@@ -8,10 +8,18 @@
 #include <string>
 #include <vector>
 
-struct FastqRecord {
-    std::string identifier;
-    std::vector<unsigned char> compressed_sequence;
-    std::vector<unsigned char> compressed_quality;
-};
+namespace TracEon {
 
+    enum class StrategyType {
+        PlainText,
+        TwoBit
+    };
+
+    struct FastqRecord {
+        std::string identifier;
+        std::vector<unsigned char> compressed_sequence;
+        std::vector<unsigned char> compressed_quality;
+    };
+
+}
 #endif //TRACEON_RECORDTYPES_H

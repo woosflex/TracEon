@@ -3,7 +3,7 @@
 //
 
 #include <catch2/catch_all.hpp>
-#include "../TwoBitDnaStrategy.h" // This file doesn't exist yet
+#include "../TwoBitDnaStrategy.h"
 
 TEST_CASE("TwoBitDnaStrategy encoding and decoding", "[strategy]") {
 
