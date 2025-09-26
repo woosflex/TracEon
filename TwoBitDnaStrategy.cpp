@@ -1,74 +1,58 @@
-//
-// Created by Adnan Raza on 9/26/2025.
-//
-
 #include "TwoBitDnaStrategy.h"
-#include <stdexcept> // For std::runtime_error
-#include <cmath>     // For std::ceil
+#include <stdexcept>
+#include <cmath>
 
-// Helper function to convert a base to its 2-bit representation.
+// A simple mapping from a DNA base to its 2-bit value.
 inline unsigned char baseToBits(char base) {
     switch (base) {
-        case 'A': return 0b00; // 0
-        case 'C': return 0b01; // 1
-        case 'G': return 0b10; // 2
-        case 'T': return 0b11; // 3
-        default:  return 0b00; // Default for 'N' etc.
+        case 'A': return 0b00;
+        case 'C': return 0b01;
+        case 'G': return 0b10;
+        case 'T': return 0b11;
+        default:  return 0b00; // Let 'N' and others default to 'A'
     }
 }
 
-// Helper function to convert 2 bits back to a base character.
+// And the reverse mapping from 2 bits back to a DNA base.
 inline char bitsToBase(unsigned char bits) {
     switch (bits) {
         case 0b00: return 'A';
         case 0b01: return 'C';
         case 0b10: return 'G';
         case 0b11: return 'T';
-        default:   return 'N';
+        default:   return 'N'; // Should not happen with valid encoded data
     }
 }
 
-
 std::vector<unsigned char> TwoBitDnaStrategy::encode(const std::string& data) const {
-    if (data.empty()) {
-        return {};
-    }
+    if (data.empty()) return {};
 
-    // We'll store the original length in the first 4 bytes.
     uint32_t original_length = data.length();
-
-    // Calculate how many bytes we need for the packed data. Each byte holds 4 bases.
+    // We need space for 4 bytes of length, plus the packed data.
     size_t packed_data_size = std::ceil(static_cast<double>(original_length) / 4.0);
-
-    // Total size is 4 bytes for the length + the packed data size.
     std::vector<unsigned char> encoded_data(4 + packed_data_size, 0);
 
-    // Write the length into the first 4 bytes.
+    // Manually write the 32-bit length into the first 4 bytes of the vector.
     encoded_data[0] = (original_length >> 24) & 0xFF;
     encoded_data[1] = (original_length >> 16) & 0xFF;
     encoded_data[2] = (original_length >> 8) & 0xFF;
     encoded_data[3] = original_length & 0xFF;
 
-    // Now, pack the DNA sequence.
+    // Pack 4 bases into each subsequent byte.
     for (size_t i = 0; i < original_length; ++i) {
         unsigned char two_bit_value = baseToBits(data[i]);
         size_t byte_index = 4 + (i / 4);
-        // We pack from left to right (e.g., first base goes into bits 7-6)
+        // The first base goes into the most significant bits (7-6), the second into (5-4), etc.
         int bit_shift = (3 - (i % 4)) * 2;
         encoded_data[byte_index] |= (two_bit_value << bit_shift);
     }
-
     return encoded_data;
 }
 
-
 std::string TwoBitDnaStrategy::decode(const std::vector<unsigned char>& data) const {
-    if (data.size() < 4) {
-        // Not enough data to even have the length, something is wrong.
-        return "";
-    }
+    if (data.size() < 4) return ""; // Not even enough data for the length header
 
-    // First, read the original length from the first 4 bytes.
+    // Reconstruct the original 32-bit length from the first 4 bytes.
     uint32_t original_length = (static_cast<uint32_t>(data[0]) << 24) |
                                (static_cast<uint32_t>(data[1]) << 16) |
                                (static_cast<uint32_t>(data[2]) << 8)  |
@@ -81,10 +65,9 @@ std::string TwoBitDnaStrategy::decode(const std::vector<unsigned char>& data) co
     for (size_t i = 0; i < original_length; ++i) {
         size_t byte_index = 4 + (i / 4);
         int bit_shift = (3 - (i % 4)) * 2;
-        // Shift the bits to the right, then mask to get only the 2 we care about.
+        // Shift the byte to align the 2 bits we want, then mask them off.
         unsigned char two_bit_value = (data[byte_index] >> bit_shift) & 0b11;
         decoded_dna += bitsToBase(two_bit_value);
     }
-
     return decoded_dna;
 }

@@ -1,15 +1,13 @@
-//
-// Created by Adnan Raza on 9/26/2025.
-//
-
 #include "PlainTextStrategy.h"
 
+// This is our simplest strategy, it just handles the basic conversion
+// from a string to a byte vector for storage.
 std::vector<unsigned char> PlainTextStrategy::encode(const std::string& data) const {
-    // Convert the string to a vector of its raw byte data.
+    // Just convert the string into a vector of its raw bytes.
     return {data.begin(), data.end()};
 }
 
+// And this just converts the byte vector right back into a string.
 std::string PlainTextStrategy::decode(const std::vector<unsigned char>& data) const {
-    // Convert the vector of bytes back into a string.
     return {data.begin(), data.end()};
 }

@@ -1,19 +1,15 @@
-//
-// Created by Adnan Raza on 9/26/2025.
-//
-
 #include <catch2/catch_all.hpp>
 #include "../TwoBitDnaStrategy.h"
 
 TEST_CASE("TwoBitDnaStrategy encoding and decoding", "[strategy]") {
-
     TwoBitDnaStrategy strategy;
     std::string original_dna = "GATTACA";
 
     SECTION("Encoding reduces size") {
         auto encoded_data = strategy.encode(original_dna);
-        // 7 bases * 2 bits/base = 14 bits. This should fit in 2 bytes.
+        // Check that the encoded size is smaller than the original.
         REQUIRE(encoded_data.size() < original_dna.size());
+        // Specifically, it should be 4 bytes for the length + 2 bytes for 7 bases of data.
         REQUIRE(encoded_data.size() == 6);
     }
 
