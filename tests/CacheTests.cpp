@@ -6,6 +6,19 @@ TEST_CASE("Cache Initialization", "[cache]") {
         TracEon::Cache cache;
         REQUIRE(cache.size() == 0);
     }
+
+    SECTION("Can set and get a simple key-value pair") {
+        TracEon::Cache cache;
+        std::string key = "seq1";
+        std::string value = "GATTACA";
+
+        // These methods don't exist yet, so this will fail to compile.
+        cache.set(key, value);
+        std::string retrieved_value = cache.get(key);
+
+        REQUIRE(retrieved_value == value);
+        REQUIRE(cache.size() == 1);
+    }
 }
 
 //

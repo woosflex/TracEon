@@ -26,6 +26,8 @@ namespace TracEon {
         void restore(const std::string& filepath);
         std::string getFastaSequence(const std::string& key);
         size_t size() const;
+        void set(const std::string& key, const std::string& value);
+        std::string get(const std::string& key);
 
     private:
         std::unique_ptr<IEncodingStrategy> m_dna_strategy;
