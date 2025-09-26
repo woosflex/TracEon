@@ -20,7 +20,10 @@ target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # This is just a little app for any manual testing or demos we want to do.
 add_executable(trac-eon-test main.cpp
         main.cpp
-        Cache.cpp)
+        Cache.cpp
+        Cache.h
+        IEncodingStrategy.h
+        RecordTypes.h)
 target_link_libraries(trac-eon-test PRIVATE traceon_core)
 
 # --- Test Setup ---
@@ -41,7 +44,7 @@ enable_testing()
 # We'll create a separate program just for running our tests...
 add_executable(unit_tests
         tests/main.cpp
-        tests/CacehTests.cpp
+        tests/CacheTests.cpp
         # Our test files, like tests/CacheTests.cpp, will be added here
 )
 
