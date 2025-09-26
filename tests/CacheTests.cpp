@@ -34,4 +34,16 @@ TEST_CASE("Cache Functionality", "[cache]") {
         REQUIRE(stored_size < value.size());
     }
 
+    SECTION("Can load a simple FASTA file") {
+        TracEon::Cache cache;
+        // The path is relative to the build directory, so we go up one level.
+        std::string test_file_path = "../test_data/simple.fasta";
+
+        // This method is not implemented yet, so this will cause a linker error.
+        cache.loadFasta(test_file_path);
+
+        REQUIRE(cache.size() == 2);
+        REQUIRE(cache.get("seq1") == "GATTACA");
+        REQUIRE(cache.get("seq2") == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
+    }
 }
