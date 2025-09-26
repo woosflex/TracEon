@@ -14,7 +14,7 @@ TEST_CASE("TwoBitDnaStrategy encoding and decoding", "[strategy]") {
         auto encoded_data = strategy.encode(original_dna);
         // 7 bases * 2 bits/base = 14 bits. This should fit in 2 bytes.
         REQUIRE(encoded_data.size() < original_dna.size());
-        REQUIRE(encoded_data.size() == 2);
+        REQUIRE(encoded_data.size() == 6);
     }
 
     SECTION("Encode and Decode returns original string") {

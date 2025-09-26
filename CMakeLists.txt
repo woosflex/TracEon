@@ -12,13 +12,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(traceon_core STATIC
         Cache.cpp
         PlainTextStrategy.cpp
+        TwoBitDnaStrategy.cpp
 )
 # Make sure our library knows where to find its own header files.
 target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # This is our little app for manual testing. It only needs main.cpp,
 # because all the other code is linked in from the traceon_core library.
-add_executable(trac-eon-test main.cpp)
+add_executable(trac-eon-test main.cpp
+        TwoBitDnaStrategy.h
+        TwoBitDnaStrategy.cpp)
 target_link_libraries(trac-eon-test PRIVATE traceon_core)
 
 # --- Test Setup ---
