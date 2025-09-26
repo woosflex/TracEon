@@ -23,7 +23,6 @@ TEST_CASE("Cache Functionality", "[cache]") {
         std::string key = "seq1";
         std::string value = "GATTACA"; // 7 bytes
 
-        // These methods don't exist yet, so this will fail.
         cache.setStrategy(TracEon::StrategyType::TwoBit);
         cache.set(key, value);
 

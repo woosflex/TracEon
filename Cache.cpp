@@ -1,11 +1,35 @@
 #include "Cache.h"
 #include "PlainTextStrategy.h"
+#include "TwoBitDnaStrategy.h"
 
 namespace TracEon {
 
     Cache::Cache() {
         // For now, our cache defaults to using the plain text strategy.
         m_dna_strategy = std::make_unique<PlainTextStrategy>();
+    }
+
+    void Cache::setStrategy(StrategyType type) {
+        switch (type) {
+            case StrategyType::TwoBit:
+                m_dna_strategy = std::make_unique<TwoBitDnaStrategy>();
+                break;
+            case StrategyType::PlainText:
+            default:
+                m_dna_strategy = std::make_unique<PlainTextStrategy>();
+                break;
+        }
+    }
+
+    size_t Cache::getStoredSize(const std::string& key) const {
+        if (m_store.count(key)) {
+            const auto& record_variant = m_store.at(key);
+            if (const FastaRecordData* data = std::get_if<FastaRecordData>(&record_variant)) {
+                // Just return the size of the stored byte vector.
+                return data->size();
+            }
+        }
+        return 0; // Return 0 if key not found or wrong type.
     }
 
     Cache::~Cache() = default;
