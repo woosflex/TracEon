@@ -35,6 +35,7 @@ namespace TracEon {
         void restore(const std::string& filepath);
 
     private:
+        StrategyType m_current_strategy_type;
         std::unique_ptr<IEncodingStrategy> m_dna_strategy;
         // We'll use this later for FASTQ files.
         std::unique_ptr<IEncodingStrategy> m_quality_strategy;

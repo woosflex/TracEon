@@ -55,7 +55,7 @@ TEST_CASE("Cache Functionality", "[cache]") {
         cache1.set("seq1", "GATTACA");
         cache1.set("seq2", "CGCGCGCG");
 
-        // This method is not implemented yet.
+        // Save the original cache.
         cache1.save(test_filename);
 
         // 2. Create a new, empty cache.
