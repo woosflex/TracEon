@@ -41,6 +41,7 @@ enable_testing()
 # We'll create a separate program just for running our tests...
 add_executable(unit_tests
         tests/main.cpp
+        tests/CacehTests.cpp
         # Our test files, like tests/CacheTests.cpp, will be added here
 )
 
