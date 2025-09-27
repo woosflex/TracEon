@@ -2,6 +2,8 @@
 #include <cmath>
 #include <cstdint>
 
+TwoBitDnaStrategy::~TwoBitDnaStrategy() = default;
+
 namespace { // Use an anonymous namespace for internal helper functions
     // Maps a DNA base to its 2-bit value.
     inline unsigned char baseToBits(char base) {
