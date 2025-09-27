@@ -9,6 +9,7 @@
 
 #include "IEncodingStrategy.h"
 #include "RecordTypes.h"
+#include "DecodedRecordTypes.h"
 
 namespace TracEon {
 
@@ -27,6 +28,7 @@ namespace TracEon {
         void set(const std::string& key, const std::string& value);
         // Retrieves and decodes a value by its key. Returns empty string if not found.
         std::string get(const std::string& key);
+        std::optional<DecodedFastqRecord> getFastqRecord(const std::string& key);
 
         // --- Status & Inspection ---
         // Returns the total number of items in the cache.
@@ -37,6 +39,7 @@ namespace TracEon {
         // --- File I/O ---
         // Parses a FASTA file and loads its contents into the cache.
         void loadFasta(const std::string& filepath);
+        void loadFastq(const std::string& filepath);
         // Writes the entire cache's state to a binary file.
         void save(const std::string& filepath);
         // Loads the cache's state from a binary file.
