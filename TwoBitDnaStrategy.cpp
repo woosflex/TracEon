@@ -1,5 +1,6 @@
 #include "TwoBitDnaStrategy.h"
 #include <cmath>
+#include <cstdint>
 
 namespace { // Use an anonymous namespace for internal helper functions
     // Maps a DNA base to its 2-bit value.
