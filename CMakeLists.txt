@@ -22,6 +22,7 @@ set(TEST_SOURCES
         tests/CacheTests.cpp
         tests/TwoBitStrategyTests.cpp
         tests/FastqTests.cpp
+        tests/QualityScoreStrategyTests.cpp
 )
 
 # --- Library Target ---
