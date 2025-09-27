@@ -13,6 +13,7 @@ add_library(traceon_core STATIC
         Cache.cpp
         PlainTextStrategy.cpp
         TwoBitDnaStrategy.cpp
+        IEncodingStrategy.cpp
 )
 # Make sure our library knows where to find its own header files.
 target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
