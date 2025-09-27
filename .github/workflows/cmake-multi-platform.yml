@@ -1,0 +1,34 @@
+# .github/workflows/cmake.yml
+
+name: CMake CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    # This matrix will run the job on Windows, Ubuntu, and macOS
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    # This step configures the project with CMake
+    - name: Configure CMake
+      # We added the Release flag here for optimized builds
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+
+    # This step compiles everything
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release
+
+    # This step runs your tests
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      run: ctest --config Release
