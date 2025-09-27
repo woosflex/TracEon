@@ -1,0 +1,16 @@
+# CMake build directories
+/cmake-build-*/
+
+# Generated test data and cache files
+/large_test.fasta
+/test_cache.bin
+
+# CLion specific files
+.idea/
+
+# Other common generated files
+*.o
+*.a
+*.so
+*.dll
+*.exe

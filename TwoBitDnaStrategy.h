@@ -1,12 +1,9 @@
-//
-// Created by Adnan Raza on 9/26/2025.
-//
-
 #ifndef TRACEON_TWOBITDNASTRATEGY_H
 #define TRACEON_TWOBITDNASTRATEGY_H
 
 #include "IEncodingStrategy.h"
 
+// A strategy that compresses DNA sequences using 2 bits per base.
 class TwoBitDnaStrategy : public IEncodingStrategy {
 public:
     std::vector<unsigned char> encode(const std::string& data) const override;

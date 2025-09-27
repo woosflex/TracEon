@@ -8,11 +8,13 @@
 namespace TracEon {
 
 Cache::Cache() {
-    // We'll default to the plain text strategy on startup.
+    // Default to the plain text strategy on startup.
     setStrategy(StrategyType::PlainText);
 }
 
 Cache::~Cache() = default;
+
+// --- Configuration ---
 
 void Cache::setStrategy(StrategyType type) {
     m_current_strategy_type = type;
@@ -27,20 +29,7 @@ void Cache::setStrategy(StrategyType type) {
     }
 }
 
-size_t Cache::getStoredSize(const std::string& key) const {
-    if (m_store.count(key)) {
-        const auto& record_variant = m_store.at(key);
-        if (const auto* data = std::get_if<FastaRecordData>(&record_variant)) {
-            // Just return the size of the raw stored data.
-            return data->size();
-        }
-    }
-    return 0;
-}
-
-size_t Cache::size() const {
-    return m_store.size();
-}
+// --- Data Interaction ---
 
 void Cache::set(const std::string& key, const std::string& value) {
     // Let the current strategy handle the encoding.
@@ -61,10 +50,28 @@ std::string Cache::get(const std::string& key) {
     return "";
 }
 
+// --- Status & Inspection ---
+
+size_t Cache::size() const {
+    return m_store.size();
+}
+
+size_t Cache::getStoredSize(const std::string& key) const {
+    if (m_store.count(key)) {
+        const auto& record_variant = m_store.at(key);
+        if (const auto* data = std::get_if<FastaRecordData>(&record_variant)) {
+            // Return the size of the raw stored data in bytes.
+            return data->size();
+        }
+    }
+    return 0;
+}
+
+// --- File I/O ---
+
 void Cache::loadFasta(const std::string& filepath) {
     std::ifstream file(filepath);
     if (!file.is_open()) {
-        // Silently fail if we can't open the file.
         // A real-world version might throw an error here.
         return;
     }
@@ -82,8 +89,8 @@ void Cache::loadFasta(const std::string& filepath) {
             continue;
         }
 
-        if (line[0] == '>') { // New sequence header found
-            // If we have a sequence buffered, save it first.
+        if (line[0] == '>') { // New sequence header
+            // If we have a sequence buffered, save it.
             if (!current_key.empty()) {
                 set(current_key, current_value_stream.str());
             }
@@ -92,25 +99,23 @@ void Cache::loadFasta(const std::string& filepath) {
             size_t first_space = line.find(' ');
             current_key = line.substr(1, first_space - 1);
 
-            // Reset the stream for the new sequence data.
+            // Reset for the new sequence.
             current_value_stream.str("");
             current_value_stream.clear();
-        } else { // Sequence data line
+        } else { // Sequence data
             current_value_stream << line;
         }
     }
 
-    // After the loop, make sure to save the very last sequence.
+    // Save the very last sequence in the file.
     if (!current_key.empty()) {
         set(current_key, current_value_stream.str());
     }
 }
-    void Cache::save(const std::string& filepath) {
-    // Open the file in binary mode for writing.
+
+void Cache::save(const std::string& filepath) {
     std::ofstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        return; // Failed to open file
-    }
+    if (!file.is_open()) return;
 
     // --- Write Header ---
     const char magic[] = "TRAC";
@@ -125,13 +130,13 @@ void Cache::loadFasta(const std::string& filepath) {
 
     // --- Write Records ---
     for (const auto& pair : m_store) {
-        // Write key
+        // Write key (length-prefixed)
         const std::string& key = pair.first;
         uint64_t key_len = key.length();
         file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
         file.write(key.c_str(), key_len);
 
-        // Write value (which is a variant)
+        // Write value (length-prefixed)
         if (const auto* data = std::get_if<FastaRecordData>(&pair.second)) {
             uint64_t val_len = data->size();
             file.write(reinterpret_cast<const char*>(&val_len), sizeof(val_len));
@@ -140,15 +145,11 @@ void Cache::loadFasta(const std::string& filepath) {
     }
 }
 
-    void Cache::restore(const std::string& filepath) {
-    // Open the file in binary mode for reading.
+void Cache::restore(const std::string& filepath) {
     std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        return;
-    }
+    if (!file.is_open()) return;
 
-    // Start fresh
-    m_store.clear();
+    m_store.clear(); // Start with a fresh cache
 
     // --- Read and Verify Header ---
     char magic[4];
@@ -157,13 +158,13 @@ void Cache::loadFasta(const std::string& filepath) {
     uint64_t record_count;
 
     file.read(magic, 4);
-    if (std::string(magic, 4) != "TRAC") return; // Not a valid file
+    if (std::string(magic, 4) != "TRAC") return; // Not a TracEon file
 
     file.read(reinterpret_cast<char*>(&version), sizeof(version));
     file.read(reinterpret_cast<char*>(&strategy_id), sizeof(strategy_id));
     file.read(reinterpret_cast<char*>(&record_count), sizeof(record_count));
 
-    // Set the strategy to match the one from the file
+    // Set our strategy to match the one from the file.
     setStrategy(static_cast<StrategyType>(strategy_id));
 
     // --- Read Records ---
@@ -180,7 +181,7 @@ void Cache::loadFasta(const std::string& filepath) {
         FastaRecordData value(val_len);
         file.read(reinterpret_cast<char*>(value.data()), val_len);
 
-        // Insert directly into the store to avoid re-encoding
+        // Insert directly to avoid re-encoding.
         m_store[key] = value;
     }
 }
