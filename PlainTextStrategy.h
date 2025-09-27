@@ -9,6 +9,7 @@
 
 class PlainTextStrategy : public IEncodingStrategy {
 public:
+    ~PlainTextStrategy() override = default;
     std::vector<unsigned char> encode(const std::string& data) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 };
