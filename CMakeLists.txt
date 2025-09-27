@@ -15,6 +15,7 @@ set(CORE_SOURCES
         IEncodingStrategy.cpp
         PlainTextStrategy.cpp
         TwoBitDnaStrategy.cpp
+        QualityScoreRleStrategy.cpp
 )
 
 set(TEST_SOURCES
