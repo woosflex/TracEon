@@ -7,7 +7,7 @@
 // An interface (abstract base class) that all encoding strategies must implement.
 class IEncodingStrategy {
 public:
-    virtual ~IEncodingStrategy() = default;
+    virtual ~IEncodingStrategy();
 
     // Takes a raw string and returns a compressed/encoded vector of bytes.
     virtual std::vector<unsigned char> encode(const std::string& data) const = 0;
