@@ -1,14 +1,11 @@
-#ifndef TRACEON_PLAINTEXTSTRATEGY_H
-#define TRACEON_PLAINTEXTSTRATEGY_H
+#include "PlainTextStrategy.h"
 
-#include "IEncodingStrategy.h"
+PlainTextStrategy::~PlainTextStrategy() = default;
 
-// A simple strategy that performs no compression.
-// It just converts between string and a vector of its bytes.
-class PlainTextStrategy : public IEncodingStrategy {
-public:
-    std::vector<unsigned char> encode(const std::string& data) const override;
-    std::string decode(const std::vector<unsigned char>& data) const override;
-};
+std::vector<unsigned char> PlainTextStrategy::encode(const std::string& data) const {
+    return {data.begin(), data.end()};
+}
 
-#endif //TRACEON_PLAINTEXTSTRATEGY_H
+std::string PlainTextStrategy::decode(const std::vector<unsigned char>& data) const {
+    return {data.begin(), data.end()};
+}

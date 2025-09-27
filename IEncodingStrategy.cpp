@@ -1,7 +1,5 @@
 #include "IEncodingStrategy.h"
 
-// This out-of-line definition gives the vtable a place to anchor.
+// This out-of-line definition gives the vtable a place to anchor,
+// fixing the linker errors on GCC and Clang.
 IEncodingStrategy::~IEncodingStrategy() = default;
-//
-// Created by Adnan Raza on 9/27/2025.
-//

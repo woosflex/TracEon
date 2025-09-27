@@ -1,7 +1,3 @@
-//
-// Created by Adnan Raza on 9/26/2025.
-//
-
 #ifndef TRACEON_PLAINTEXTSTRATEGY_H
 #define TRACEON_PLAINTEXTSTRATEGY_H
 
@@ -9,7 +5,7 @@
 
 class PlainTextStrategy : public IEncodingStrategy {
 public:
-    ~PlainTextStrategy() override = default;
+    ~PlainTextStrategy() override;
     std::vector<unsigned char> encode(const std::string& data) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 };
