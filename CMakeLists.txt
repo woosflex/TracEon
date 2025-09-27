@@ -49,6 +49,7 @@ add_executable(unit_tests
         tests/main.cpp
         tests/CacheTests.cpp
         tests/TwoBitStrategyTests.cpp
+        tests/FastqTests.cpp
 )
 
 # ...and our test program needs to be linked against our library and Catch2.
