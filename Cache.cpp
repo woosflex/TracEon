@@ -1,7 +1,6 @@
 #include "Cache.h"
 #include "PlainTextStrategy.h"
 #include "TwoBitDnaStrategy.h"
-#include "QualityScoreRleStrategy.h"
 #include <fstream>
 #include <sstream>
 #include <ios>
@@ -12,7 +11,7 @@ namespace TracEon {
 Cache::Cache() {
     // Default to plain text for both strategies on startup.
     setStrategy(StrategyType::PlainText);
-    m_quality_strategy = std::make_unique<QualityScoreRleStrategy>();
+    m_quality_strategy = std::make_unique<PlainTextStrategy>();
 }
 
 Cache::~Cache() = default;
