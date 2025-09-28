@@ -13,17 +13,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CORE_SOURCES
         Cache.cpp
         IEncodingStrategy.cpp
-        PlainTextStrategy.cpp
-        TwoBitDnaStrategy.cpp
-        QualityScoreRleStrategy.cpp
+        SmartStrategy.cpp
 )
 
 set(TEST_SOURCES
         tests/main.cpp
         tests/CacheTests.cpp
-        tests/TwoBitStrategyTests.cpp
         tests/FastqTests.cpp
-        tests/QualityScoreStrategyTests.cpp
         tests/SmartStrategyTests.cpp
 )
 
