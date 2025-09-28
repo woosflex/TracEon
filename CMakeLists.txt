@@ -15,6 +15,7 @@ set(CORE_SOURCES
         IEncodingStrategy.cpp
         PlainTextStrategy.cpp
         TwoBitDnaStrategy.cpp
+        QualityScoreRleStrategy.cpp
 )
 
 set(TEST_SOURCES
@@ -23,7 +24,6 @@ set(TEST_SOURCES
         tests/TwoBitStrategyTests.cpp
         tests/FastqTests.cpp
         tests/QualityScoreStrategyTests.cpp
-        tests/SmartStrategyTests.cpp
 )
 
 # --- Library Target ---
