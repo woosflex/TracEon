@@ -39,6 +39,8 @@ namespace TracEon {
         void saveSmartBinary(const std::string& filepath);
         void loadSmartBinary(const std::string& filepath);
 
+        void set(const std::string& key, const std::string& value);
+
     private:
         // Private helpers for loading specific file types
         void loadFasta(std::ifstream& file);

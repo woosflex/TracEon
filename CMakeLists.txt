@@ -34,9 +34,12 @@ add_executable(trac-eon-test main.cpp)
 target_link_libraries(trac-eon-test PRIVATE traceon_core)
 
 # Benchmark executables.
-add_executable(benchmark_disk benchmark_disk.cpp)
-add_executable(benchmark_traceon benchmark_traceon.cpp)
-target_link_libraries(benchmark_traceon PRIVATE traceon_core)
+## Comprehensive benchmark executable
+add_executable(comprehensive_benchmark comprehensive_benchmark.cpp)
+target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
+## GCP NGS Benchmark executable
+add_executable(gcp_benchmark gcp_benchmark.cpp)
+target_link_libraries(gcp_benchmark PRIVATE traceon_core)
 
 # --- Test Setup using Catch2 ---
 # This CMake trick automatically downloads Catch2 from GitHub for us.
