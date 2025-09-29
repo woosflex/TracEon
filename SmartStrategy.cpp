@@ -407,6 +407,16 @@ void SmartStrategy::loadBinary(const std::string& binary_filepath) {
         throw std::runtime_error("Cannot open binary file: " + binary_filepath);
     }
 
+    // Check if this is a "TRAC" format file (wrong format for SmartStrategy)
+    char magic[4];
+    file.read(magic, 4);
+    if (std::string(magic, 4) == "TRAC") {
+        throw std::runtime_error("File is in TRAC format, not SmartStrategy format");
+    }
+
+    // Rewind to beginning
+    file.seekg(0);
+
     file_cache_.clear();
 
     // Read format header

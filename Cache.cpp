@@ -84,6 +84,9 @@ size_t Cache::getStoredSize(const std::string& key) const {
     return 0;
 }
 
+void Cache::set(const std::string& key, const std::string& value) {
+    m_store[key] = m_strategy->encode(value);
+}
 // --- File I/O ---
 
 void Cache::loadFile(const std::string& filepath) {
@@ -166,7 +169,7 @@ void Cache::loadFastq(std::ifstream& file) {
 void Cache::save(const std::string& filepath) {
     // Check if we can use SmartStrategy's binary save
     if (auto* smart_strategy = dynamic_cast<SmartStrategy*>(m_strategy.get())) {
-        if (smart_strategy->getFileCacheSize() > 0) {
+        if (smart_strategy->getFileCacheSize() > 0 && m_store.empty()) {
             smart_strategy->saveBinary(filepath);
             return;
         }
