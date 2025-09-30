@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- ZLIB Support ---
-find_package(ZLIB REQUIRED)
+# Instead of finding the system ZLIB, we build our own version.
+# This makes the project portable and removes external dependencies.
+add_subdirectory(third_party/zlib)
 
 # --- Source File Definitions ---
 # By defining our source files in variables, we only have to list them once.
@@ -42,7 +44,8 @@ add_executable(comprehensive_benchmark comprehensive_benchmark.cpp)
 target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
 ## GCP NGS Benchmark executable
 add_executable(gcp_benchmark gcp_benchmark.cpp)
-target_link_libraries(gcp_benchmark PRIVATE traceon_core ZLIB::ZLIB)
+# Link our benchmark against the core library AND our vendored ZLIB.
+target_link_libraries(gcp_benchmark PRIVATE traceon_core zlib_static)
 
 # --- Test Setup using Catch2 ---
 # This CMake trick automatically downloads Catch2 from GitHub for us.
