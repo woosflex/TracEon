@@ -2,7 +2,7 @@
 #include "../SmartStrategy.h" // This file doesn't exist yet
 
 TEST_CASE("SmartStrategy automatic encoding", "[strategy][smart]") {
-    SmartStrategy strategy;
+    TracEon::SmartStrategy strategy;
 
     SECTION("Correctly encodes and decodes DNA") {
         std::string dna = "GATTACAGATTACAGATTACAGATTACA"; // 28 bytes - longer sequence
