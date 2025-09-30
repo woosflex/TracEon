@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <sstream>
 #include <ctime>
-#include <sys/resource.h>
 #include <zlib.h>
 #include "Cache.h"
 
@@ -17,6 +16,7 @@
 #include <psapi.h>
 #else
 #include <unistd.h>
+#include <sys/resource.h>
 #endif
 
 
