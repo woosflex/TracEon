@@ -44,6 +44,7 @@ namespace {
     }
 }
 
+
 // --- Constructor / Destructor ---
 SmartStrategy::SmartStrategy() : detected_format_(FileFormat::DNA_FASTA) {}
 SmartStrategy::~SmartStrategy() = default;
@@ -337,6 +338,18 @@ SmartStrategy::ParsedChunk SmartStrategy::parse_chunk_fastq(const Chunk& buffer)
         std::string_view sequence = content.substr(p1+1, p2-(p1+1));
         std::string_view quality = content.substr(p3+1, p4-(p3+1));
 
+        // Trim trailing newline and carriage return characters from the views
+        auto trim_view = [](std::string_view sv) {
+            while (!sv.empty() && (sv.back() == '\n' || sv.back() == '\r')) {
+                sv.remove_suffix(1);
+            }
+            return sv;
+        };
+
+        header = trim_view(header);
+        sequence = trim_view(sequence);
+        quality = trim_view(quality);
+
         if (!header.empty() && header[0] == '@') {
             size_t first_space = header.find(' ');
             std::string key(header.substr(1, first_space != std::string_view::npos ? first_space - 1 : std::string_view::npos));
@@ -369,6 +382,24 @@ void SmartStrategy::determine_format_from_cache() {
 }
 
 // --- Other Public and Private Methods ---
+    void SmartStrategy::mergeFileCacheInto(
+     std::unordered_map<std::string, std::variant<std::vector<unsigned char>, FastqRecord>>& store,
+     const IEncodingStrategy& encoder)
+{
+    // This function can now access member variables
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+
+    for (const auto& [key, data] : file_cache_) {
+        if (!data.quality.empty()) { // It's a FASTQ record
+            FastqRecord record;
+            record.compressed_sequence = encoder.encode(data.sequence, DataTypeHint::Generic);
+            record.compressed_quality = encoder.encode(data.quality, DataTypeHint::QualityScore);
+            store[key] = record;
+        } else { // It's a FASTA record
+            store[key] = encoder.encode(data.sequence);
+        }
+    }
+}
 
 size_t SmartStrategy::getFileCacheSize() const {
     std::lock_guard<std::mutex> lock(cache_mutex_);

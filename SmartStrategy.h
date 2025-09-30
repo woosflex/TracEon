@@ -7,6 +7,9 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <variant>
+
+#include "RecordTypes.h"
 
 namespace TracEon {
 
@@ -39,6 +42,10 @@ public:
     bool hasSequence(const std::string& sequence_id) const;
     size_t getFileCacheSize() const;
 
+    void mergeFileCacheInto(
+        std::unordered_map<std::string, std::variant<std::vector<unsigned char>, FastqRecord>>& store,
+        const IEncodingStrategy& encoder
+    );
     // Utility methods
     FileFormat getDetectedFormat() const { return detected_format_; }
     void clearFileCache();
