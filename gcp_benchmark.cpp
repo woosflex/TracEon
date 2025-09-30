@@ -8,6 +8,7 @@
 #include <sstream>
 #include <ctime>
 #include <sys/resource.h>
+#include <unistd.h>
 #include "Cache.h"
 
 namespace fs = std::filesystem;
