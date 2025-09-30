@@ -1,5 +1,6 @@
 #include "Cache.h"
 #include "SmartStrategy.h"
+#include "FileReader.h"
 #include <fstream>
 #include <sstream>
 #include <ios>
@@ -90,39 +91,41 @@ void Cache::set(const std::string& key, const std::string& value) {
 // --- File I/O ---
 
 void Cache::loadFile(const std::string& filepath) {
-    // Use SmartStrategy's file loading capability
+    // Use SmartStrategy's file loading capability (supports .gz)
     if (auto* smart_strategy = dynamic_cast<SmartStrategy*>(m_strategy.get())) {
         smart_strategy->loadFile(filepath);
         return;
     }
 
-    // Fallback to old method if not SmartStrategy
-    std::ifstream file(filepath);
+    // Fallback: manual parsing with FileReader
+    FileReader file(filepath);
     if (!file.is_open()) return;
 
-    // Read the first line to sniff the file type.
     std::string first_line;
-    std::getline(file, first_line);
+    file.getline(first_line);
 
-    // Rewind the file to the beginning so the parsers can read the whole thing.
-    file.seekg(0);
-
-    // Sniff the file type based on the first character.
     if (!first_line.empty()) {
         if (first_line[0] == '>') {
-            loadFasta(file);
+            loadFastaFromReader(file, first_line);
         } else if (first_line[0] == '@') {
-            loadFastq(file);
+            loadFastqFromReader(file, first_line);
         }
     }
 }
 
-void Cache::loadFasta(std::ifstream& file) {
-    std::string line, current_key;
+void Cache::loadFastaFromReader(FileReader& file, const std::string& first_line) {
+    std::string line = first_line;
+    std::string current_key;
     std::stringstream current_value_stream;
 
-    while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    // Process the first line that was already read
+    if (!line.empty() && line[0] == '>') {
+        size_t first_space = line.find(' ');
+        current_key = line.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
+    }
+
+    // Process the rest of the file
+    while (file.getline(line)) {
         if (line.empty()) continue;
 
         if (line[0] == '>') {
@@ -130,34 +133,46 @@ void Cache::loadFasta(std::ifstream& file) {
                 m_store[current_key] = m_strategy->encode(current_value_stream.str());
             }
             size_t first_space = line.find(' ');
-            current_key = line.substr(1, first_space - 1);
+            current_key = line.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
             current_value_stream.str("");
             current_value_stream.clear();
         } else {
             current_value_stream << line;
         }
     }
+    // Add the last sequence
     if (!current_key.empty()) {
         m_store[current_key] = m_strategy->encode(current_value_stream.str());
     }
 }
 
-void Cache::loadFastq(std::ifstream& file) {
-    std::string header, sequence, plus, quality;
+void Cache::loadFastqFromReader(FileReader& file, const std::string& first_line) {
+    std::string header = first_line;
+    std::string sequence, plus, quality;
 
-    while (std::getline(file, header) &&
-           std::getline(file, sequence) &&
-           std::getline(file, plus) &&
-           std::getline(file, quality))
+    // Process the first record which was partially read
+    if (file.getline(sequence) && file.getline(plus) && file.getline(quality)) {
+        if (!header.empty() && header[0] == '@') {
+            size_t first_space = header.find(' ');
+            std::string key = header.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
+
+            FastqRecord record;
+            record.compressed_sequence = m_strategy->encode(sequence, DataTypeHint::Generic);
+            record.compressed_quality = m_strategy->encode(quality, DataTypeHint::QualityScore);
+            m_store[key] = record;
+        }
+    }
+
+    // Process the rest of the file
+    while (file.getline(header) &&
+           file.getline(sequence) &&
+           file.getline(plus) &&
+           file.getline(quality))
     {
-        if (!header.empty() && header.back() == '\r') header.pop_back();
-        if (!sequence.empty() && sequence.back() == '\r') sequence.pop_back();
-        if (!quality.empty() && quality.back() == '\r') quality.pop_back();
-
         if (header.empty() || header[0] != '@') continue;
 
         size_t first_space = header.find(' ');
-        std::string key = header.substr(1, first_space - 1);
+        std::string key = header.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
 
         FastqRecord record;
         record.compressed_sequence = m_strategy->encode(sequence, DataTypeHint::Generic);

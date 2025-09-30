@@ -7,6 +7,9 @@
 #include <unordered_map>
 #include <memory>
 #include <fstream>
+namespace TracEon {
+
+class FileReader;
 
 // File format identifiers for binary headers (your original spec)
 enum class FileFormat : uint8_t {
@@ -36,8 +39,8 @@ private:
     bool hasRNA(const std::string& data) const;
 
     // File parsing methods (missing declarations)
-    void parseFASTA(std::ifstream& file);
-    void parseFASTQ(std::ifstream& file);
+    void parseFASTA(FileReader& file, const std::string& first_line);
+    void parseFASTQ(FileReader& file, const std::string& first_line);
 
     // Encoding helpers (your existing implementation)
     std::vector<unsigned char> encode_nucleotide(const std::string& data) const;
@@ -70,5 +73,5 @@ public:
     FileFormat getDetectedFormat() const { return detected_format_; }
     void clearFileCache() { file_cache_.clear(); }
 };
-
+} // namespace TracEon
 #endif //TRACEON_SMARTSTRATEGY_H
