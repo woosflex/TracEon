@@ -19,6 +19,7 @@ set(CORE_SOURCES
         Cache.cpp
         IEncodingStrategy.cpp
         SmartStrategy.cpp
+        FileReader.cpp
 )
 
 set(TEST_SOURCES
@@ -32,6 +33,7 @@ set(TEST_SOURCES
 # Here's our main library, 'traceon_core'. All our core logic lives here.
 add_library(traceon_core STATIC ${CORE_SOURCES})
 target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(traceon_core PUBLIC zlib_static)
 
 # --- Executable Targets ---
 # A simple app for manual testing.
@@ -45,7 +47,7 @@ target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
 ## GCP NGS Benchmark executable
 add_executable(gcp_benchmark gcp_benchmark.cpp)
 # Link our benchmark against the core library AND our vendored ZLIB.
-target_link_libraries(gcp_benchmark PRIVATE traceon_core zlib_static)
+target_link_libraries(gcp_benchmark PRIVATE traceon_core)
 
 # --- Test Setup using Catch2 ---
 # This CMake trick automatically downloads Catch2 from GitHub for us.

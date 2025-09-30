@@ -1,4 +1,5 @@
 #include "SmartStrategy.h"
+#include "FileReader.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <iostream>
 #include <algorithm>
 
+namespace TracEon {
 // Define our metadata header bytes for self-describing data (your existing system)
 namespace {
     const uint8_t TYPE_DNA = 0x01;
@@ -233,19 +235,18 @@ std::string SmartStrategy::decode_plain(const std::vector<unsigned char>& data) 
     return {data.begin(), data.end()};
 }
 
-// --- File-based Operations (your new requirements) ---
+// --- File-based Operations ---
 
 void SmartStrategy::loadFile(const std::string& filepath) {
     file_cache_.clear();
 
-    std::ifstream file(filepath);
+    FileReader file(filepath);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open file: " + filepath);
     }
 
     std::string first_line;
-    std::getline(file, first_line);
-    file.seekg(0); // Reset to beginning
+    file.getline(first_line);
 
     if (first_line.empty()) {
         throw std::runtime_error("Empty file: " + filepath);
@@ -260,9 +261,9 @@ void SmartStrategy::loadFile(const std::string& filepath) {
 
     // Parse based on format
     if (is_fasta) {
-        parseFASTA(file);
+        parseFASTA(file, first_line);
     } else {
-        parseFASTQ(file);
+        parseFASTQ(file, first_line);
     }
 
     // Detect sequence type and set format
@@ -294,16 +295,18 @@ void SmartStrategy::loadFile(const std::string& filepath) {
               << static_cast<int>(detected_format_) << ")" << std::endl;
 }
 
-void SmartStrategy::parseFASTA(std::ifstream& file) {
-    std::string line, current_id, current_sequence;
+void SmartStrategy::parseFASTA(FileReader& file, const std::string& first_line) {
+    std::string line = first_line;
+    std::string current_id, current_sequence;
 
-    while (std::getline(file, line)) {
+    // Process first line
+    if (!line.empty() && line[0] == '>') {
+        size_t first_space = line.find(' ');
+        current_id = line.substr(1, first_space - 1);
+    }
+
+    while (file.getline(line)) {
         if (line.empty()) continue;
-
-        // Remove carriage return if present
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
 
         if (line[0] == '>') {
             // Save previous sequence
@@ -314,7 +317,7 @@ void SmartStrategy::parseFASTA(std::ifstream& file) {
                 file_cache_[current_id] = seq_data;
             }
 
-            // Start new sequence - extract ID (everything before first space)
+            // Start new sequence
             size_t first_space = line.find(' ');
             current_id = line.substr(1, first_space - 1);
             current_sequence.clear();
@@ -332,22 +335,34 @@ void SmartStrategy::parseFASTA(std::ifstream& file) {
     }
 }
 
-void SmartStrategy::parseFASTQ(std::ifstream& file) {
-    std::string header, sequence, plus, quality;
+void SmartStrategy::parseFASTQ(FileReader& file, const std::string& first_line) {
+    std::string header = first_line;
+    std::string sequence, plus, quality;
 
-    while (std::getline(file, header) &&
-           std::getline(file, sequence) &&
-           std::getline(file, plus) &&
-           std::getline(file, quality)) {
+    // Process first record
+    if (!header.empty() && header[0] == '@') {
+        file.getline(sequence);
+        file.getline(plus);
+        file.getline(quality);
 
-        // Remove carriage returns
-        if (!header.empty() && header.back() == '\r') header.pop_back();
-        if (!sequence.empty() && sequence.back() == '\r') sequence.pop_back();
-        if (!quality.empty() && quality.back() == '\r') quality.pop_back();
+        size_t first_space = header.find(' ');
+        std::string key = header.substr(1, first_space - 1);
+
+        SequenceData seq_data;
+        seq_data.id = key;
+        seq_data.sequence = sequence;
+        seq_data.quality = quality;
+        file_cache_[key] = seq_data;
+    }
+
+    // Continue with rest of file
+    while (file.getline(header) &&
+           file.getline(sequence) &&
+           file.getline(plus) &&
+           file.getline(quality)) {
 
         if (header.empty() || header[0] != '@') continue;
 
-        // Extract ID (everything before first space)
         size_t first_space = header.find(' ');
         std::string key = header.substr(1, first_space - 1);
 
@@ -478,3 +493,4 @@ std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
 bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
     return file_cache_.find(sequence_id) != file_cache_.end();
 }
+} // namespace TracEon

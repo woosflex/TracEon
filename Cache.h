@@ -7,13 +7,13 @@
 #include <variant>
 #include <cstddef>
 #include <optional>
-
 #include "IEncodingStrategy.h"
 #include "RecordTypes.h"
 #include "DecodedRecordTypes.h"
 
 namespace TracEon {
 
+    class FileReader;
     // The main class for the TracEon in-memory cache.
     // It now uses a single, smart strategy for all encoding.
     class Cache {
@@ -30,11 +30,11 @@ namespace TracEon {
         size_t getStoredSize(const std::string& key) const;
 
         // File I/O (existing interface)
-        void loadFile(const std::string& filepath); // <-- The unified loader
+        void loadFile(const std::string& filepath);
         void save(const std::string& filepath);
         void restore(const std::string& filepath);
 
-        // SmartStrategy specific file operations (NEW - these were missing!)
+        // SmartStrategy specific file operations
         void loadSmartFile(const std::string& filepath);
         void saveSmartBinary(const std::string& filepath);
         void loadSmartBinary(const std::string& filepath);
@@ -43,8 +43,8 @@ namespace TracEon {
 
     private:
         // Private helpers for loading specific file types
-        void loadFasta(std::ifstream& file);
-        void loadFastq(std::ifstream& file);
+        void loadFastaFromReader(FileReader& file, const std::string& first_line);
+        void loadFastqFromReader(FileReader& file, const std::string& first_line);
 
         // A single, smart strategy for all data types.
         std::unique_ptr<IEncodingStrategy> m_strategy;
