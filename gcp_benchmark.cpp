@@ -286,6 +286,43 @@ std::string decompressFile(const std::string& gz_filepath) {
 double benchmarkDiskSearch(const std::string& filepath, const std::string& target_id, bool is_fastq) {
     DetailedTimer timer;
 
-    FileReader file(filepath);
+    std::ifstream file(filepath);
     std::string line, current_id, result;
     bool found = false;
+
+    if (is_fastq) {
+        std::string header, sequence, plus, quality;
+        while (std::getline(file, header) && !found) {
+            std::getline(file, sequence);
+            std::getline(file, plus);
+            std::getline(file, quality);
+
+            if (!header.empty() && header[0] == '@') {
+                size_t space = header.find(' ');
+                current_id = header.substr(1, space - 1);
+                if (current_id == target_id) {
+                    result = sequence;
+                    found = true;
+                }
+            }
+        }
+    } else {
+        std::string sequence;
+        while (std::getline(file, line) && !found) {
+            if (!line.empty() && line[0] == '>') {
+                if (!current_id.empty() && current_id == target_id) {
+                    result = sequence;
+                    found = true;
+                    break;
+                }
+                size_t space = line.find(' ');
+                current_id = line.substr(1, space - 1);
+                sequence.clear();
+            } else {
+                sequence += line;
+            }
+        }
+    }
+
+    return timer.stop().elapsed_ms;
+}
