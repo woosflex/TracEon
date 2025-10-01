@@ -6,12 +6,12 @@ on:
     tags:
       - 'v*'
 
-# Add permissions for the GITHUB_TOKEN to create a release
+# Add permissions for the GITHUB_TOKEN to create a release and write assets
 permissions:
   contents: write
 
 jobs:
-  # This job creates the GitHub Release and gets the URL for uploading assets.
+  # This job creates the GitHub Release once.
   create_release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -29,14 +29,20 @@ jobs:
           draft: false
           prerelease: false
 
-  # This job builds the binaries for each OS.
+  # This job builds the binaries for each OS and architecture in parallel.
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build on ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
     needs: create_release # This job runs only after the release has been created.
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        platform:
+          - { os: ubuntu-latest, arch: 'x64' }
+          - { os: windows-latest, arch: 'x64' }
+          - { os: windows-latest-arm64, arch: 'arm64' } # Windows on ARM
+          - { os: macos-12, arch: 'x64' }            # Intel macOS
+          - { os: macos-latest, arch: 'arm64' }        # Apple Silicon macOS
+
+    runs-on: ${{ matrix.platform.os }}
 
     steps:
       - name: Checkout code
@@ -49,36 +55,36 @@ jobs:
         run: cmake --build ${{ github.workspace }}/build --config Release
 
       - name: Prepare Artifacts for Windows
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path ${{ github.workspace }}/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-amd64.zip
+          Compress-Archive -Path ${{ github.workspace }}/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
         shell: pwsh
 
       - name: Prepare Artifacts for Linux/macOS
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
         run: |
-          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz -C ${{ github.workspace }}/build gcp_benchmark
+          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz -C ${{ github.workspace }}/build gcp_benchmark
         shell: bash
 
       - name: Upload Release Asset (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/traceon-windows-amd64.zip
-          asset_name: traceon-windows-amd64.zip
+          asset_path: ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
+          asset_name: traceon-windows-${{ matrix.platform.arch }}.zip
           asset_content_type: application/zip
 
       - name: Upload Release Asset (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
-          asset_name: traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
+          asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
+          asset_name: traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
           asset_content_type: application/gzip
 
