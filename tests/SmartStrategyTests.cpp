@@ -1,39 +1,40 @@
 #include <catch2/catch_all.hpp>
-#include "../SmartStrategy.h" // This file doesn't exist yet
+#include <vector>
+#include <string>
+#include "../SmartStrategy.h"
 
-TEST_CASE("SmartStrategy automatic encoding", "[strategy][smart]") {
-    TracEon::SmartStrategy strategy;
+// Note: These tests assume the presence of 'simple.fasta' and 'simple.fastq'
+// in the '../test_data/' directory, consistent with other test files.
 
-    SECTION("Correctly encodes and decodes DNA") {
-        std::string dna = "GATTACAGATTACAGATTACAGATTACA"; // 28 bytes - longer sequence
-        auto encoded = strategy.encode(dna);
-        // Now we'll see actual compression benefits
-        REQUIRE(encoded.size() < dna.size());
-        REQUIRE(strategy.decode(encoded) == dna);
+TEST_CASE("SmartStrategy File Loading", "[strategy]") {
+
+    SECTION("Can load a simple FASTA file") {
+        TracEon::SmartStrategy strategy;
+        std::string test_file_path = "../test_data/simple.fasta";
+
+        strategy.loadFile(test_file_path);
+
+        REQUIRE(strategy.getFileCacheSize() == 2);
+        REQUIRE(strategy.getSequence("seq1") == "GATTACA");
+        REQUIRE(strategy.getSequence("seq2") == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
+        REQUIRE(strategy.getQuality("seq1").empty()); // FASTA has no quality scores
     }
 
-    SECTION("Correctly encodes and decodes RNA") {
-        std::string rna = "GAUUACAGAUUACAGAUUACAGAUUACA"; // 28 bytes - longer sequence
-        auto encoded = strategy.encode(rna);
-        REQUIRE(encoded.size() < rna.size());
-        // Check that U is treated like T for compression
-        REQUIRE(strategy.decode(encoded) == "GATTACAGATTACAGATTACAGATTACA");
-    }
+    SECTION("Can load a simple FASTQ file") {
+        TracEon::SmartStrategy strategy;
+        std::string test_file_path = "../test_data/simple.fastq";
 
-    SECTION("Correctly encodes and decodes Quality Scores with RLE") {
-        std::string quality = "FFFFHHHHIIIIJJJJ"; // 16 bytes
-        // Give a hint to the encoder that this is a quality string
-        auto encoded = strategy.encode(quality, DataTypeHint::QualityScore);
-        REQUIRE(encoded.size() < quality.size());
-        REQUIRE(encoded.size() == 9); // 1 byte header + 8 bytes of RLE data
-        REQUIRE(strategy.decode(encoded) == quality);
-    }
+        strategy.loadFile(test_file_path);
 
-    SECTION("Correctly handles Protein sequences (no compression)") {
-        std::string protein = "LVFP"; // A non-compressible string
-        auto encoded = strategy.encode(protein);
-        // Expect 1-byte header + 4 bytes of plain text data
-        REQUIRE(encoded.size() == protein.size() + 1);
-        REQUIRE(strategy.decode(encoded) == protein);
+        REQUIRE(strategy.getFileCacheSize() == 2);
+
+        // Check first record
+        REQUIRE(strategy.getSequence("seq1") == "GATTACA");
+        REQUIRE(strategy.getQuality("seq1") == "@@@DDDD");
+
+        // Check second record
+        REQUIRE(strategy.getSequence("seq2") == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
+        REQUIRE(strategy.getQuality("seq2") == "HHHIIIIIIIIIIIIIIIIIIIIIII");
     }
 }
+

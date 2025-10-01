@@ -1,16 +1,31 @@
-# CMake build directories
-/cmake-build-*/
-
 # Generated test data and cache files
 /large_test.fasta
 /test_cache.bin
 
 # CLion specific files
 .idea/
+# CMake build files
+/cmake-build-*/
+/build/
 
-# Other common generated files
-*.o
-*.a
-*.so
-*.dll
+# IDE-specific files (CLion, VSCode, etc.)
+/.idea/
+/.vscode/
+
+# Binaries and executables
 *.exe
+*.dll
+*.so
+*.a
+*.out
+
+# Test and benchmark artifacts
+*.bin
+*.log
+*.txt
+
+# macOS system files
+.DS_Store
+
+# User-specific files
+cmake-build-debug-wsl/

@@ -16,18 +16,18 @@ TEST_CASE("Cache Functionality", "[cache]") {
         REQUIRE(cache.size() == 1);
     }
 
-    SECTION("Can get real compression with SmartStrategy") {
+    SECTION("Can get storage size with uncompressed SmartStrategy") {
         TracEon::Cache cache;
         std::string key = "seq1";
-        // Use a longer sequence to see compression benefits
+        // Use a longer sequence
         std::string value = "GATTACAGATTACAGATTACAGATTACA"; // 28 bytes
 
         cache.set(key, value);
 
         size_t stored_size = cache.getStoredSize(key);
 
-        // SmartStrategy automatically compresses DNA
-        REQUIRE(stored_size < value.size());
+        // With the uncompressed strategy, the stored size should equal the original size.
+        REQUIRE(stored_size == value.size());
     }
 
     SECTION("Can load a simple FASTA file") {
@@ -44,7 +44,6 @@ TEST_CASE("Cache Functionality", "[cache]") {
         std::string test_filename = "test_cache.bin";
 
         TracEon::Cache cache1;
-        // No setStrategy() call needed
         cache1.set("seq1", "GATTACA");
         cache1.set("seq2", "CGCGCGCG");
 

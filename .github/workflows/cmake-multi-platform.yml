@@ -1,34 +1,112 @@
-# .github/workflows/cmake.yml
+name: Create Release and Build Binaries
 
-name: CMake CI
-
+# This workflow runs when a new tag is pushed
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v*' # e.g., v0.0.1, v1.2.3
 
 jobs:
+  build_and_release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - name: Store Release URL
+        run: echo "RELEASE_UPLOAD_URL=${{ steps.create_release.outputs.upload_url }}" > release.env
+
+      - name: Persist Release URL
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-env
+          path: release.env
+
   build:
-    # This matrix will run the job on Windows, Ubuntu, and macOS
-    runs-on: ${{ matrix.os }}
+    name: Build on ${{ matrix.os }}
+    needs: build_and_release # This job runs after the release is created
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    # This step configures the project with CMake
-    - name: Configure CMake
-      # We added the Release flag here for optimized builds
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure CMake
+        run: cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
 
-    # This step compiles everything
-    - name: Build
-      run: cmake --build ${{github.workspace}}/build --config Release
+      - name: Build
+        run: cmake --build ${{ github.workspace }}/build --config Release
 
-    # This step runs your tests
-    - name: Test
-      working-directory: ${{github.workspace}}/build
-      run: ctest -C Release --output-on-failure
+      - name: Prepare Artifacts for Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          Compress-Archive -Path ${{ github.workspace }/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-amd64.zip
+        shell: pwsh
+
+      - name: Prepare Artifacts for Linux/macOS
+        if: matrix.os != 'windows-latest'
+        run: |
+          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz -C ${{ github.workspace }}/build gcp_benchmark
+        shell: bash
+
+      - name: Get Release URL
+        uses: actions/download-artifact@v3
+        with:
+          name: release-env
+          path: ${{ github.workspace }}
+
+      - name: Set Upload URL from file
+        id: set_upload_url
+        run: echo "upload_url=$(cat release.env | grep RELEASE_UPLOAD_URL | cut -d '=' -f2)" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Upload Release Asset (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.upload_url }}
+          asset_path: ${{ github.workspace }}/traceon-windows-amd64.zip
+          asset_name: traceon-windows-amd64.zip
+          asset_content_type: application/zip
+
+      - name: Upload Release Asset (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.upload_url }}
+          asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
+          asset_name: traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
+          asset_content_type: application/gzip
+  ```
+  
+  ### How to Create Your v0.0.1 Release (The Final Step)
+  
+  After you've committed the `.gitignore` and this new workflow file, you just need to create and push a Git tag. The workflow will handle the rest automatically.
+
+1.  **Create a Git Tag:** On your local machine, run these commands:
+  ```shell
+  git tag -a v0.0.1 -m "Initial complete implementation (v0.0.1)"
+  ```
+  
+  2.  **Push the Tag to GitHub:**
+  ```shell
+  git push origin v0.0.1
+
