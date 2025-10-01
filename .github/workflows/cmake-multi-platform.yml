@@ -1,19 +1,19 @@
 name: Create Release and Build Binaries
 
-# This workflow runs when a new tag is pushed
+# This workflow runs when a new tag is pushed (e.g., v0.0.1, v1.2.3)
 on:
   push:
     tags:
-      - 'v*' # e.g., v0.0.1, v1.2.3
+      - 'v*'
 
 jobs:
-  build_and_release:
-    name: Build and Release
+  # This job creates the GitHub Release and gets the URL for uploading assets.
+  create_release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -25,25 +25,18 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Store Release URL
-        run: echo "RELEASE_UPLOAD_URL=${{ steps.create_release.outputs.upload_url }}" > release.env
-
-      - name: Persist Release URL
-        uses: actions/upload-artifact@v3
-        with:
-          name: release-env
-          path: release.env
-
+  # This job builds the binaries for each OS.
   build:
     name: Build on ${{ matrix.os }}
-    needs: build_and_release # This job runs after the release is created
+    needs: create_release # This job runs only after the release has been created.
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure CMake
         run: cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
@@ -63,24 +56,13 @@ jobs:
           tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz -C ${{ github.workspace }}/build gcp_benchmark
         shell: bash
 
-      - name: Get Release URL
-        uses: actions/download-artifact@v3
-        with:
-          name: release-env
-          path: ${{ github.workspace }}
-
-      - name: Set Upload URL from file
-        id: set_upload_url
-        run: echo "upload_url=$(cat release.env | grep RELEASE_UPLOAD_URL | cut -d '=' -f2)" >> $GITHUB_ENV
-        shell: bash
-
       - name: Upload Release Asset (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ env.upload_url }}
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
           asset_path: ${{ github.workspace }}/traceon-windows-amd64.zip
           asset_name: traceon-windows-amd64.zip
           asset_content_type: application/zip
@@ -91,7 +73,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ env.upload_url }}
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
           asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
-          asset_name: traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
+          asset_name: traceon-${{ toLower(runner.os) }}-${{ runner.arch }}.tar.gz
           asset_content_type: application/gzip
