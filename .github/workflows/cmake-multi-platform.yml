@@ -54,7 +54,7 @@ jobs:
       - name: Prepare Artifacts for Windows
         if: matrix.os == 'windows-latest'
         run: |
-          Compress-Archive -Path ${{ github.workspace }/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-amd64.zip
+          Compress-Archive -Path ${{ github.workspace/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-amd64.zip
         shell: pwsh
 
       - name: Prepare Artifacts for Linux/macOS
