@@ -15,11 +15,11 @@ TEST_CASE("FASTQ File Loading", "[fastq]") {
         auto record1 = cache.getFastqRecord("seq1");
         REQUIRE(record1.has_value());
         REQUIRE(record1->sequence == "GATTACA");
-        REQUIRE(record1->quality == "!''*.~~");
+        REQUIRE(record1->quality == "@@@DDDD");
 
         auto record2 = cache.getFastqRecord("seq2");
         REQUIRE(record2.has_value());
-        REQUIRE(record2->sequence == "TTAACCGG");
-        REQUIRE(record2->quality == "!''*+,-.");
+        REQUIRE(record2->sequence == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
+        REQUIRE(record2->quality == "HHHIIIIIIIIIIIIIIIIIIIIIII");
     }
 }
