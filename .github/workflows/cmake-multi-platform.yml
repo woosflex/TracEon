@@ -95,18 +95,3 @@ jobs:
           asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
           asset_name: traceon-${{ runner.os }}-${{ runner.arch }}.tar.gz
           asset_content_type: application/gzip
-  ```
-  
-  ### How to Create Your v0.0.1 Release (The Final Step)
-  
-  After you've committed the `.gitignore` and this new workflow file, you just need to create and push a Git tag. The workflow will handle the rest automatically.
-
-1.  **Create a Git Tag:** On your local machine, run these commands:
-  ```shell
-  git tag -a v0.0.1 -m "Initial complete implementation (v0.0.1)"
-  ```
-  
-  2.  **Push the Tag to GitHub:**
-  ```shell
-  git push origin v0.0.1
-
