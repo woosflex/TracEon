@@ -41,7 +41,7 @@ jobs:
           - { os: ubuntu-22.04-arm}
           - { os: windows-latest}
           - { os: windows-11-arm} # Windows on ARM
-          - { os: macos-latest-large}            # Intel macOS
+          - { os: macos-15-intel}            # Intel macOS
           - { os: macos-latest}        # Apple Silicon macOS
 
     runs-on: ${{ matrix.platform.os }}
