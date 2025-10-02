@@ -36,11 +36,13 @@ jobs:
     strategy:
       matrix:
         platform:
-          - { os: ubuntu-latest, arch: 'x64' }
-          - { os: windows-latest, arch: 'x64' }
-          - { os: windows-latest-arm64, arch: 'arm64' } # Windows on ARM
-          - { os: macos-12, arch: 'x64' }            # Intel macOS
-          - { os: macos-latest, arch: 'arm64' }        # Apple Silicon macOS
+          - { os: ubuntu-latest}
+          - { os: ubuntu-24.04-arm}
+          - { os: ubuntu-22.04-arm}
+          - { os: windows-latest}
+          - { os: windows-11-arm} # Windows on ARM
+          - { os: macos-latest-large}            # Intel macOS
+          - { os: macos-latest}        # Apple Silicon macOS
 
     runs-on: ${{ matrix.platform.os }}
 
