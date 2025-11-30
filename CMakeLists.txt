@@ -12,6 +12,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Instead of finding the system ZLIB, we build our own version.
 # This makes the project portable and removes external dependencies.
 add_subdirectory(third_party/zlib)
+# --- LZ4 Support (for compressed cache files) ---
+add_subdirectory(third_party/lz4/build/cmake)
+
 
 # --- Source File Definitions ---
 # By defining our source files in variables, we only have to list them once.
@@ -32,8 +35,10 @@ set(TEST_SOURCES
 # --- Library Target ---
 # Here's our main library, 'traceon_core'. All our core logic lives here.
 add_library(traceon_core STATIC ${CORE_SOURCES})
+target_include_directories(traceon_core PUBLIC third_party/lz4/lib)
 target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(traceon_core PUBLIC zlib_static)
+# Link traceon_core to both zlib and lz4
+target_link_libraries(traceon_core PUBLIC zlib_static lz4_static)
 
 # --- Executable Targets ---
 # A simple app for manual testing.
@@ -48,6 +53,10 @@ target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
 add_executable(gcp_benchmark gcp_benchmark.cpp)
 # Link our benchmark against the core library AND our vendored ZLIB.
 target_link_libraries(gcp_benchmark PRIVATE traceon_core)
+
+# --- Benchmark Driver ---
+add_executable(traceon_driver traceon_driver.cpp)
+target_link_libraries(traceon_driver PRIVATE traceon_core)
 
 # --- Test Setup using Catch2 ---
 # This CMake trick automatically downloads Catch2 from GitHub for us.

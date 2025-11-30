@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <variant>
+#include <sstream>
 
 #include "RecordTypes.h"
 
@@ -31,10 +32,16 @@ public:
     std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 
-    // Main file-based operations (now multithreaded)
+    // Main file-based loading operation
     void loadFile(const std::string& filepath);
-    void saveBinary(const std::string& binary_filepath);
-    void loadBinary(const std::string& binary_filepath);
+
+    // --- NEW: In-memory serialization and deserialization methods ---
+    void serialize(std::stringstream& buffer) const;
+    void deserialize(std::stringstream& buffer);
+
+    // --- REMOVED: These are now handled by the Cache class ---
+    // void saveBinary(const std::string& binary_filepath);
+    // void loadBinary(const std::string& binary_filepath);
 
     // File cache access methods (thread-safe)
     std::string getSequence(const std::string& sequence_id) const;
@@ -46,6 +53,9 @@ public:
         std::unordered_map<std::string, std::variant<std::vector<unsigned char>, FastqRecord>>& store,
         const IEncodingStrategy& encoder
     );
+
+    std::vector<std::string> getAllKeys() const;
+
     // Utility methods
     FileFormat getDetectedFormat() const { return detected_format_; }
     void clearFileCache();

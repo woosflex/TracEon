@@ -194,84 +194,84 @@ void SmartStrategy::loadFile(const std::string& filepath) {
               << num_threads << " parsing thread(s)." << std::endl;
 }
 
-void SmartStrategy::saveBinary(const std::string& binary_filepath) {
-    std::ofstream file(binary_filepath, std::ios::binary);
-    if (!file.is_open()) throw std::runtime_error("Cannot create binary file: " + binary_filepath);
-
+// --- NEW: Implementation of serialize ---
+void SmartStrategy::serialize(std::stringstream& buffer) const {
     std::lock_guard<std::mutex> lock(cache_mutex_);
 
-    // Write magic number for SmartStrategy format
-    const char magic[] = "SMRT";
-    file.write(magic, 4);
+    // This logic is moved directly from the old saveBinary method.
+    // Instead of writing to a file, it writes to the in-memory buffer.
 
     uint8_t format_byte = static_cast<uint8_t>(detected_format_);
-    file.write(reinterpret_cast<const char*>(&format_byte), sizeof(format_byte));
+    buffer.write(reinterpret_cast<const char*>(&format_byte), sizeof(format_byte));
 
     uint64_t num_sequences = file_cache_.size();
-    file.write(reinterpret_cast<const char*>(&num_sequences), sizeof(num_sequences));
+    buffer.write(reinterpret_cast<const char*>(&num_sequences), sizeof(num_sequences));
 
     for (const auto& [key, data] : file_cache_) {
         uint32_t id_len = data.id.length();
-        file.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
-        file.write(data.id.c_str(), id_len);
+        buffer.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
+        buffer.write(data.id.c_str(), id_len);
 
         uint32_t seq_len = data.sequence.length();
-        file.write(reinterpret_cast<const char*>(&seq_len), sizeof(seq_len));
-        file.write(data.sequence.c_str(), seq_len);
+        buffer.write(reinterpret_cast<const char*>(&seq_len), sizeof(seq_len));
+        buffer.write(data.sequence.c_str(), seq_len);
 
         uint32_t qual_len = data.quality.length();
-        file.write(reinterpret_cast<const char*>(&qual_len), sizeof(qual_len));
+        buffer.write(reinterpret_cast<const char*>(&qual_len), sizeof(qual_len));
         if (qual_len > 0) {
-            file.write(data.quality.c_str(), qual_len);
+            buffer.write(data.quality.c_str(), qual_len);
         }
     }
-
-    std::cout << "Saved " << file_cache_.size() << " sequences to: " << binary_filepath << std::endl;
 }
 
-void SmartStrategy::loadBinary(const std::string& binary_filepath) {
-    std::ifstream file(binary_filepath, std::ios::binary);
-    if (!file.is_open()) throw std::runtime_error("Cannot open binary file: " + binary_filepath);
-
-    // Check magic number
-    char magic[4];
-    file.read(magic, 4);
-    if (std::string(magic, 4) != "SMRT") {
-        throw std::runtime_error("Invalid SmartStrategy binary file format");
-    }
-
+// --- NEW: Implementation of deserialize ---
+void SmartStrategy::deserialize(std::stringstream& buffer) {
     clearFileCache();
+    std::lock_guard<std::mutex> lock(cache_mutex_); // Lock for the whole operation
+
+    // This logic is moved directly from the old loadBinary method.
+    // Instead of reading from a file, it reads from the in-memory buffer.
 
     uint8_t format_byte;
-    file.read(reinterpret_cast<char*>(&format_byte), sizeof(format_byte));
+    buffer.read(reinterpret_cast<char*>(&format_byte), sizeof(format_byte));
     detected_format_ = static_cast<FileFormat>(format_byte);
 
     uint64_t num_sequences;
-    file.read(reinterpret_cast<char*>(&num_sequences), sizeof(num_sequences));
+    buffer.read(reinterpret_cast<char*>(&num_sequences), sizeof(num_sequences));
 
     for (uint64_t i = 0; i < num_sequences; ++i) {
         SequenceData data;
         uint32_t len;
 
-        file.read(reinterpret_cast<char*>(&len), sizeof(len));
+        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
         data.id.resize(len);
-        file.read(&data.id[0], len);
+        buffer.read(&data.id[0], len);
 
-        file.read(reinterpret_cast<char*>(&len), sizeof(len));
+        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
         data.sequence.resize(len);
-        file.read(&data.sequence[0], len);
+        buffer.read(&data.sequence[0], len);
 
-        file.read(reinterpret_cast<char*>(&len), sizeof(len));
+        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
         if (len > 0) {
             data.quality.resize(len);
-            file.read(&data.quality[0], len);
+            buffer.read(&data.quality[0], len);
         }
 
         file_cache_[data.id] = std::move(data);
     }
-
-    std::cout << "Loaded " << file_cache_.size() << " sequences from: " << binary_filepath << std::endl;
 }
+
+
+// --- REMOVED: saveBinary and loadBinary ---
+/*
+void SmartStrategy::saveBinary(const std::string& binary_filepath) {
+    // This entire function body is now inside serialize() and Cache::saveSmartBinary()
+}
+
+void SmartStrategy::loadBinary(const std::string& binary_filepath) {
+    // This entire function body is now inside deserialize() and Cache::loadSmartBinary()
+}
+*/
 
 void SmartStrategy::determine_format_from_cache() {
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -319,6 +319,16 @@ std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
 bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     return file_cache_.find(sequence_id) != file_cache_.end();
+}
+
+std::vector<std::string> SmartStrategy::getAllKeys() const {
+    std::vector<std::string> keys;
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    keys.reserve(file_cache_.size());
+    for (const auto& pair : file_cache_) {
+        keys.push_back(pair.first);
+    }
+    return keys;
 }
 
 bool SmartStrategy::isNucleotideSequence(const std::string& data) const {
