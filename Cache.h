@@ -12,8 +12,14 @@
 #include "DecodedRecordTypes.h"
 
 namespace TracEon {
-
     class FileReader;
+
+    // Defines the storage mode for saving the cache.
+    enum class SaveMode {
+        Uncompressed, // Fastest for quick save/restore
+        Compressed    // Smaller file size for long-term storage
+    };
+
     // The main class for the TracEon in-memory cache.
     // It now uses a single, smart strategy for all encoding.
     class Cache {
@@ -36,10 +42,13 @@ namespace TracEon {
 
         // SmartStrategy specific file operations
         void loadSmartFile(const std::string& filepath);
-        void saveSmartBinary(const std::string& filepath);
+        // MODIFIED: Added SaveMode parameter
+        void saveSmartBinary(const std::string& filepath, SaveMode mode = SaveMode::Uncompressed);
         void loadSmartBinary(const std::string& filepath);
 
         void set(const std::string& key, const std::string& value);
+
+        IEncodingStrategy* getStrategy() { return m_strategy.get(); }
 
     private:
         // Private helpers for loading specific file types
