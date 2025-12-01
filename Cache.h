@@ -3,68 +3,52 @@
 
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <vector>
 #include <memory>
-#include <variant>
-#include <cstddef>
 #include <optional>
+
 #include "IEncodingStrategy.h"
 #include "RecordTypes.h"
 #include "DecodedRecordTypes.h"
+#include "MapDefs.h" // For HashMap definition if needed elsewhere
 
 namespace TracEon {
-    class FileReader;
+    class SmartStrategy; // Forward declare to avoid circular dependency issues if any
 
-    // Defines the storage mode for saving the cache.
-    enum class SaveMode {
-        Uncompressed, // Fastest for quick save/restore
-        Compressed    // Smaller file size for long-term storage
-    };
-
-    // The main class for the TracEon in-memory cache.
-    // It now uses a single, smart strategy for all encoding.
     class Cache {
     public:
         Cache();
         ~Cache();
 
-        // Data Interaction
+        // --- Data Access ---
+        
+        // Legacy: Returns a copy of the string (compatibility)
         std::string get(const std::string& key);
 
+        // V2.0: Returns a Zero-Copy view into the arena/mmap
         std::string_view getView(const std::string& key);
 
         std::optional<DecodedFastqRecord> getFastqRecord(const std::string& key);
 
-        // Status & Inspection
-        size_t size() const;
-        size_t getStoredSize(const std::string& key) const;
-
-        // File I/O (existing interface)
+        // --- I/O Operations ---
+        
         void loadFile(const std::string& filepath);
+        
+        // Optimized Binary I/O
         void save(const std::string& filepath);
         void restore(const std::string& filepath);
 
-        // SmartStrategy specific file operations
-        void loadSmartFile(const std::string& filepath);
-        // MODIFIED: Added SaveMode parameter
-        void saveSmartBinary(const std::string& filepath, SaveMode mode = SaveMode::Uncompressed);
-        void loadSmartBinary(const std::string& filepath);
-
+        // Manual Insertion (Legacy support)
         void set(const std::string& key, const std::string& value);
-
-        IEncodingStrategy* getStrategy() { return m_strategy.get(); }
+        
+        size_t size() const;
 
     private:
-        // Private helpers for loading specific file types
-        void loadFastaFromReader(FileReader& file, const std::string& first_line);
-        void loadFastqFromReader(FileReader& file, const std::string& first_line);
+        // Use unique_ptr to abstract the strategy
+        std::unique_ptr<SmartStrategy> m_strategy;
 
-        // A single, smart strategy for all data types.
-        std::unique_ptr<IEncodingStrategy> m_strategy;
-
-        using FastaRecordData = std::vector<unsigned char>;
-        using RecordData = std::variant<FastaRecordData, FastqRecord>;
-        std::unordered_map<std::string, RecordData> m_store;
+        // Legacy fallback store for manually set items (not used in high-perf path)
+        std::unordered_map<std::string, std::string> m_manual_store;
     };
 
 } // namespace TracEon

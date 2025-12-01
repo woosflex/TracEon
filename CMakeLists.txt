@@ -12,17 +12,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Instead of finding the system ZLIB, we build our own version.
 # This makes the project portable and removes external dependencies.
 add_subdirectory(third_party/zlib)
-# --- LZ4 Support (for compressed cache files) ---
+
+# --- LZ4 Support ---
+# Kept for potential benchmark usage or legacy support, 
+# though TracEon 2.0 Core now uses raw Zero-Copy serialization.
 add_subdirectory(third_party/lz4/build/cmake)
 
-
 # --- Source File Definitions ---
-# By defining our source files in variables, we only have to list them once.
+# We update the core sources to include the new MapDefs.h and remove the obsolete FileReader.
 set(CORE_SOURCES
         Cache.cpp
         IEncodingStrategy.cpp
         SmartStrategy.cpp
-        FileReader.cpp
+        MapDefs.h          # New: Header for Robin Hood hashing selection
+        # FileReader.cpp   # Removed: TracEon 2.0 uses direct Arena/MMAP loading
 )
 
 set(TEST_SOURCES
@@ -33,10 +36,16 @@ set(TEST_SOURCES
 )
 
 # --- Library Target ---
-# Here's our main library, 'traceon_core'. All our core logic lives here.
+# Here's our main library, 'traceon_core'.
+# All our core logic lives here.
 add_library(traceon_core STATIC ${CORE_SOURCES})
+
+# Include directories:
+# 1. lz4/lib for LZ4 headers
+# 2. CMAKE_CURRENT_SOURCE_DIR so we can include "third_party/robin_hood.h" and local headers
 target_include_directories(traceon_core PUBLIC third_party/lz4/lib)
 target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Link traceon_core to both zlib and lz4
 target_link_libraries(traceon_core PUBLIC zlib_static lz4_static)
 
@@ -49,6 +58,7 @@ target_link_libraries(trac-eon-test PRIVATE traceon_core)
 ## Comprehensive benchmark executable
 add_executable(comprehensive_benchmark comprehensive_benchmark.cpp)
 target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
+
 ## GCP NGS Benchmark executable
 add_executable(gcp_benchmark gcp_benchmark.cpp)
 # Link our benchmark against the core library AND our vendored ZLIB.

@@ -2,26 +2,34 @@
 #define TRACEON_SMARTSTRATEGY_H
 
 #include "IEncodingStrategy.h"
+#include "MapDefs.h"
+#include "RecordTypes.h"
+
 #include <string>
 #include <string_view>
 #include <vector>
-#include <unordered_map>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <variant>
-#include <sstream>
-
-#include "RecordTypes.h"
+#include <filesystem>
 
 namespace TracEon {
 
-// Forward-declare FileReader to avoid including its full header here
-class FileReader;
+// Forward declaration for the PIMPL-style handling of OS-specific MMAP resources
+struct MMapHandle;
 
-// Enum for identifying the type of biological data in the file
+// Enum for identifying the type of biological data
 enum class FileFormat : uint8_t {
     DNA_FASTA = 0x00, RNA_FASTA = 0x01, PROTEIN_FASTA = 0x02,
-    DNA_FASTQ = 0x03, RNA_FASTQ = 0x04, PROTEIN_FASTQ = 0x05
+    DNA_FASTQ = 0x03, RNA_FASTQ = 0x04, PROTEIN_FASTQ = 0x05,
+    UNKNOWN = 0xFF
+};
+
+// Zero-Copy Data Structure
+struct SequenceView {
+    std::string_view id;
+    std::string_view sequence;
+    std::string_view quality; // Empty for FASTA
 };
 
 class SmartStrategy : public IEncodingStrategy {
@@ -29,78 +37,65 @@ public:
     SmartStrategy();
     virtual ~SmartStrategy();
 
-    // IEncodingStrategy interface
+    // IEncodingStrategy interface (Legacy wrappers)
     std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 
-    // Main file-based loading operation
+    // --- Core Loading Operations ---
+
+    // Parses text file into the Arena (In-Memory)
     void loadFile(const std::string& filepath);
 
-    // --- NEW: In-memory serialization and deserialization methods ---
-    void serialize(std::stringstream& buffer) const;
-    void deserialize(std::stringstream& buffer);
+    // Maps a binary file directly into memory (Zero-Copy)
+    void loadBinary(const std::string& filepath);
 
-    // --- REMOVED: These are now handled by the Cache class ---
-    // void saveBinary(const std::string& binary_filepath);
-    // void loadBinary(const std::string& binary_filepath);
+    // Serializes current cache to the custom binary format
+    void saveBinary(const std::string& filepath) const;
 
-    // File cache access methods (thread-safe)
+    // --- Access Methods ---
+
+    // New Zero-Copy Accessor
+    std::string_view getView(const std::string_view& sequence_id) const;
+
+    // Legacy String Accessors (Constructs a string from the view)
     std::string getSequence(const std::string& sequence_id) const;
     std::string getQuality(const std::string& sequence_id) const;
-
-    std::string_view getSequenceView(const std::string& sequence_id) const;
-
     bool hasSequence(const std::string& sequence_id) const;
     size_t getFileCacheSize() const;
-
-    void mergeFileCacheInto(
-        std::unordered_map<std::string, std::variant<std::vector<unsigned char>, FastqRecord>>& store,
-        const IEncodingStrategy& encoder
-    );
-
     std::vector<std::string> getAllKeys() const;
 
-    // Utility methods
+    // Utility
+    void clearCache();
     FileFormat getDetectedFormat() const { return detected_format_; }
-    void clearFileCache();
 
 private:
-    // Internal struct to hold sequence data
-    struct SequenceData {
-        std::string id;
-        std::string sequence;
-        std::string quality;
-    };
+    // --- Data Storage ---
 
-    // Type aliases for multithreading logic
-    using SequenceCache = std::unordered_map<std::string, SequenceData>;
-    using Chunk = std::vector<char>;
-    using ParsedChunk = std::vector<SequenceData>;
+    // 1. Arena for text-based loading. Stores the full file content contiguously.
+    std::vector<char> text_arena_;
 
-    // Member variables
-    SequenceCache file_cache_;
+    // 2. Handle for Memory Mapped files (OS specific resource).
+    std::unique_ptr<MMapHandle> mmap_handle_;
+
+    // 3. CRITICAL FIX: Use std::string keys (owned) with SequenceView values (views)
+    // This enables hash caching and fast lookups while maintaining zero-copy for values
+    HashMap<std::string, SequenceView> file_cache_;
+
     FileFormat detected_format_;
-    mutable std::mutex cache_mutex_; // Protects access to file_cache_
+    
+    // Use shared_mutex for concurrent reads
+    mutable std::shared_mutex cache_mutex_;
 
-    // Private helper methods for multithreading
-    ParsedChunk parse_chunk_fasta(const Chunk& buffer) const;
-    ParsedChunk parse_chunk_fastq(const Chunk& buffer) const;
+    // Helpers
     void determine_format_from_cache();
-
-    // Private helper methods for content analysis
-    bool isNucleotideSequence(const std::string& data) const;
-    bool hasRNA(const std::string& data) const;
-
-    // Private helper methods for encoding/decoding
-    std::vector<unsigned char> encode_nucleotide(const std::string& data) const;
-    std::string decode_nucleotide(const std::vector<unsigned char>& data) const;
-    std::vector<unsigned char> encode_rle(const std::string& data) const;
-    std::string decode_rle(const std::vector<unsigned char>& data) const;
-    std::vector<unsigned char> encode_plain(const std::string& data) const;
-    std::string decode_plain(const std::vector<unsigned char>& data) const;
+    bool isNucleotideSequence(std::string_view data) const;
+    bool hasRNA(std::string_view data) const;
+    
+    // Optimized parsers
+    void parseFastaOptimized(std::string_view content);
+    void parseFastqOptimized(std::string_view content);
 };
 
 } // namespace TracEon
 
 #endif // TRACEON_SMARTSTRATEGY_H
-
