@@ -36,6 +36,18 @@ struct SequenceView {
     std::string_view quality;  
 };
 
+// --- ADAPTIVE INDEX TYPES ---
+// Mode A: Genome/Long-Read (Safe, Owned Keys)
+using GenomeIndex = HashMap<std::string, SequenceView>;
+
+// Mode B: NGS/Short-Read (Fast, Hash Keys)
+using NGSIndex = HashMap<uint64_t, SequenceView>;
+
+enum class IndexMode {
+    GENOME, // Hybrid (std::string key)
+    NGS     // Hash-Only (uint64_t key)
+};
+
 class SmartStrategy : public IEncodingStrategy {
 public:
     SmartStrategy();
@@ -63,18 +75,16 @@ public:
     // Utility
     void clearCache();
     FileFormat getDetectedFormat() const { return detected_format_; }
+    IndexMode getIndexMode() const; 
 
 private:
-    // 1. Arena for text (Stable memory)
+    // 1. Stable Memory
     std::vector<char> text_arena_;
-
-    // 2. MMAP Handle (Stable memory)
     std::unique_ptr<MMapHandle> mmap_handle_;
 
-    // 3. CACHE: Key is std::string (OWNED), Value is SequenceView (ZERO-COPY)
-    // Hybrid Architecture: Safe Keys, Fast Values.
-    HashMap<std::string, SequenceView> file_cache_;
-
+    // 2. POLYMORPHIC CACHE (The Adaptive Core)
+    std::variant<GenomeIndex, NGSIndex> file_cache_;
+    
     FileFormat detected_format_;
     mutable std::shared_mutex cache_mutex_;
 
@@ -82,8 +92,23 @@ private:
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
+    uint64_t hash_key(std::string_view key) const; 
     
-    // Parsers
+    // Templated Parsers (Internal)
+    template <typename MapType>
+    void parseFastaInternal(std::string_view content, MapType& map);
+    
+    template <typename MapType>
+    void parseFastqInternal(std::string_view content, MapType& map);
+
+    // Templated Multithreaded Parsers
+    template <typename MapType>
+    void parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map);
+
+    template <typename MapType>
+    void parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map);
+
+    // --- Fix: Added missing declarations for wrappers defined in .cpp ---
     void parseFastaOptimized(std::string_view content);
     void parseFastqOptimized(std::string_view content);
     void parseFastaMultithreaded(std::string_view content);
