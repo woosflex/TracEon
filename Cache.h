@@ -6,14 +6,15 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 #include "IEncodingStrategy.h"
 #include "RecordTypes.h"
 #include "DecodedRecordTypes.h"
-#include "MapDefs.h" // For HashMap definition if needed elsewhere
+#include "MapDefs.h" 
 
 namespace TracEon {
-    class SmartStrategy; // Forward declare to avoid circular dependency issues if any
+    class SmartStrategy; // Forward declaration
 
     class Cache {
     public:
@@ -21,33 +22,26 @@ namespace TracEon {
         ~Cache();
 
         // --- Data Access ---
-        
-        // Legacy: Returns a copy of the string (compatibility)
         std::string get(const std::string& key);
-
-        // V2.0: Returns a Zero-Copy view into the arena/mmap
         std::string_view getView(const std::string& key);
-
         std::optional<DecodedFastqRecord> getFastqRecord(const std::string& key);
 
+        // --- NEW: Existence Check ---
+        bool hasSequence(const std::string& key);
+
         // --- I/O Operations ---
-        
         void loadFile(const std::string& filepath);
-        
-        // Optimized Binary I/O
         void save(const std::string& filepath);
         void restore(const std::string& filepath);
-
-        // Manual Insertion (Legacy support)
         void set(const std::string& key, const std::string& value);
         
         size_t size() const;
 
-    private:
-        // Use unique_ptr to abstract the strategy
-        std::unique_ptr<SmartStrategy> m_strategy;
+        // --- Benchmarking Accessor ---
+        IEncodingStrategy* getStrategy() const;
 
-        // Legacy fallback store for manually set items (not used in high-perf path)
+    private:
+        std::unique_ptr<SmartStrategy> m_strategy;
         std::unordered_map<std::string, std::string> m_manual_store;
     };
 
