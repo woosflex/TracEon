@@ -1,19 +1,69 @@
 #include "SmartStrategy.h"
-#include "FileReader.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
-#include <thread>
-#include <future>
-#include <filesystem>
+#include <cstring>
+#include <stdexcept>
+#include <mutex>
+#include <shared_mutex>
 
-namespace fs = std::filesystem;
+// --- Platform Specific Includes for MMAP ---
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+#else
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <unistd.h>
+#endif
+
 namespace TracEon {
 
-SmartStrategy::SmartStrategy() : detected_format_(FileFormat::DNA_FASTA) {}
-SmartStrategy::~SmartStrategy() = default;
+// --- MMapHandle Implementation ---
 
-// Simple pass-through - no compression
+struct MMapHandle {
+    void* data = nullptr;
+    size_t size = 0;
+#ifdef _WIN32
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
+#else
+    int fd = -1;
+#endif
+
+    MMapHandle() = default;
+
+    ~MMapHandle() {
+        cleanup();
+    }
+
+    void cleanup() {
+#ifdef _WIN32
+        if (data) UnmapViewOfFile(data);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+        data = nullptr; hMap = NULL; hFile = INVALID_HANDLE_VALUE;
+#else
+        if (data && data != MAP_FAILED) munmap(data, size);
+        if (fd != -1) close(fd);
+        data = nullptr; fd = -1;
+#endif
+    }
+};
+
+// --- Constants ---
+static const char MAGIC_BYTES[] = "MMAP";
+
+// --- Constructor / Destructor ---
+
+SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN) {}
+SmartStrategy::~SmartStrategy() {
+    clearCache(); // Ensure views are cleared before destroying arena/mmap
+}
+
+// --- IEncodingStrategy (Legacy/Pass-through) ---
+
 std::vector<unsigned char> SmartStrategy::encode(const std::string& data, DataTypeHint hint) const {
     return {data.begin(), data.end()};
 }
@@ -22,318 +72,351 @@ std::string SmartStrategy::decode(const std::vector<unsigned char>& data) const 
     return {data.begin(), data.end()};
 }
 
-void SmartStrategy::loadFile(const std::string& filepath) {
-    clearFileCache();
+// --- Optimized FASTA Parser (O(N) Single Pass) ---
 
-    const size_t file_size = fs::file_size(filepath);
-    if (file_size == 0) return;
-
-    const bool is_gzipped = (filepath.size() > 3 && filepath.substr(filepath.size() - 3) == ".gz");
-    char record_start_char;
-
-    {
-        FileReader first_line_reader(filepath);
-        std::string first_line;
-        if (!first_line_reader.getline(first_line) || first_line.empty()) {
-            throw std::runtime_error("Cannot read from file: " + filepath);
+void SmartStrategy::parseFastaOptimized(std::string_view content) {
+    const char* ptr = content.data();
+    const char* end = ptr + content.size();
+    
+    while (ptr < end) {
+        // Skip whitespace/empty lines
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) {
+            ++ptr;
         }
-        record_start_char = first_line[0];
+        
+        if (ptr >= end || *ptr != '>') break;
+        
+        // Parse header line
+        ++ptr; // Skip '>'
+        const char* id_start = ptr;
+        
+        // ID is from here until first space or newline
+        while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        const char* id_end = ptr;
+        
+        // Skip rest of header line
+        while (ptr < end && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ++ptr;
+        }
+        
+        // Collect sequence until next '>' or EOF
+        const char* seq_start = ptr;
+        const char* seq_end = seq_start;
+        
+        // Scan for next record marker or EOF
+        while (ptr < end) {
+            if (*ptr == '>') {
+                // Found next record, backtrack to remove trailing whitespace
+                seq_end = ptr;
+                while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) {
+                    --seq_end;
+                }
+                break;
+            }
+            ++ptr;
+        }
+        
+        if (ptr >= end) {
+            // Reached EOF, trim trailing whitespace
+            seq_end = end;
+            while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) {
+                --seq_end;
+            }
+        }
+        
+        // Create views and insert
+        std::string_view id(id_start, id_end - id_start);
+        std::string_view seq(seq_start, seq_end - seq_start);
+        
+        if (!id.empty() && !seq.empty()) {
+            // CRITICAL: Use std::string for key (owned), string_view for values (zero-copy)
+            file_cache_.emplace(std::string(id), SequenceView{id, seq, {}});
+        }
     }
-    const bool is_fastq = (record_start_char == '@');
+}
 
-    // Use single-threaded for small files (< 1MB) or gzipped files
-    const bool use_single_threaded = (file_size < 1024 * 1024) || is_gzipped;
-    const unsigned int num_threads = use_single_threaded ? 1 : std::max(1u, std::thread::hardware_concurrency());
+// --- Optimized FASTQ Parser (O(N) Single Pass) ---
 
-    if (use_single_threaded) {
-        // Single-threaded parsing
-        FileReader reader(filepath);
-        std::string line;
-
-        if (is_fastq) {
-            while (reader.getline(line)) {
-                if (line.empty() || line[0] != '@') continue;
-                std::string s, p, q;
-                if (!reader.getline(s) || !reader.getline(p) || !reader.getline(q)) break;
-
-                size_t first_space = line.find(' ');
-                std::string id = line.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
-                file_cache_[id] = {id, s, q};
-            }
-        } else {
-            std::string id, seq_buffer;
-            while(reader.getline(line)) {
-                if (line.empty()) continue;
-                if (line[0] == '>') {
-                    if (!id.empty()) file_cache_[id] = {id, seq_buffer, ""};
-                    seq_buffer.clear();
-                    size_t first_space = line.find(' ');
-                    id = line.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
-                } else {
-                    seq_buffer += line;
-                }
-            }
-            if (!id.empty()) file_cache_[id] = {id, seq_buffer, ""};
+void SmartStrategy::parseFastqOptimized(std::string_view content) {
+    const char* ptr = content.data();
+    const char* end = ptr + content.size();
+    
+    while (ptr < end) {
+        // Skip whitespace
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) {
+            ++ptr;
         }
+        
+        if (ptr >= end || *ptr != '@') break;
+        
+        // Line 1: @Header
+        ++ptr; // Skip '@'
+        const char* id_start = ptr;
+        
+        while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        const char* id_end = ptr;
+        
+        // Skip rest of header
+        while (ptr < end && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ++ptr;
+        }
+        
+        // Line 2: Sequence
+        const char* seq_start = ptr;
+        while (ptr < end && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        const char* seq_end = ptr;
+        
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ++ptr;
+        }
+        
+        // Line 3: + (skip entire line)
+        while (ptr < end && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ++ptr;
+        }
+        
+        // Line 4: Quality
+        const char* qual_start = ptr;
+        while (ptr < end && *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        const char* qual_end = ptr;
+        
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ++ptr;
+        }
+        
+        // Create views and insert
+        std::string_view id(id_start, id_end - id_start);
+        std::string_view seq(seq_start, seq_end - seq_start);
+        std::string_view qual(qual_start, qual_end - qual_start);
+        
+        if (!id.empty() && !seq.empty()) {
+            file_cache_.emplace(std::string(id), SequenceView{id, seq, qual});
+        }
+    }
+}
+
+// --- Core Logic: Text Loading (Arena) ---
+
+void SmartStrategy::loadFile(const std::string& filepath) {
+    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    clearCache();
+
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("Cannot open file: " + filepath);
+
+    size_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // 1. Allocate Arena
+    text_arena_.resize(fileSize);
+    
+    // 2. Read entire file into Arena
+    if (!file.read(text_arena_.data(), fileSize)) {
+        throw std::runtime_error("Failed to read file into arena");
+    }
+
+    // 3. Parse In-Place (Zero Copy view creation)
+    std::string_view content(text_arena_.data(), fileSize);
+    
+    // Determine format from first character
+    if (content.empty()) return;
+    
+    bool isFastq = (content[0] == '@');
+    
+    // Reserve space for expected entries (heuristic: assume avg 100 bytes per record)
+    file_cache_.reserve(fileSize / 100);
+    
+    // Use optimized O(N) parsers
+    if (isFastq) {
+        parseFastqOptimized(content);
     } else {
-        // Multithreaded parsing with pre-scan
-        std::vector<size_t> record_starts;
+        parseFastaOptimized(content);
+    }
+    
+    determine_format_from_cache();
+}
 
-        // Phase 1: Pre-scan to build index of verified record start positions
-        {
-            std::ifstream scan_file(filepath, std::ios::binary);
-            std::string line;
+// --- Core Logic: Binary Save (Serialization) ---
 
-            if (is_fastq) {
-                // For FASTQ: validate 4-line structure before adding to index
-                while (std::getline(scan_file, line)) {
-                    size_t header_pos = scan_file.tellg();
-                    header_pos = header_pos - line.length() - 1;
+void SmartStrategy::saveBinary(const std::string& filepath) const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot create file: " + filepath);
 
-                    if (!line.empty() && line[0] == '@') {
-                        // Verify this is a true header by checking next 3 lines exist
-                        std::string seq, plus, qual;
-                        size_t saved_pos = scan_file.tellg();
+    // 1. Header
+    out.write(MAGIC_BYTES, 4);
+    
+    // 2. Size
+    uint64_t count = file_cache_.size();
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
 
-                        if (std::getline(scan_file, seq) &&
-                            std::getline(scan_file, plus) &&
-                            std::getline(scan_file, qual) &&
-                            !plus.empty() && plus[0] == '+') {
-                            // Valid 4-line FASTQ record
-                            record_starts.push_back(header_pos);
-                        } else {
-                            // Not a valid record, rewind and continue
-                            scan_file.seekg(saved_pos);
-                        }
-                    }
-                }
-            } else {
-                // For FASTA: simpler - just look for '>'
-                while (std::getline(scan_file, line)) {
-                    if (!line.empty() && line[0] == '>') {
-                        size_t pos = scan_file.tellg();
-                        record_starts.push_back(pos - line.length() - 1);
-                    }
-                }
-            }
+    // 3. Data Loop
+    for (const auto& [key, view] : file_cache_) {
+        uint32_t len;
+        
+        // ID
+        len = static_cast<uint32_t>(view.id.size());
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(view.id.data(), len);
+
+        // Sequence
+        len = static_cast<uint32_t>(view.sequence.size());
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(view.sequence.data(), len);
+
+        // Quality
+        len = static_cast<uint32_t>(view.quality.size());
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        if (len > 0) out.write(view.quality.data(), len);
+    }
+}
+
+// --- Core Logic: Binary Load (MMAP / Zero-Copy) ---
+
+void SmartStrategy::loadBinary(const std::string& filepath) {
+    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    clearCache();
+    
+    mmap_handle_ = std::make_unique<MMapHandle>();
+
+#ifdef _WIN32
+    // Windows MMAP
+    mmap_handle_->hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (mmap_handle_->hFile == INVALID_HANDLE_VALUE) throw std::runtime_error("Win32: Open file failed");
+
+    LARGE_INTEGER size;
+    GetFileSizeEx(mmap_handle_->hFile, &size);
+    mmap_handle_->size = static_cast<size_t>(size.QuadPart);
+
+    mmap_handle_->hMap = CreateFileMappingA(mmap_handle_->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mmap_handle_->hMap) throw std::runtime_error("Win32: CreateFileMapping failed");
+
+    mmap_handle_->data = MapViewOfFile(mmap_handle_->hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!mmap_handle_->data) throw std::runtime_error("Win32: MapViewOfFile failed");
+#else
+    // POSIX MMAP
+    mmap_handle_->fd = open(filepath.c_str(), O_RDONLY);
+    if (mmap_handle_->fd == -1) throw std::runtime_error("Posix: Open failed");
+
+    struct stat sb;
+    if (fstat(mmap_handle_->fd, &sb) == -1) throw std::runtime_error("Posix: fstat failed");
+    mmap_handle_->size = sb.st_size;
+
+    mmap_handle_->data = mmap(NULL, mmap_handle_->size, PROT_READ, MAP_PRIVATE, mmap_handle_->fd, 0);
+    if (mmap_handle_->data == MAP_FAILED) throw std::runtime_error("Posix: mmap failed");
+#endif
+
+    // --- Pointer Arithmetic for Zero-Copy Reconstruction ---
+    
+    const char* ptr = static_cast<const char*>(mmap_handle_->data);
+    const char* end = ptr + mmap_handle_->size;
+
+    // Check Magic
+    if (mmap_handle_->size < 4 || std::strncmp(ptr, MAGIC_BYTES, 4) != 0) {
+        throw std::runtime_error("Invalid binary format: Missing Magic Bytes");
+    }
+    ptr += 4;
+
+    // Read Count
+    uint64_t count = *reinterpret_cast<const uint64_t*>(ptr);
+    ptr += sizeof(uint64_t);
+
+    file_cache_.reserve(count);
+
+    // O(N) Loop
+    for (uint64_t i = 0; i < count; ++i) {
+        if (ptr >= end) break;
+
+        // ID
+        uint32_t id_len = *reinterpret_cast<const uint32_t*>(ptr);
+        ptr += sizeof(uint32_t);
+        std::string_view id_view(ptr, id_len);
+        ptr += id_len;
+
+        // Sequence
+        uint32_t seq_len = *reinterpret_cast<const uint32_t*>(ptr);
+        ptr += sizeof(uint32_t);
+        std::string_view seq_view(ptr, seq_len);
+        ptr += seq_len;
+
+        // Quality
+        uint32_t qual_len = *reinterpret_cast<const uint32_t*>(ptr);
+        ptr += sizeof(uint32_t);
+        std::string_view qual_view;
+        if (qual_len > 0) {
+            qual_view = std::string_view(ptr, qual_len);
+            ptr += qual_len;
         }
 
-        if (record_starts.empty()) {
-            determine_format_from_cache();
-            return;
-        }
-
-        // Phase 2: Divide records among threads
-        size_t total_records = record_starts.size();
-        size_t records_per_thread = (total_records + num_threads - 1) / num_threads;
-
-        std::vector<std::future<std::vector<SequenceData>>> futures;
-
-        for (unsigned int i = 0; i < num_threads; ++i) {
-            size_t start_idx = i * records_per_thread;
-            if (start_idx >= total_records) break;
-
-            size_t end_idx = std::min(start_idx + records_per_thread, total_records);
-
-            futures.push_back(std::async(std::launch::async, [=, this]() {
-                std::vector<SequenceData> local_results;
-                std::ifstream thread_file(filepath, std::ios::binary);
-
-                for (size_t idx = start_idx; idx < end_idx; ++idx) {
-                    thread_file.seekg(record_starts[idx]);
-
-                    if (is_fastq) {
-                        std::string header, sequence, plus, quality;
-
-                        if (!std::getline(thread_file, header)) continue;
-                        if (!std::getline(thread_file, sequence)) continue;
-                        if (!std::getline(thread_file, plus)) continue;
-                        if (!std::getline(thread_file, quality)) continue;
-
-                        if (header.empty() || header[0] != '@') continue;
-
-                        size_t first_space = header.find(' ');
-                        std::string id = header.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
-
-                        local_results.push_back({id, sequence, quality});
-                    } else {
-                        // FASTA
-                        std::string header, seq_buffer, line;
-
-                        if (!std::getline(thread_file, header)) continue;
-
-                        size_t first_space = header.find(' ');
-                        std::string id = header.substr(1, first_space != std::string::npos ? first_space - 1 : std::string::npos);
-
-                        // Read sequence lines until next record or end
-                        while (std::getline(thread_file, line)) {
-                            if (!line.empty() && line[0] == '>') break;
-                            seq_buffer += line;
-                        }
-
-                        local_results.push_back({id, seq_buffer, ""});
-                    }
-                }
-
-                return local_results;
-            }));
-        }
-
-        // Phase 3: Collect results
-        for (auto& future : futures) {
-            auto chunk_results = future.get();
-            for (const auto& data : chunk_results) {
-                file_cache_[data.id] = data;
-            }
-        }
+        // Insert into map - KEY IS OWNED, VALUES ARE VIEWS
+        file_cache_.emplace(std::string(id_view), SequenceView{id_view, seq_view, qual_view});
     }
 
     determine_format_from_cache();
-    std::cout << "Loaded " << getFileCacheSize() << " sequences (format: "
-              << (is_fastq ? "FASTQ" : "FASTA") << ") using "
-              << num_threads << " parsing thread(s)." << std::endl;
 }
 
-// --- NEW: Implementation of serialize ---
-void SmartStrategy::serialize(std::stringstream& buffer) const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+// --- Utilities ---
 
-    // This logic is moved directly from the old saveBinary method.
-    // Instead of writing to a file, it writes to the in-memory buffer.
-
-    uint8_t format_byte = static_cast<uint8_t>(detected_format_);
-    buffer.write(reinterpret_cast<const char*>(&format_byte), sizeof(format_byte));
-
-    uint64_t num_sequences = file_cache_.size();
-    buffer.write(reinterpret_cast<const char*>(&num_sequences), sizeof(num_sequences));
-
-    for (const auto& [key, data] : file_cache_) {
-        uint32_t id_len = data.id.length();
-        buffer.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
-        buffer.write(data.id.c_str(), id_len);
-
-        uint32_t seq_len = data.sequence.length();
-        buffer.write(reinterpret_cast<const char*>(&seq_len), sizeof(seq_len));
-        buffer.write(data.sequence.c_str(), seq_len);
-
-        uint32_t qual_len = data.quality.length();
-        buffer.write(reinterpret_cast<const char*>(&qual_len), sizeof(qual_len));
-        if (qual_len > 0) {
-            buffer.write(data.quality.c_str(), qual_len);
-        }
-    }
-}
-
-// --- NEW: Implementation of deserialize ---
-void SmartStrategy::deserialize(std::stringstream& buffer) {
-    clearFileCache();
-    std::lock_guard<std::mutex> lock(cache_mutex_); // Lock for the whole operation
-
-    // This logic is moved directly from the old loadBinary method.
-    // Instead of reading from a file, it reads from the in-memory buffer.
-
-    uint8_t format_byte;
-    buffer.read(reinterpret_cast<char*>(&format_byte), sizeof(format_byte));
-    detected_format_ = static_cast<FileFormat>(format_byte);
-
-    uint64_t num_sequences;
-    buffer.read(reinterpret_cast<char*>(&num_sequences), sizeof(num_sequences));
-
-    for (uint64_t i = 0; i < num_sequences; ++i) {
-        SequenceData data;
-        uint32_t len;
-
-        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
-        data.id.resize(len);
-        buffer.read(&data.id[0], len);
-
-        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
-        data.sequence.resize(len);
-        buffer.read(&data.sequence[0], len);
-
-        buffer.read(reinterpret_cast<char*>(&len), sizeof(len));
-        if (len > 0) {
-            data.quality.resize(len);
-            buffer.read(&data.quality[0], len);
-        }
-
-        file_cache_[data.id] = std::move(data);
-    }
-}
-
-
-// --- REMOVED: saveBinary and loadBinary ---
-/*
-void SmartStrategy::saveBinary(const std::string& binary_filepath) {
-    // This entire function body is now inside serialize() and Cache::saveSmartBinary()
-}
-
-void SmartStrategy::loadBinary(const std::string& binary_filepath) {
-    // This entire function body is now inside deserialize() and Cache::loadSmartBinary()
-}
-*/
-
-void SmartStrategy::determine_format_from_cache() {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    if (file_cache_.empty()) return;
-
-    const auto& first_seq_data = file_cache_.begin()->second;
-    const auto& first_seq = first_seq_data.sequence;
-    bool is_rna = hasRNA(first_seq);
-    bool is_nuc = isNucleotideSequence(first_seq);
-    bool is_fastq = !first_seq_data.quality.empty();
-
-    if (!is_fastq) {
-        detected_format_ = is_rna ? FileFormat::RNA_FASTA :
-                          is_nuc ? FileFormat::DNA_FASTA :
-                          FileFormat::PROTEIN_FASTA;
-    } else {
-        detected_format_ = is_rna ? FileFormat::RNA_FASTQ :
-                          is_nuc ? FileFormat::DNA_FASTQ :
-                          FileFormat::PROTEIN_FASTQ;
-    }
-}
-
-size_t SmartStrategy::getFileCacheSize() const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    return file_cache_.size();
-}
-
-void SmartStrategy::clearFileCache() {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+void SmartStrategy::clearCache() {
     file_cache_.clear();
+    text_arena_.clear();
+    text_arena_.shrink_to_fit();
+    mmap_handle_.reset(); // Unmaps memory
 }
 
-std::string SmartStrategy::getSequence(const std::string& sequence_id) const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = file_cache_.find(sequence_id);
-    return (it != file_cache_.end()) ? it->second.sequence : "";
-}
-
-std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = file_cache_.find(sequence_id);
-    return (it != file_cache_.end()) ? it->second.quality : "";
-}
-
-std::string_view SmartStrategy::getSequenceView(const std::string& sequence_id) const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = file_cache_.find(sequence_id);
+std::string_view SmartStrategy::getView(const std::string_view& sequence_id) const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_); // Read lock (allows concurrent reads)
+    auto it = file_cache_.find(std::string(sequence_id)); // Temporary string for lookup
     if (it != file_cache_.end()) {
-        // Return a view to the string stored in the map
-        return std::string_view(it->second.sequence);
+        return it->second.sequence;
     }
     return {};
 }
 
+std::string SmartStrategy::getSequence(const std::string& sequence_id) const {
+    std::string_view v = getView(sequence_id);
+    return std::string(v);
+}
+
+std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    auto it = file_cache_.find(sequence_id);
+    if (it != file_cache_.end()) {
+        return std::string(it->second.quality);
+    }
+    return "";
+}
+
 bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
     return file_cache_.find(sequence_id) != file_cache_.end();
 }
 
+size_t SmartStrategy::getFileCacheSize() const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    return file_cache_.size();
+}
+
 std::vector<std::string> SmartStrategy::getAllKeys() const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
     std::vector<std::string> keys;
-    std::lock_guard<std::mutex> lock(cache_mutex_);
     keys.reserve(file_cache_.size());
     for (const auto& pair : file_cache_) {
         keys.push_back(pair.first);
@@ -341,23 +424,26 @@ std::vector<std::string> SmartStrategy::getAllKeys() const {
     return keys;
 }
 
-bool SmartStrategy::isNucleotideSequence(const std::string& data) const {
-    if (data.empty()) return false;
-    int nucleotide_count = 0, total_count = 0;
-    for (char c : data) {
-        if (std::isalpha(c)) {
-            total_count++;
-            char upper_c = std::toupper(c);
-            if (upper_c == 'A' || upper_c == 'T' || upper_c == 'G' || upper_c == 'C' || upper_c == 'U' || upper_c == 'N') {
-                nucleotide_count++;
-            }
-        }
+void SmartStrategy::determine_format_from_cache() {
+    if (file_cache_.empty()) {
+        detected_format_ = FileFormat::UNKNOWN;
+        return;
     }
-    return total_count > 0 && (static_cast<double>(nucleotide_count) / total_count) > 0.8;
+    const auto& first = file_cache_.begin()->second;
+    bool hasQ = !first.quality.empty();
+    bool isRNA = hasRNA(first.sequence);
+    
+    if (hasQ) detected_format_ = isRNA ? FileFormat::RNA_FASTQ : FileFormat::DNA_FASTQ;
+    else detected_format_ = isRNA ? FileFormat::RNA_FASTA : FileFormat::DNA_FASTA;
 }
 
-bool SmartStrategy::hasRNA(const std::string& data) const {
-    return data.find('U') != std::string::npos || data.find('u') != std::string::npos;
+bool SmartStrategy::isNucleotideSequence(std::string_view data) const {
+    if (data.empty()) return false;
+    return true; 
+}
+
+bool SmartStrategy::hasRNA(std::string_view data) const {
+    return data.find('U') != std::string_view::npos || data.find('u') != std::string_view::npos;
 }
 
 } // namespace TracEon
