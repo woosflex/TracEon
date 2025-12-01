@@ -9,6 +9,9 @@
 #include <thread>
 #include <vector>
 #include <cassert>
+#include <cmath>
+#include <functional> 
+#include <cctype>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -51,7 +54,7 @@ struct MMapHandle {
 
 static const char MAGIC_BYTES[] = "MMAP";
 
-SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN) {}
+SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN), file_cache_(GenomeIndex{}) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
 
 std::vector<unsigned char> SmartStrategy::encode(const std::string& data, DataTypeHint hint) const {
@@ -62,19 +65,30 @@ std::string SmartStrategy::decode(const std::vector<unsigned char>& data) const 
     return {data.begin(), data.end()};
 }
 
-// --- Multithreaded Parsers ---
+// --- Hashing Helper ---
+inline uint64_t SmartStrategy::hash_key(std::string_view key) const {
+    return std::hash<std::string_view>{}(key);
+}
 
-void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
+// --- Generic Generic Helpers ---
+template <typename MapType>
+inline void insert_record(MapType& map, std::string_view id, std::string_view seq, std::string_view qual, const SmartStrategy* strat) {
+    if constexpr (std::is_same_v<MapType, GenomeIndex>) {
+        map.emplace(std::string(id), SequenceView{id, seq, qual});
+    } else {
+        map.emplace(strat->hash_key(id), SequenceView{id, seq, qual});
+    }
+}
+
+// --- Templated Multithreaded Parsers ---
+
+template <typename MapType>
+void SmartStrategy::parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map) {
     const size_t num_threads = std::thread::hardware_concurrency();
     const size_t chunk_size = content.size() / num_threads;
     
-    if (chunk_size < 1024 * 1024) { 
-        parseFastaOptimized(content);
-        return;
-    }
-    
     std::vector<std::thread> threads;
-    std::vector<HashMap<std::string, SequenceView>> thread_caches(num_threads);
+    std::vector<MapType> thread_caches(num_threads);
     
     auto worker = [&](size_t thread_id, size_t start, size_t end) {
         const char* ptr = content.data() + start;
@@ -90,7 +104,7 @@ void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
             while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
             if (ptr >= chunk_end || *ptr != '>') break;
             
-            ++ptr; 
+            ++ptr;
             const char* id_start = ptr;
             while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
             const char* id_end = ptr;
@@ -117,11 +131,11 @@ void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
             std::string_view seq(seq_start, seq_end - seq_start);
             
             if (!id.empty() && !seq.empty()) {
-                #ifndef NDEBUG
-                assert(id.find('\n') == std::string_view::npos);
-                assert(id.find('\r') == std::string_view::npos);
-                #endif
-                thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, {}});
+                if constexpr (std::is_same_v<MapType, GenomeIndex>) {
+                    thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, {}});
+                } else {
+                    thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, {}});
+                }
             }
         }
     };
@@ -135,26 +149,19 @@ void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
     
     size_t total_size = 0;
     for (const auto& cache : thread_caches) total_size += cache.size();
-    file_cache_.reserve(total_size);
-    
+    dest_map.reserve(total_size);
     for (auto& cache : thread_caches) {
-        for (auto& entry : cache) {
-            file_cache_.insert(std::move(entry)); 
-        }
+        for (auto& entry : cache) dest_map.insert(std::move(entry));
     }
 }
 
-void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
+template <typename MapType>
+void SmartStrategy::parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map) {
     const size_t num_threads = std::thread::hardware_concurrency();
     const size_t chunk_size = content.size() / num_threads;
     
-    if (chunk_size < 1024 * 1024) {
-        parseFastqOptimized(content);
-        return;
-    }
-    
     std::vector<std::thread> threads;
-    std::vector<HashMap<std::string, SequenceView>> thread_caches(num_threads);
+    std::vector<MapType> thread_caches(num_threads);
     
     auto worker = [&](size_t thread_id, size_t start, size_t end) {
         const char* ptr = content.data() + start;
@@ -204,11 +211,11 @@ void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
             std::string_view qual(qual_start, qual_end - qual_start);
             
             if (!id.empty() && !seq.empty()) {
-                #ifndef NDEBUG
-                assert(id.find('\n') == std::string_view::npos);
-                assert(id.find('\r') == std::string_view::npos);
-                #endif
-                thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, qual});
+                if constexpr (std::is_same_v<MapType, GenomeIndex>) {
+                    thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, qual});
+                } else {
+                    thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, qual});
+                }
             }
         }
     };
@@ -222,30 +229,29 @@ void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
     
     size_t total_size = 0;
     for (const auto& cache : thread_caches) total_size += cache.size();
-    file_cache_.reserve(total_size);
+    dest_map.reserve(total_size);
     for (auto& cache : thread_caches) {
-        for (auto& entry : cache) file_cache_.insert(std::move(entry));
+        for (auto& entry : cache) dest_map.insert(std::move(entry));
     }
 }
 
-// --- Optimized Parsers ---
+// --- Templated Optimized Parsers ---
 
-void SmartStrategy::parseFastaOptimized(std::string_view content) {
+template <typename MapType>
+void SmartStrategy::parseFastaInternal(std::string_view content, MapType& map) {
     const char* ptr = content.data();
     const char* end = ptr + content.size();
-    
+    map.reserve(content.size() / 200); 
+
     while (ptr < end) {
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '>') break;
-        
         ++ptr;
         const char* id_start = ptr;
         while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
         const char* id_end = ptr;
-        
         while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr;
         while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        
         const char* seq_start = ptr;
         const char* seq_end = seq_start;
         while (ptr < end) {
@@ -263,40 +269,38 @@ void SmartStrategy::parseFastaOptimized(std::string_view content) {
         
         std::string_view id(id_start, id_end - id_start);
         std::string_view seq(seq_start, seq_end - seq_start);
+        
         if (!id.empty() && !seq.empty()) {
-            #ifndef NDEBUG
-            assert(id.find('\n') == std::string_view::npos);
-            assert(id.find('\r') == std::string_view::npos);
-            #endif
-            file_cache_.emplace(std::string(id), SequenceView{id, seq, {}});
+            if constexpr (std::is_same_v<MapType, GenomeIndex>) {
+                map.emplace(std::string(id), SequenceView{id, seq, {}});
+            } else {
+                map.emplace(hash_key(id), SequenceView{id, seq, {}});
+            }
         }
     }
 }
 
-void SmartStrategy::parseFastqOptimized(std::string_view content) {
+template <typename MapType>
+void SmartStrategy::parseFastqInternal(std::string_view content, MapType& map) {
     const char* ptr = content.data();
     const char* end = ptr + content.size();
-    
+    map.reserve(content.size() / 150);
+
     while (ptr < end) {
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '@') break;
-        
         ++ptr;
         const char* id_start = ptr;
         while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
         const char* id_end = ptr;
-        
         while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr;
         while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        
         const char* seq_start = ptr;
         while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr;
         const char* seq_end = ptr;
         while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        
         while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr;
         while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        
         const char* qual_start = ptr;
         while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr;
         const char* qual_end = ptr;
@@ -307,16 +311,16 @@ void SmartStrategy::parseFastqOptimized(std::string_view content) {
         std::string_view qual(qual_start, qual_end - qual_start);
         
         if (!id.empty() && !seq.empty()) {
-            #ifndef NDEBUG
-            assert(id.find('\n') == std::string_view::npos);
-            assert(id.find('\r') == std::string_view::npos);
-            #endif
-            file_cache_.emplace(std::string(id), SequenceView{id, seq, qual});
+            if constexpr (std::is_same_v<MapType, GenomeIndex>) {
+                map.emplace(std::string(id), SequenceView{id, seq, qual});
+            } else {
+                map.emplace(hash_key(id), SequenceView{id, seq, qual});
+            }
         }
     }
 }
 
-// --- Loading / Saving ---
+// --- Loading with Adaptive Logic ---
 
 void SmartStrategy::loadFile(const std::string& filepath) {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
@@ -334,18 +338,47 @@ void SmartStrategy::loadFile(const std::string& filepath) {
     if (content.empty()) return;
     
     bool isFastq = (content[0] == '@');
-    file_cache_.reserve(fileSize / 100);
+
+    // PERFORMANCE FIX: 
+    // We force GenomeIndex (Hybrid Mode with std::string keys) for essentially everything.
+    // Why? Short reads (NGS) have short IDs. std::string uses SSO (Small String Optimization) 
+    // to store these short IDs directly inside the map node.
+    // This provides "Hot Cache" locality during lookups.
+    // The previous "Optimization" (Hash Keys) caused "Cold Cache" misses because verification
+    // required chasing pointers into the main Arena.
+    //
+    // We keep the architecture polymorphic in case we later implement a Blocked Bloom Filter index.
     
-    const size_t MULTITHREAD_THRESHOLD = 10 * 1024 * 1024;
-    if (fileSize > MULTITHREAD_THRESHOLD) {
-        if (isFastq) parseFastqMultithreaded(content);
-        else parseFastaMultithreaded(content);
+    bool use_ngs_mode = false; // <--- FORCED DISABLE OF HASH MODE TO RESTORE SPEED
+
+    const size_t MULTITHREAD_THRESHOLD = 10 * 1024 * 1024; // 10MB
+
+    if (use_ngs_mode) {
+        file_cache_ = NGSIndex{};
+        auto& map = std::get<NGSIndex>(file_cache_);
+        if (fileSize > MULTITHREAD_THRESHOLD) {
+            if (isFastq) parseFastqMultithreadedTemplate(content, map);
+            else parseFastaMultithreadedTemplate(content, map);
+        } else {
+            if (isFastq) parseFastqInternal(content, map);
+            else parseFastaInternal(content, map);
+        }
     } else {
-        if (isFastq) parseFastqOptimized(content);
-        else parseFastaOptimized(content);
+        file_cache_ = GenomeIndex{};
+        auto& map = std::get<GenomeIndex>(file_cache_);
+        if (fileSize > MULTITHREAD_THRESHOLD) {
+            if (isFastq) parseFastqMultithreadedTemplate(content, map);
+            else parseFastaMultithreadedTemplate(content, map);
+        } else {
+            if (isFastq) parseFastqInternal(content, map);
+            else parseFastaInternal(content, map);
+        }
     }
+    
     determine_format_from_cache();
 }
+
+// --- Binary IO ---
 
 void SmartStrategy::saveBinary(const std::string& filepath) const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
@@ -353,23 +386,48 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
     if (!out) throw std::runtime_error("Cannot write: " + filepath);
 
     out.write(MAGIC_BYTES, 4);
-    uint64_t count = file_cache_.size();
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    
+    uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+    out.write(reinterpret_cast<const char*>(&mode), 1);
 
-    for (const auto& [key, view] : file_cache_) {
-        // Key is std::string now
-        uint32_t len = static_cast<uint32_t>(key.size());
-        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        out.write(key.data(), len);
+    if (mode == 0) {
+        const auto& map = std::get<GenomeIndex>(file_cache_);
+        uint64_t count = map.size();
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        
+        for (const auto& [key, view] : map) {
+            uint32_t len = static_cast<uint32_t>(key.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            out.write(key.data(), len);
+            
+            len = static_cast<uint32_t>(view.sequence.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            out.write(view.sequence.data(), len);
+            
+            len = static_cast<uint32_t>(view.quality.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            if (len > 0) out.write(view.quality.data(), len);
+        }
+    } else {
+        const auto& map = std::get<NGSIndex>(file_cache_);
+        uint64_t count = map.size();
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        
+        for (const auto& [key, view] : map) {
+            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            
+            uint32_t len = static_cast<uint32_t>(view.id.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            out.write(view.id.data(), len);
 
-        // Sequence/Qual are views
-        len = static_cast<uint32_t>(view.sequence.size());
-        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        out.write(view.sequence.data(), len);
-
-        len = static_cast<uint32_t>(view.quality.size());
-        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        if (len > 0) out.write(view.quality.data(), len);
+            len = static_cast<uint32_t>(view.sequence.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            out.write(view.sequence.data(), len);
+            
+            len = static_cast<uint32_t>(view.quality.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            if (len > 0) out.write(view.quality.data(), len);
+        }
     }
 }
 
@@ -378,7 +436,6 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     clearCache();
     
     mmap_handle_ = std::make_unique<MMapHandle>();
-    // ... MMAP Setup ...
 #ifdef _WIN32
     mmap_handle_->hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     GetFileSizeEx(mmap_handle_->hFile, (PLARGE_INTEGER)&mmap_handle_->size);
@@ -394,37 +451,60 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     const char* ptr = static_cast<const char*>(mmap_handle_->data);
     const char* end = ptr + mmap_handle_->size;
 
-    if (mmap_handle_->size < 4 || std::strncmp(ptr, MAGIC_BYTES, 4) != 0) throw std::runtime_error("Invalid binary");
+    if (mmap_handle_->size < 5 || std::strncmp(ptr, MAGIC_BYTES, 4) != 0) throw std::runtime_error("Invalid binary");
     ptr += 4;
+
+    uint8_t mode = *reinterpret_cast<const uint8_t*>(ptr);
+    ptr += 1;
 
     uint64_t count = *reinterpret_cast<const uint64_t*>(ptr);
     ptr += sizeof(uint64_t);
-    file_cache_.reserve(count);
 
-    for (uint64_t i = 0; i < count; ++i) {
-        if (ptr >= end) break;
-        uint32_t len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-        std::string_view id_view(ptr, len); ptr += len;
-
-        len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-        std::string_view seq(ptr, len); ptr += len;
-
-        len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-        std::string_view qual;
-        if (len > 0) { qual = std::string_view(ptr, len); ptr += len; }
-
-        // HYBRID ARCHITECTURE: 
-        // 1. Copy ID into std::string (KEY)
-        // 2. Keep Sequence as string_view (VALUE) pointing to MMAP
-        // NOTE: We deliberately allow SequenceView.id to point to MMAP (id_view) 
-        // to ensure it points to stable memory, while the map key is an owned copy.
-        file_cache_.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+    if (mode == 0) {
+        file_cache_ = GenomeIndex{};
+        auto& map = std::get<GenomeIndex>(file_cache_);
+        map.reserve(count);
+        
+        for (uint64_t i = 0; i < count; ++i) {
+            uint32_t len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view id_view(ptr, len); ptr += len;
+            
+            uint32_t seq_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view seq(ptr, seq_len); ptr += seq_len;
+            
+            uint32_t qual_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view qual;
+            if (qual_len > 0) { qual = std::string_view(ptr, qual_len); ptr += qual_len; }
+            
+            map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+        }
+    } else {
+        file_cache_ = NGSIndex{};
+        auto& map = std::get<NGSIndex>(file_cache_);
+        map.reserve(count);
+        
+        for (uint64_t i = 0; i < count; ++i) {
+            uint64_t hash = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+            
+            uint32_t len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view id_view(ptr, len); ptr += len;
+            
+            uint32_t seq_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view seq(ptr, seq_len); ptr += seq_len;
+            
+            uint32_t qual_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            std::string_view qual;
+            if (qual_len > 0) { qual = std::string_view(ptr, qual_len); ptr += qual_len; }
+            
+            map.emplace(hash, SequenceView{id_view, seq, qual});
+        }
     }
     determine_format_from_cache();
 }
 
 void SmartStrategy::clearCache() {
-    file_cache_.clear();
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) std::get<GenomeIndex>(file_cache_).clear();
+    else std::get<NGSIndex>(file_cache_).clear();
     text_arena_.clear();
     text_arena_.shrink_to_fit();
     mmap_handle_.reset();
@@ -434,36 +514,147 @@ void SmartStrategy::clearCache() {
 
 std::string_view SmartStrategy::getView(const std::string_view& sequence_id) const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    auto it = file_cache_.find(std::string(sequence_id)); 
-    if (it != file_cache_.end()) return it->second.sequence;
+    
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        const auto& map = std::get<GenomeIndex>(file_cache_);
+        auto it = map.find(std::string(sequence_id)); 
+        if (it != map.end()) return it->second.sequence;
+    } else {
+        const auto& map = std::get<NGSIndex>(file_cache_);
+        uint64_t h = hash_key(sequence_id); 
+        auto it = map.find(h);
+        
+        if (it != map.end() && it->second.id == sequence_id) {
+            return it->second.sequence;
+        }
+    }
     return {};
 }
 
-std::string SmartStrategy::getSequence(const std::string& sequence_id) const {
-    return std::string(getView(sequence_id));
-}
-std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
+// Wrappers
+std::string SmartStrategy::getSequence(const std::string& sequence_id) const { return std::string(getView(sequence_id)); }
+std::string SmartStrategy::getQuality(const std::string& sequence_id) const { 
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    auto it = file_cache_.find(sequence_id);
-    return (it != file_cache_.end()) ? std::string(it->second.quality) : "";
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        auto& map = std::get<GenomeIndex>(file_cache_);
+        auto it = map.find(sequence_id);
+        return (it != map.end()) ? std::string(it->second.quality) : "";
+    } else {
+        auto& map = std::get<NGSIndex>(file_cache_);
+        auto it = map.find(hash_key(sequence_id));
+        return (it != map.end() && it->second.id == sequence_id) ? std::string(it->second.quality) : "";
+    }
 }
 bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    return file_cache_.find(sequence_id) != file_cache_.end();
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        return std::get<GenomeIndex>(file_cache_).count(sequence_id) > 0;
+    } else {
+        auto& map = std::get<NGSIndex>(file_cache_);
+        auto it = map.find(hash_key(sequence_id));
+        return (it != map.end() && it->second.id == sequence_id);
+    }
 }
 size_t SmartStrategy::getFileCacheSize() const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    return file_cache_.size();
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) return std::get<GenomeIndex>(file_cache_).size();
+    return std::get<NGSIndex>(file_cache_).size();
 }
 std::vector<std::string> SmartStrategy::getAllKeys() const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
     std::vector<std::string> keys;
-    keys.reserve(file_cache_.size());
-    for (const auto& pair : file_cache_) keys.emplace_back(pair.first);
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        auto& map = std::get<GenomeIndex>(file_cache_);
+        keys.reserve(map.size());
+        for (const auto& pair : map) keys.emplace_back(pair.first);
+    } else {
+        auto& map = std::get<NGSIndex>(file_cache_);
+        keys.reserve(map.size());
+        for (const auto& pair : map) keys.emplace_back(std::string(pair.second.id));
+    }
     return keys;
 }
-void SmartStrategy::determine_format_from_cache() { /* ... */ }
-bool SmartStrategy::isNucleotideSequence(std::string_view data) const { return !data.empty(); }
-bool SmartStrategy::hasRNA(std::string_view data) const { return data.find('U') != std::string_view::npos; }
+IndexMode SmartStrategy::getIndexMode() const {
+    return std::holds_alternative<GenomeIndex>(file_cache_) ? IndexMode::GENOME : IndexMode::NGS;
+}
+
+void SmartStrategy::determine_format_from_cache() {
+    bool empty = false;
+    SequenceView first_view;
+
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        const auto& map = std::get<GenomeIndex>(file_cache_);
+        if (map.empty()) empty = true;
+        else first_view = map.begin()->second;
+    } else {
+        const auto& map = std::get<NGSIndex>(file_cache_);
+        if (map.empty()) empty = true;
+        else first_view = map.begin()->second;
+    }
+
+    if (empty) {
+        detected_format_ = FileFormat::UNKNOWN;
+        return;
+    }
+
+    bool is_fastq = !first_view.quality.empty();
+    bool is_rna = hasRNA(first_view.sequence);
+    bool is_nuc = isNucleotideSequence(first_view.sequence);
+
+    if (!is_fastq) {
+        detected_format_ = is_rna ? FileFormat::RNA_FASTA :
+                          is_nuc ? FileFormat::DNA_FASTA :
+                          FileFormat::PROTEIN_FASTA;
+    } else {
+        detected_format_ = is_rna ? FileFormat::RNA_FASTQ :
+                          is_nuc ? FileFormat::DNA_FASTQ :
+                          FileFormat::PROTEIN_FASTQ;
+    }
+}
+
+bool SmartStrategy::isNucleotideSequence(std::string_view data) const {
+    if (data.empty()) return false;
+    size_t nucleotide_count = 0;
+    size_t total_count = 0;
+    size_t scan_limit = std::min(data.size(), (size_t)1000);
+    
+    for (size_t i = 0; i < scan_limit; ++i) {
+        char c = data[i];
+        if (std::isalpha(c)) {
+            total_count++;
+            char upper_c = std::toupper(c);
+            if (upper_c == 'A' || upper_c == 'T' || upper_c == 'G' || upper_c == 'C' || upper_c == 'U' || upper_c == 'N') {
+                nucleotide_count++;
+            }
+        }
+    }
+    return total_count > 0 && (static_cast<double>(nucleotide_count) / total_count) > 0.8;
+}
+
+bool SmartStrategy::hasRNA(std::string_view data) const {
+    size_t scan_limit = std::min(data.size(), (size_t)1000);
+    for (size_t i = 0; i < scan_limit; ++i) {
+        if (data[i] == 'U' || data[i] == 'u') return true;
+    }
+    return false;
+}
+
+// Dummy parsers - assuming optimized/threaded versions are identical but called via templates in loadFile
+void SmartStrategy::parseFastaOptimized(std::string_view content) { 
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastaInternal(content, std::get<GenomeIndex>(file_cache_));
+    else parseFastaInternal(content, std::get<NGSIndex>(file_cache_));
+}
+void SmartStrategy::parseFastqOptimized(std::string_view content) {
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastqInternal(content, std::get<GenomeIndex>(file_cache_));
+    else parseFastqInternal(content, std::get<NGSIndex>(file_cache_));
+}
+void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastaMultithreadedTemplate(content, std::get<GenomeIndex>(file_cache_));
+    else parseFastaMultithreadedTemplate(content, std::get<NGSIndex>(file_cache_));
+}
+void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastqMultithreadedTemplate(content, std::get<GenomeIndex>(file_cache_));
+    else parseFastqMultithreadedTemplate(content, std::get<NGSIndex>(file_cache_));
+}
 
 } // namespace
