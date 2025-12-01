@@ -3,238 +3,208 @@ import time
 import subprocess
 import random
 import sys
+import threading
+import psutil
 
 # === CONFIGURATION ===
 TRACEON_BINARY = "./build/traceon_driver"
-SEQTK_BINARY = "seqtk"         # Ensure installed
-TARGET_DATA_VOLUME_MB = 500    # Target 500MB data movement for lookups (keeps runtime sane)
-MAX_LOOKUPS_CAP = 1_000_000    # Cap lookups to prevent infinite loops
+SEQTK_BINARY = "seqtk"
+SEQKIT_BINARY = "seqkit"
+MAX_LOOKUPS = 500000
+TARGET_LOOKUP_VOLUME_MB = 500
 
-# Try importing BioPython
-try:
-    from Bio import SeqIO
-except ImportError:
-    print("Error: BioPython is not installed. Please run: pip install biopython")
-    sys.exit(1)
+# === MATRIX CONFIGURATION ===
+FILE_SIZES_MB = [10, 100, 500, 1000]
 
-# === BIOLOGICAL SCENARIOS ===
-SCENARIOS = [
-    {
-        "name": "WGS (Whole Genome - Illumina)",
-        "type": "fastq",
-        "prefix": "cluster_",
-        "num_seqs": 1_000_000, # 1 Million reads
-        "avg_len": 150,
-        "desc": "High throughput, massive file size"
-    },
-    {
-        "name": "WES (Whole Exome - Illumina)",
-        "type": "fastq",
-        "prefix": "exome_",
-        "num_seqs": 250_000,
-        "avg_len": 100,
-        "desc": "High depth, shorter reads"
-    },
-    {
-        "name": "TGE (Targeted Gene Panel)",
-        "type": "fastq",
-        "prefix": "panel_",
-        "num_seqs": 50_000,
-        "avg_len": 150,
-        "desc": "Low volume, high precision"
-    },
-    {
-        "name": "Long Reads (PacBio HiFi/Nanopore)",
-        "type": "fastq",
-        "prefix": "read_",
-        "num_seqs": 10_000,
-        "avg_len": 15_000, # 15kb reads
-        "desc": "Very long sequences, memory bandwidth heavy"
-    },
-    {
-        "name": "Reference Genome (Alignment/Mapping)",
-        "type": "fasta",
-        "prefix": "chr",
-        "num_seqs": 24,    # Human (1-22, X, Y)
-        "avg_len": 10_000_000, # Simulating 10MB chunks for test speed
-        "desc": "Massive contiguous strings, Random Access heavy"
-    }
+DATA_TYPES = [
+    ("WGS", "fastq", 150),
+    ("WES", "fastq", 100),
+    ("Panel", "fastq", 150),
+    ("PacBio", "fastq", 15_000),
+    ("Nanopore", "fastq", 30_000),
+    ("RefGenome", "fasta", 1_000_000)
 ]
 
-def run_command(cmd):
-    try:
-        start = time.time()
-        # Using a large buffer size for pipe to avoid bottlenecks
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1024*1024)
-        out, err = proc.communicate()
-        end = time.time()
-        return out, proc.returncode, (end - start)
-    except FileNotFoundError:
-        return None, -1, 0
+# === SHIM SCRIPTS ===
+BP_PARSE_SCRIPT = "import sys; from Bio import SeqIO; [x for x in SeqIO.parse(sys.argv[1], sys.argv[2])]"
 
-def parse_val(output, key):
-    if not output: return 0.0
-    for line in output.splitlines():
-        if key in line:
-            return float(line.split(":")[1].strip())
-    return 0.0
-
-def generate_data(filename, scenario):
-    print(f"  Generating {filename} ({scenario['num_seqs']} seqs)...")
-    # Pre-generate a 1MB buffer to slice from (faster than randomizing every char)
-    buffer_len = 1_000_000
-    dna_buffer = "".join(random.choices("ACGT", k=buffer_len))
-    
-    with open(filename, "w") as f:
-        for i in range(scenario['num_seqs']):
-            # Jitter length by +/- 10%
-            length = int(scenario['avg_len'] * random.uniform(0.9, 1.1))
-            start = random.randint(0, buffer_len - length if length < buffer_len else 0)
-            
-            if length > buffer_len:
-                 # Construct massive seqs on the fly
-                 seq = "".join(random.choices("ACGT", k=length))
-            else:
-                 seq = dna_buffer[start : start + length]
-
-            if scenario['type'] == 'fasta':
-                f.write(f">{scenario['prefix']}{i} synthetic_data\n{seq}\n")
-            else:
-                qual = "I" * len(seq) # Phred 40
-                f.write(f"@{scenario['prefix']}{i} synthetic_data\n{seq}\n+\n{qual}\n")
-
-def calculate_adaptive_iterations(scenario):
-    """
-    Adjusts lookup count to process ~500MB of data volume.
-    Ensures benchmarks don't freeze on Reference Genomes but run long enough for WES/WGS.
-    """
-    avg_size_bytes = scenario['avg_len']
-    target_bytes = TARGET_DATA_VOLUME_MB * 1024 * 1024
-    
-    count = int(target_bytes / avg_size_bytes)
-    
-    # Safety Clamps
-    if count < 50: count = 50 
-    if count > MAX_LOOKUPS_CAP: count = MAX_LOOKUPS_CAP
-    
-    return count
-
-# === BENCHMARK CORE ===
-
-def bench_biopython_parse(filename, fmt):
-    start = time.time()
-    # Simply iterate to force parsing
-    for _ in SeqIO.parse(filename, fmt): pass
-    return time.time() - start
-
-def bench_biopython_lookup(filename, fmt, num_lookups, prefix, max_idx):
-    # 1. Load (Dict) - The expensive part
-    try:
-        # Use simple dict for WGS/WES, might OOM on Genome if not careful
-        record_dict = SeqIO.to_dict(SeqIO.parse(filename, fmt))
-    except MemoryError:
-        return -1 # Fail Gracefully
-        
-    # 2. Lookup - The fast part
-    t0 = time.time()
+BP_LOOKUP_SCRIPT = """
+import sys, random
+from Bio import SeqIO
+try:
+    rd = SeqIO.to_dict(SeqIO.parse(sys.argv[1], sys.argv[2]))
     random.seed(42)
-    for _ in range(num_lookups):
-        k = f"{prefix}{random.randint(0, max_idx-1)}"
-        _ = record_dict.get(k)
-    return time.time() - t0
+    for _ in range(int(sys.argv[3])):
+        k = f"{sys.argv[4]}{random.randint(0, int(sys.argv[5])-1)}"
+        _ = rd.get(k)
+except MemoryError: sys.exit(137)
+except Exception: sys.exit(1)
+"""
 
-def run_scenario(s):
-    base_name = f"bench_{s['name'].split()[0]}"
-    fname = f"{base_name}.{s['type']}"
-    cname = f"{base_name}.bin"
-    
-    iter_count = calculate_adaptive_iterations(s)
-    
-    print(f"\n[SCENARIO: {s['name']}]")
-    print(f"  Configuration: {s['num_seqs']:,} seqs, avg len {s['avg_len']}")
-    print(f"  Adaptive Lookups: {iter_count:,} iterations (~{TARGET_DATA_VOLUME_MB}MB volume)")
+# Updated shim: Crashes if 0 hits are found, ensuring the speed is real.
+PYFASTX_SCRIPT = """
+import sys, random, pyfastx
+fname, n, prefix, m = sys.argv[1], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
 
-    if not os.path.exists(fname): generate_data(fname, s)
+if fname.endswith('.fastq'): db = pyfastx.Fastq(fname)
+else: db = pyfastx.Fasta(fname)
+
+random.seed(42)
+hits = 0
+for _ in range(n):
+    try: 
+        _ = str(db[f"{prefix}{random.randint(0, m-1)}"]) 
+        hits += 1
+    except: pass
+
+# SANITY CHECK: If we found nothing, the benchmark is invalid.
+if hits == 0:
+    sys.stderr.write("Error: pyfastx found 0 records! Check ID format.\\n")
+    sys.exit(1) # Return error code
+"""
+
+# === UTILITIES ===
+def monitor_process(proc, res):
+    peak = 0
+    try:
+        p = psutil.Process(proc.pid)
+        while proc.poll() is None:
+            try: peak = max(peak, p.memory_info().rss)
+            except: break
+            time.sleep(0.01)
+    except: pass
+    res['peak_mb'] = peak / (1024*1024)
+
+def run_cmd(cmd):
+    stats = {'peak_mb': 0}
+    t0 = time.time()
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        t = threading.Thread(target=monitor_process, args=(p, stats))
+        t.start()
+        p.communicate()
+        t.join()
+        return p.returncode, time.time()-t0, stats['peak_mb']
+    except: return -1, 0, 0
+
+def parse_val(out, key):
+    try: return float([l.split(":")[1] for l in out.splitlines() if key in l][0])
+    except: return 0.0
+
+def generate_dataset(fname, fmt, target_mb, avg_len):
+    if fmt == "fastq":
+        bytes_per_rec = (avg_len * 2) + 50
+        prefix = "r"
+    else:
+        bytes_per_rec = avg_len + 20
+        prefix = "c"
+        
+    num_seqs = int((target_mb * 1024 * 1024) / bytes_per_rec)
+    if num_seqs < 1: num_seqs = 1
+
+    print(f"  Generating {fname} ({num_seqs:,} recs, ~{avg_len}bp)...")
+    
+    buf_size = 10_000_000
+    buf = "".join(random.choices("ACGT", k=buf_size))
+    
+    with open(fname, "w") as f:
+        for i in range(num_seqs):
+            s_len = avg_len
+            if s_len > buf_size: 
+                seq = "".join(random.choices("ACGT", k=s_len))
+            else:
+                start = random.randint(0, buf_size - s_len)
+                seq = buf[start:start+s_len]
+                
+            if fmt == "fastq":
+                f.write(f"@{prefix}{i}\n{seq}\n+\n{'I'*s_len}\n")
+            else:
+                f.write(f">{prefix}{i}\n{seq}\n")
+    return num_seqs, prefix
+
+def run_benchmark(label, fmt, size_mb, avg_len):
+    fname, bin = f"bench_{label}_{size_mb}MB.{fmt}", f"bench_{label}_{size_mb}MB.bin"
+    n_seqs, prefix = generate_dataset(fname, fmt, size_mb, avg_len)
+    
+    # Increase min lookups to ensure stable measurement
+    iters = min(MAX_LOOKUPS, max(1000, int(TARGET_LOOKUP_VOLUME_MB*1024*1024/avg_len)))
     
     res = {}
-    
-    # --- 1. PARSING & IO ---
-    print("  > Benchmarking Parsing Speed...")
-    
-    # SeqTk (C Stream) - The Baseline
-    out, rc, duration = run_command([SEQTK_BINARY, "fqchk", fname])
-    res['SeqTk'] = duration if rc == 0 else None
-    
-    # BioPython (Python Stream)
-    res['BioPy_Parse'] = bench_biopython_parse(fname, s['type'])
-    
-    # TracEon (C++ Load)
-    out, rc, _ = run_command([TRACEON_BINARY, "load", fname])
-    res['TracEon_Load'] = parse_val(out, "Load_Time_s")
-    
-    # --- 2. LIFECYCLE (Save/Restore) ---
-    run_command([TRACEON_BINARY, "save", fname, cname])
-    
-    out, rc, _ = run_command([TRACEON_BINARY, "restore", cname])
-    res['TracEon_Restore'] = parse_val(out, "Restore_Time_s")
-    
-    # --- 3. RANDOM ACCESS LOOKUPS ---
-    print(f"  > Benchmarking Random Access (Alignment I/O Sim)...")
-    
-    # BioPython Dict
-    t_bio = bench_biopython_lookup(fname, s['type'], iter_count, s['prefix'], s['num_seqs'])
-    res['BioPy_Lookup_Rate'] = (iter_count / t_bio) if t_bio > 0 else 0
 
-    # TracEon Lookup
-    out, rc, _ = run_command([TRACEON_BINARY, "lookup", cname, str(iter_count), s['prefix'], str(s['num_seqs'])])
-    res['TracEon_Lookup_Rate'] = parse_val(out, "Throughput")
+    # 1. PARSING
+    res['SeqTk'] = run_cmd([SEQTK_BINARY, "fqchk", fname]) if fmt == "fastq" else (0,0,0)
+    res['SeqKit'] = run_cmd([SEQKIT_BINARY, "stats", fname])
+    res['BioPy'] = run_cmd([sys.executable, "-c", BP_PARSE_SCRIPT, fname, fmt])
+    res['TracEon'] = run_cmd([TRACEON_BINARY, "load", fname])
+
+    # 2. LIFECYCLE
+    run_cmd([TRACEON_BINARY, "save", fname, bin])
+    p = subprocess.Popen([TRACEON_BINARY, "restore", bin], stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate()
+    res['Restore'] = parse_val(out, "Restore_Time_s")
+
+    # 3. LOOKUPS
+    res['BioPy_L'] = run_cmd([sys.executable, "-c", BP_LOOKUP_SCRIPT, fname, fmt, str(iters), prefix, str(n_seqs)])
+    res['PyFastX_L'] = run_cmd([sys.executable, "-c", PYFASTX_SCRIPT, fname, str(iters), prefix, str(n_seqs)])
+
+    p = subprocess.Popen([TRACEON_BINARY, "lookup", bin, str(iters), prefix, str(n_seqs)], stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate()
+    res['TracEon_L'] = parse_val(out, "Throughput")
 
     # Cleanup
     if os.path.exists(fname): os.remove(fname)
-    if os.path.exists(cname): os.remove(cname)
+    if os.path.exists(bin): os.remove(bin)
+    if os.path.exists(fname+".fxi"): os.remove(fname+".fxi")
+    if os.path.exists(fname+".fai"): os.remove(fname+".fai")
     
     return res
 
-def print_summary(all_res):
-    print("\n" + "="*125)
-    print(f"{'SCENARIO':<35} | {'METRIC':<18} | {'SeqTk':<10} | {'BioPython':<12} | {'TracEon':<12} | {'IMPROVEMENT'}")
-    print("-" * 125)
-    
-    for name, r in all_res.items():
-        # 1. Parsing Row
-        stk = f"{r['SeqTk']:.4f}s" if r['SeqTk'] else "N/A"
-        bio = f"{r['BioPy_Parse']:.4f}s"
-        tra = f"{r['TracEon_Load']:.4f}s"
-        
-        # Improvement: TracEon Load vs BioPy Parse
-        imp = f"{r['BioPy_Parse']/r['TracEon_Load']:.1f}x (vs Py)" if r['TracEon_Load'] > 0 else "-"
-        print(f"{name:<35} | {'Parse Time':<18} | {stk:<10} | {bio:<12} | {tra:<12} | {imp}")
-        
-        # 2. Restore Row
-        tra_rest = f"{r['TracEon_Restore']:.4f}s"
-        print(f"{'':<35} | {'Restore Time':<18} | {'-':<10} | {'-':<12} | {tra_rest:<12} | -")
-        
-        # 3. Lookup Row
-        bp_ops = r['BioPy_Lookup_Rate']
-        tr_ops = r['TracEon_Lookup_Rate']
-        if bp_ops > 0:
-            speedup = f"{tr_ops/bp_ops:.1f}x"
-        else:
-            speedup = "Inf"
-            
-        print(f"{'':<35} | {'Lookups/sec':<18} | {'-':<10} | {int(bp_ops):<12,} | {int(tr_ops):<12,} | {speedup}")
-        print("-" * 125)
-
 def main():
     if not os.path.exists(TRACEON_BINARY):
-        print(f"Error: {TRACEON_BINARY} not found. Please compile traceon_driver first.")
-        return
-    
-    results = {}
-    for s in SCENARIOS:
-        results[s['name']] = run_scenario(s)
+        print("Compile driver first!")
+        sys.exit(1)
+
+    print(f"Starting Matrix Benchmark: {len(FILE_SIZES_MB)} Sizes x {len(DATA_TYPES)} Scenarios")
+
+    for size_mb in FILE_SIZES_MB:
+        print(f"\n" + "="*180)
+        print(f"  FILE SIZE: {size_mb} MB")
+        print(f"{'SCENARIO':<12} | {'SEQTK':<6} | {'SEQKIT':<6} | {'BIOPY':<6} | {'TRACEON':<7} | {'RESTORE':<7} | {'TRACEON OPS/s':<15} | {'PYFASTX OPS/s':<15} | {'RAM DIFF':<15}")
+        print("-" * 180)
         
-    print_summary(results)
+        for (label, fmt, avg_len) in DATA_TYPES:
+            r = run_benchmark(label, fmt, size_mb, avg_len)
+            
+            stk = f"{r['SeqTk'][1]:.2f}" if r['SeqTk'][1] > 0 else "-"
+            skt = f"{r['SeqKit'][1]:.2f}" if r['SeqKit'][1] > 0 else "-"
+            bio = f"{r['BioPy'][1]:.2f}"
+            tra = f"{r['TracEon'][1]:.2f}"
+            rst = f"{r['Restore']:.2f}"
+            
+            ops_tra = f"{int(r['TracEon_L']):,}"
+            
+            iters = min(MAX_LOOKUPS, max(1000, int(TARGET_LOOKUP_VOLUME_MB*1024*1024/avg_len)))
+            pfx_dur = r['PyFastX_L'][1]
+            
+            if pfx_dur > 0:
+                ops_pfx_val = iters/pfx_dur
+                ops_pfx = f"{int(ops_pfx_val):,}"
+                if ops_pfx_val > 10_000_000: ops_pfx += " (?)"
+            else:
+                ops_pfx = "-"
+            
+            bp_rc, _, bp_ram_val = r['BioPy_L']
+            tra_ram_val = r['TracEon'][2]
+            
+            if bp_rc != 0: ram_str = f"{tra_ram_val:.0f}MB (BioPy CRASH)"
+            elif bp_ram_val > 0:
+                diff_pct = (1 - tra_ram_val / bp_ram_val) * 100
+                ram_str = f"{tra_ram_val:.0f}MB (-{diff_pct:.0f}%)"
+            else: ram_str = f"{tra_ram_val:.0f}MB (?)"
+            
+            print(f"{label:<12} | {stk:<6} | {skt:<6} | {bio:<6} | {tra:<7} | {rst:<7} | {ops_tra:<15} | {ops_pfx:<15} | {ram_str:<15}")
+            
+    print("="*180)
 
 if __name__ == "__main__":
     main()

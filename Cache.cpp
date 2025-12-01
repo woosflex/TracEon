@@ -17,10 +17,8 @@ namespace TracEon
     const uint32_t SMART_UNCOMPRESSED_MAGIC = 0x534D5254; // "SMRT"
     const uint32_t SMART_COMPRESSED_MAGIC = 0x534D525A;   // "SMRZ" (Z for compressed)
 
-    
     Cache::Cache() : m_strategy(std::make_unique<SmartStrategy>()) {}
     Cache::~Cache() = default;
-
 
     // --- Data Interaction ---
 
@@ -43,6 +41,37 @@ namespace TracEon
         }
 
         return "";
+    }
+
+    std::string_view Cache::getView(const std::string &key)
+    {
+        // 1. Check SmartStrategy file cache (Primary path for your benchmark)
+        if (auto *smart_strategy = dynamic_cast<SmartStrategy *>(m_strategy.get()))
+        {
+            if (smart_strategy->getFileCacheSize() > 0)
+            {
+                return smart_strategy->getSequenceView(key);
+            }
+        }
+
+        // 2. Check regular store (Fallback for manually set keys)
+        if (m_store.count(key))
+        {
+            const auto &record_variant = m_store.at(key);
+            if (const auto *data = std::get_if<FastaRecordData>(&record_variant))
+            {
+                // CAST the vector<unsigned char> to string_view directly
+                // This assumes NO compression (pass-through), which matches SmartStrategy::encode implementation
+                return std::string_view(reinterpret_cast<const char *>(data->data()), data->size());
+            }
+            else if (const auto *fastq = std::get_if<FastqRecord>(&record_variant))
+            {
+                return std::string_view(reinterpret_cast<const char *>(fastq->compressed_sequence.data()),
+                                        fastq->compressed_sequence.size());
+            }
+        }
+
+        return {};
     }
 
     std::optional<DecodedFastqRecord> Cache::getFastqRecord(const std::string &key)
@@ -353,11 +382,15 @@ namespace TracEon
         }
     }
 
-    void Cache::loadSmartFile(const std::string& filepath) {
+    void Cache::loadSmartFile(const std::string &filepath)
+    {
         // This is a wrapper that delegates to the SmartStrategy
-        if (auto* smart_strategy = dynamic_cast<SmartStrategy*>(m_strategy.get())) {
+        if (auto *smart_strategy = dynamic_cast<SmartStrategy *>(m_strategy.get()))
+        {
             smart_strategy->loadFile(filepath);
-        } else {
+        }
+        else
+        {
             throw std::runtime_error("SmartStrategy not available for loading file.");
         }
     }
