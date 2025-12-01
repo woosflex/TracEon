@@ -3,6 +3,7 @@
 
 #include "IEncodingStrategy.h"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <memory>
@@ -46,6 +47,9 @@ public:
     // File cache access methods (thread-safe)
     std::string getSequence(const std::string& sequence_id) const;
     std::string getQuality(const std::string& sequence_id) const;
+
+    std::string_view getSequenceView(const std::string& sequence_id) const;
+
     bool hasSequence(const std::string& sequence_id) const;
     size_t getFileCacheSize() const;
 

@@ -2,6 +2,7 @@
 #define TRACEON_CACHE_H
 
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <memory>
 #include <variant>
@@ -29,6 +30,9 @@ namespace TracEon {
 
         // Data Interaction
         std::string get(const std::string& key);
+
+        std::string_view getView(const std::string& key);
+
         std::optional<DecodedFastqRecord> getFastqRecord(const std::string& key);
 
         // Status & Inspection

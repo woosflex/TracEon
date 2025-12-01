@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < num_lookups; ++i) {
             int id = std::rand() % max_index;
             std::string key = prefix + std::to_string(id);
-            std::string val = cache.get(key);
+            std::string_view val = cache.getView(key);
             bytes += val.size();
         }
         double sec = t.elapsed_sec();

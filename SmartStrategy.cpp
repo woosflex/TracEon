@@ -316,6 +316,16 @@ std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
     return (it != file_cache_.end()) ? it->second.quality : "";
 }
 
+std::string_view SmartStrategy::getSequenceView(const std::string& sequence_id) const {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = file_cache_.find(sequence_id);
+    if (it != file_cache_.end()) {
+        // Return a view to the string stored in the map
+        return std::string_view(it->second.sequence);
+    }
+    return {};
+}
+
 bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     return file_cache_.find(sequence_id) != file_cache_.end();
