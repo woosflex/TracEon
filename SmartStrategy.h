@@ -94,6 +94,10 @@ private:
     // Optimized parsers
     void parseFastaOptimized(std::string_view content);
     void parseFastqOptimized(std::string_view content);
+    
+    // Multithreaded parsers
+    void parseFastaMultithreaded(std::string_view content);
+    void parseFastqMultithreaded(std::string_view content);
 };
 
 } // namespace TracEon
