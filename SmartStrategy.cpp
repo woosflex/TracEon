@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
+#include <vector>
 
 // --- Platform Specific Includes for MMAP ---
 #ifdef _WIN32
@@ -70,6 +72,252 @@ std::vector<unsigned char> SmartStrategy::encode(const std::string& data, DataTy
 
 std::string SmartStrategy::decode(const std::vector<unsigned char>& data) const {
     return {data.begin(), data.end()};
+}
+
+// --- Multithreaded FASTA Parser ---
+
+void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
+    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t chunk_size = content.size() / num_threads;
+    
+    if (chunk_size < 1024 * 1024) { // If chunks too small (< 1MB), use single-threaded
+        parseFastaOptimized(content);
+        return;
+    }
+    
+    std::vector<std::thread> threads;
+    std::vector<HashMap<std::string, SequenceView>> thread_caches(num_threads);
+    
+    auto worker = [&](size_t thread_id, size_t start, size_t end) {
+        const char* ptr = content.data() + start;
+        const char* chunk_end = content.data() + end;
+        const char* global_end = content.data() + content.size();
+        
+        // Align to record boundary: scan backward to find last '>' before our chunk
+        if (thread_id > 0) {
+            while (ptr > content.data() && *(ptr - 1) != '\n') {
+                --ptr;
+            }
+            // Now find the next '>'
+            while (ptr < chunk_end && *ptr != '>') {
+                ++ptr;
+            }
+        }
+        
+        // Parse records in this chunk
+        while (ptr < chunk_end) {
+            // Skip whitespace
+            while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) {
+                ++ptr;
+            }
+            
+            if (ptr >= chunk_end || *ptr != '>') break;
+            
+            // Parse header
+            ++ptr; // Skip '>'
+            const char* id_start = ptr;
+            
+            while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            const char* id_end = ptr;
+            
+            // Skip rest of header
+            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) {
+                ++ptr;
+            }
+            
+            // Collect sequence
+            const char* seq_start = ptr;
+            const char* seq_end = seq_start;
+            
+            while (ptr < global_end) {
+                if (*ptr == '>') {
+                    seq_end = ptr;
+                    while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) {
+                        --seq_end;
+                    }
+                    break;
+                }
+                ++ptr;
+            }
+            
+            if (ptr >= global_end) {
+                seq_end = global_end;
+                while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) {
+                    --seq_end;
+                }
+            }
+            
+            // Store in thread-local cache
+            std::string_view id(id_start, id_end - id_start);
+            std::string_view seq(seq_start, seq_end - seq_start);
+            
+            if (!id.empty() && !seq.empty()) {
+                thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, {}});
+            }
+        }
+    };
+    
+    // Launch threads
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = (i == num_threads - 1) ? content.size() : (i + 1) * chunk_size;
+        threads.emplace_back(worker, i, start, end);
+    }
+    
+    // Wait for completion
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    // Merge thread-local caches
+    size_t total_size = 0;
+    for (const auto& cache : thread_caches) {
+        total_size += cache.size();
+    }
+    file_cache_.reserve(total_size);
+    
+    for (auto& cache : thread_caches) {
+        for (auto& entry : cache) {
+            file_cache_.insert(std::move(entry));
+        }
+    }
+}
+
+// --- Multithreaded FASTQ Parser ---
+
+void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
+    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t chunk_size = content.size() / num_threads;
+    
+    if (chunk_size < 1024 * 1024) { // If chunks too small (< 1MB), use single-threaded
+        parseFastqOptimized(content);
+        return;
+    }
+    
+    std::vector<std::thread> threads;
+    std::vector<HashMap<std::string, SequenceView>> thread_caches(num_threads);
+    
+    auto worker = [&](size_t thread_id, size_t start, size_t end) {
+        const char* ptr = content.data() + start;
+        const char* chunk_end = content.data() + end;
+        const char* global_end = content.data() + content.size();
+        
+        // Align to record boundary: FASTQ records are 4 lines, so find next '@' at line start
+        if (thread_id > 0) {
+            while (ptr > content.data() && *(ptr - 1) != '\n') {
+                --ptr;
+            }
+            // Scan forward to find '@' at beginning of line
+            while (ptr < chunk_end) {
+                if (*ptr == '@') {
+                    // Verify it's not quality line by checking if previous line was '+'
+                    const char* check = ptr - 1;
+                    while (check > content.data() && (*check == '\n' || *check == '\r')) --check;
+                    while (check > content.data() && *check != '\n' && *check != '\r') --check;
+                    if (check > content.data()) ++check;
+                    
+                    // If previous line doesn't start with '+', this is a valid header
+                    if (*check != '+') break;
+                }
+                ++ptr;
+            }
+        }
+        
+        // Parse FASTQ records
+        while (ptr < chunk_end) {
+            // Skip whitespace
+            while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) {
+                ++ptr;
+            }
+            
+            if (ptr >= chunk_end || *ptr != '@') break;
+            
+            // Line 1: @Header
+            ++ptr;
+            const char* id_start = ptr;
+            
+            while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            const char* id_end = ptr;
+            
+            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) {
+                ++ptr;
+            }
+            
+            // Line 2: Sequence
+            const char* seq_start = ptr;
+            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            const char* seq_end = ptr;
+            
+            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) {
+                ++ptr;
+            }
+            
+            // Line 3: +
+            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) {
+                ++ptr;
+            }
+            
+            // Line 4: Quality
+            const char* qual_start = ptr;
+            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') {
+                ++ptr;
+            }
+            const char* qual_end = ptr;
+            
+            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) {
+                ++ptr;
+            }
+            
+            // Store in thread-local cache
+            std::string_view id(id_start, id_end - id_start);
+            std::string_view seq(seq_start, seq_end - seq_start);
+            std::string_view qual(qual_start, qual_end - qual_start);
+            
+            if (!id.empty() && !seq.empty()) {
+                thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, qual});
+            }
+        }
+    };
+    
+    // Launch threads
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = (i == num_threads - 1) ? content.size() : (i + 1) * chunk_size;
+        threads.emplace_back(worker, i, start, end);
+    }
+    
+    // Wait for completion
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    // Merge thread-local caches
+    size_t total_size = 0;
+    for (const auto& cache : thread_caches) {
+        total_size += cache.size();
+    }
+    file_cache_.reserve(total_size);
+    
+    for (auto& cache : thread_caches) {
+        for (auto& entry : cache) {
+            file_cache_.insert(std::move(entry));
+        }
+    }
 }
 
 // --- Optimized FASTA Parser (O(N) Single Pass) ---
@@ -243,11 +491,22 @@ void SmartStrategy::loadFile(const std::string& filepath) {
     // Reserve space for expected entries (heuristic: assume avg 100 bytes per record)
     file_cache_.reserve(fileSize / 100);
     
-    // Use optimized O(N) parsers
-    if (isFastq) {
-        parseFastqOptimized(content);
+    // Use multithreaded parsers for large files, single-threaded for small
+    const size_t MULTITHREAD_THRESHOLD = 10 * 1024 * 1024; // 10MB
+    
+    if (fileSize > MULTITHREAD_THRESHOLD) {
+        if (isFastq) {
+            parseFastqMultithreaded(content);
+        } else {
+            parseFastaMultithreaded(content);
+        }
     } else {
-        parseFastaOptimized(content);
+        // For smaller files, single-threaded is faster (no overhead)
+        if (isFastq) {
+            parseFastqOptimized(content);
+        } else {
+            parseFastaOptimized(content);
+        }
     }
     
     determine_format_from_cache();
