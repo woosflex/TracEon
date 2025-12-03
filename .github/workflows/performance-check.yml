@@ -1,0 +1,47 @@
+name: TracEon Avalon - Performance Check
+
+on: [push, pull_request]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    name: Avalon Performance Validation
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake python3-pip
+        pip3 install psutil
+    
+    - name: Build Release
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        cmake --build build --target traceon_driver
+    
+    - name: Run Performance Test
+      run: |
+        cd build
+        # Generate 10MB test file
+        python3 << EOF
+        with open("test.fastq", "w") as f:
+            for i in range(30000):
+                f.write(f"@read_{i}\n")
+                f.write("ACGT" * 40 + "\n")
+                f.write("+\n")
+                f.write("IIII" * 40 + "\n")
+        EOF
+        
+        # Load and save
+        ./traceon_driver load test.fastq
+        ./traceon_driver save test.fastq test.bin
+        
+        # Benchmark
+        ./traceon_driver lookup test.bin 100000 read_ 30000 > result.txt
+        cat result.txt
+    
+    - name: Check Regression
+      run: |
+        python3 benchmarks/check_regression.py build/result.txt

@@ -9,23 +9,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- ZLIB Support ---
-# Instead of finding the system ZLIB, we build our own version.
-# This makes the project portable and removes external dependencies.
 add_subdirectory(third_party/zlib)
 
 # --- LZ4 Support ---
-# Kept for potential benchmark usage or legacy support, 
-# though TracEon 2.0 Core now uses raw Zero-Copy serialization.
 add_subdirectory(third_party/lz4/build/cmake)
 
-# --- Source File Definitions ---
-# We update the core sources to include the new MapDefs.h and remove the obsolete FileReader.
+# --- Source File Definitions (UPDATED PATHS) ---
 set(CORE_SOURCES
-        Cache.cpp
-        IEncodingStrategy.cpp
-        SmartStrategy.cpp
-        MapDefs.h          # New: Header for Robin Hood hashing selection
-        # FileReader.cpp   # Removed: TracEon 2.0 uses direct Arena/MMAP loading
+        src/Cache.cpp
+        src/IEncodingStrategy.cpp
+        src/SmartStrategy.cpp
+        # MapDefs.h is a header, not a source, so strictly speaking not needed here
+        # but kept if you want IDEs to index it easily via add_library
 )
 
 set(TEST_SOURCES
@@ -36,57 +31,45 @@ set(TEST_SOURCES
 )
 
 # --- Library Target ---
-# Here's our main library, 'traceon_core'.
-# All our core logic lives here.
 add_library(traceon_core STATIC ${CORE_SOURCES})
 
-# Include directories:
-# 1. lz4/lib for LZ4 headers
-# 2. CMAKE_CURRENT_SOURCE_DIR so we can include "third_party/robin_hood.h" and local headers
-target_include_directories(traceon_core PUBLIC third_party/lz4/lib)
-target_include_directories(traceon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Include directories (UPDATED PATHS)
+# traceon_core users need 'include/'
+# traceon_core implementation needs 'third_party/lz4/lib' and 'third_party/'
+target_include_directories(traceon_core PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
+    ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
+)
 
 # Link traceon_core to both zlib and lz4
 target_link_libraries(traceon_core PUBLIC zlib_static lz4_static)
 
 # --- Executable Targets ---
-# A simple app for manual testing.
 add_executable(trac-eon-test main.cpp)
 target_link_libraries(trac-eon-test PRIVATE traceon_core)
-
-# Benchmark executables.
-## Comprehensive benchmark executable
-add_executable(comprehensive_benchmark comprehensive_benchmark.cpp)
-target_link_libraries(comprehensive_benchmark PRIVATE traceon_core)
-
-## GCP NGS Benchmark executable
-add_executable(gcp_benchmark gcp_benchmark.cpp)
-# Link our benchmark against the core library AND our vendored ZLIB.
-target_link_libraries(gcp_benchmark PRIVATE traceon_core)
 
 # --- Benchmark Driver ---
 add_executable(traceon_driver traceon_driver.cpp)
 target_link_libraries(traceon_driver PRIVATE traceon_core)
 
+# --- Example Usage (NEW) ---
+add_executable(example_usage examples/simple_usage.cpp)
+target_link_libraries(example_usage PRIVATE traceon_core)
+
 # --- Test Setup using Catch2 ---
-# This CMake trick automatically downloads Catch2 from GitHub for us.
 include(FetchContent)
 FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG        v3.6.0 # Pinning to a specific version for stability
+        GIT_TAG        v3.6.0 
 )
 FetchContent_MakeAvailable(Catch2)
 
-# Now let's set up everything for our unit tests.
 enable_testing()
 
-# We'll create a separate program just for running our tests...
 add_executable(unit_tests ${TEST_SOURCES})
-
-# ...and our test program needs to be linked against our library and Catch2.
 target_link_libraries(unit_tests PRIVATE traceon_core Catch2::Catch2WithMain)
 
-# This officially registers our 'unit_tests' program with CTest.
 include(CTest)
 add_test(NAME TracEonTests COMMAND unit_tests)

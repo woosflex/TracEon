@@ -12,8 +12,9 @@
 namespace TracEon {
 
 #ifdef TRACEON_USE_ROBIN_HOOD
+    // OPTIMIZATION: Use flat_map for better cache locality (open addressing)
     template<typename Key, typename Value>
-    using HashMap = robin_hood::unordered_map<Key, Value>;
+    using HashMap = robin_hood::unordered_flat_map<Key, Value>;
 #else
     template<typename Key, typename Value>
     using HashMap = std::unordered_map<Key, Value>;

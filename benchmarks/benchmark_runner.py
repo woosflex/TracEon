@@ -7,7 +7,7 @@ import threading
 import psutil
 
 # === CONFIGURATION ===
-TRACEON_BINARY = "./build/traceon_driver"
+TRACEON_BINARY = "../build/traceon_driver"
 SEQTK_BINARY = "seqtk"
 SEQKIT_BINARY = "seqkit"
 MAX_LOOKUPS = 500000
@@ -123,7 +123,9 @@ def generate_dataset(fname, fmt, target_mb, avg_len):
     return num_seqs, prefix
 
 def run_benchmark(label, fmt, size_mb, avg_len):
-    fname, bin = f"bench_{label}_{size_mb}MB.{fmt}", f"bench_{label}_{size_mb}MB.bin"
+    fname = f"bench_{label}_{size_mb}MB.{fmt}"
+    bin_file = f"bench_{label}_{size_mb}MB.traceon" 
+    
     n_seqs, prefix = generate_dataset(fname, fmt, size_mb, avg_len)
     
     # Increase min lookups to ensure stable measurement
@@ -138,8 +140,8 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     res['TracEon'] = run_cmd([TRACEON_BINARY, "load", fname])
 
     # 2. LIFECYCLE
-    run_cmd([TRACEON_BINARY, "save", fname, bin])
-    p = subprocess.Popen([TRACEON_BINARY, "restore", bin], stdout=subprocess.PIPE, text=True)
+    run_cmd([TRACEON_BINARY, "save", fname, bin_file])
+    p = subprocess.Popen([TRACEON_BINARY, "restore", bin_file], stdout=subprocess.PIPE, text=True)
     out, _ = p.communicate()
     res['Restore'] = parse_val(out, "Restore_Time_s")
 
@@ -147,13 +149,13 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     res['BioPy_L'] = run_cmd([sys.executable, "-c", BP_LOOKUP_SCRIPT, fname, fmt, str(iters), prefix, str(n_seqs)])
     res['PyFastX_L'] = run_cmd([sys.executable, "-c", PYFASTX_SCRIPT, fname, str(iters), prefix, str(n_seqs)])
 
-    p = subprocess.Popen([TRACEON_BINARY, "lookup", bin, str(iters), prefix, str(n_seqs)], stdout=subprocess.PIPE, text=True)
+    p = subprocess.Popen([TRACEON_BINARY, "lookup", bin_file, str(iters), prefix, str(n_seqs)], stdout=subprocess.PIPE, text=True)
     out, _ = p.communicate()
     res['TracEon_L'] = parse_val(out, "Throughput")
 
     # Cleanup
     if os.path.exists(fname): os.remove(fname)
-    if os.path.exists(bin): os.remove(bin)
+    if os.path.exists(bin_file): os.remove(bin_file) # Clean up .traceon
     if os.path.exists(fname+".fxi"): os.remove(fname+".fxi")
     if os.path.exists(fname+".fai"): os.remove(fname+".fai")
     
