@@ -12,10 +12,10 @@
 #include <shared_mutex>
 #include <variant>
 #include <filesystem>
+#include <atomic> 
 
 namespace TracEon {
 
-// Forward declaration
 struct MMapHandle;
 
 enum class FileFormat : uint8_t {
@@ -24,91 +24,90 @@ enum class FileFormat : uint8_t {
     UNKNOWN = 0xFF
 };
 
-// Zero-Copy Value Structure
+/**
+ * @struct SequenceView
+ * @brief Lightweight pointer triplet for genomic records.
+ * * Designed for Zero-Copy architecture.
+ * - Key ownership is handled by the HashMap (std::string).
+ * - View lifetime is tied to the SmartStrategy's Arena/MMAP.
+ */
 struct SequenceView {
-    // NOTE:
-    // - The Map Key (std::string) owns the normalized identifier used for hashing/lookups.
-    // - SequenceView.id, sequence, and quality are NON-OWNING views pointing
-    //   into either the mmap buffer (binary mode) or the text_arena_ buffer (load mode).
-    //   Their lifetime is guaranteed by SmartStrategy and valid until destruction.
     std::string_view id;       
     std::string_view sequence; 
     std::string_view quality;  
 };
 
-// --- ADAPTIVE INDEX TYPES ---
-// Mode A: Genome/Long-Read (Safe, Owned Keys)
-using GenomeIndex = HashMap<std::string, SequenceView>;
-
-// Mode B: NGS/Short-Read (Fast, Hash Keys)
-using NGSIndex = HashMap<uint64_t, SequenceView>;
+using GenomeIndex = HashMap<std::string, SequenceView>; 
+using NGSIndex = HashMap<uint64_t, SequenceView>;       
 
 enum class IndexMode {
-    GENOME, // Hybrid (std::string key)
-    NGS     // Hash-Only (uint64_t key)
+    GENOME, 
+    NGS     
 };
 
+/**
+ * @class SmartStrategy
+ * @brief Core engine implementing the Hybrid Architecture.
+ * * Features:
+ * - Arena Allocation for text data
+ * - Memory Mapping for binary restoration
+ * - Lock-Free atomic read path
+ * - Templated Multithreaded Parsers
+ */
 class SmartStrategy : public IEncodingStrategy {
 public:
     SmartStrategy();
     virtual ~SmartStrategy();
 
-    // IEncodingStrategy interface
     std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 
-    // --- Core Loading Operations ---
     void loadFile(const std::string& filepath);
     void loadBinary(const std::string& filepath);
     void saveBinary(const std::string& filepath) const;
 
-    // --- Access Methods ---
     std::string_view getView(const std::string_view& sequence_id) const;
-
-    // Legacy Wrappers
     std::string getSequence(const std::string& sequence_id) const;
     std::string getQuality(const std::string& sequence_id) const;
     bool hasSequence(const std::string& sequence_id) const;
+    
     size_t getFileCacheSize() const;
     std::vector<std::string> getAllKeys() const;
-
-    // Utility
     void clearCache();
+    
     FileFormat getDetectedFormat() const { return detected_format_; }
     IndexMode getIndexMode() const; 
 
 private:
-    // 1. Stable Memory
     std::vector<char> text_arena_;
     std::unique_ptr<MMapHandle> mmap_handle_;
-
-    // 2. POLYMORPHIC CACHE (The Adaptive Core)
     std::variant<GenomeIndex, NGSIndex> file_cache_;
     
     FileFormat detected_format_;
     mutable std::shared_mutex cache_mutex_;
 
-    // Helpers
+    /**
+     * Lock-Free Read Signal
+     * True only when all data is loaded and immutable.
+     * Establishes Happens-Before relationship for readers.
+     */
+    std::atomic<bool> data_ready_{false};
+
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
     uint64_t hash_key(std::string_view key) const; 
     
-    // Templated Parsers (Internal)
-    template <typename MapType>
-    void parseFastaInternal(std::string_view content, MapType& map);
-    
-    template <typename MapType>
-    void parseFastqInternal(std::string_view content, MapType& map);
+    // Internal cleanup helper (No Lock)
+    void clearInternal();
 
-    // Templated Multithreaded Parsers
-    template <typename MapType>
-    void parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map);
+    // Templated Parsers
+    template <typename MapType> void parseFastaInternal(std::string_view content, MapType& map);
+    template <typename MapType> void parseFastqInternal(std::string_view content, MapType& map);
+    template <typename MapType> void parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map);
+    template <typename MapType> void parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map);
 
-    template <typename MapType>
-    void parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map);
-
-    // --- Fix: Added missing declarations for wrappers defined in .cpp ---
+    // Wrappers
     void parseFastaOptimized(std::string_view content);
     void parseFastqOptimized(std::string_view content);
     void parseFastaMultithreaded(std::string_view content);

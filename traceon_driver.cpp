@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <random>
 #include <iomanip> // For std::fixed
-#include "Cache.h"
-#include "SmartStrategy.h" 
+#include "./include/Cache.h"
+#include "./include/SmartStrategy.h" 
 
 volatile size_t global_sink = 0;
 

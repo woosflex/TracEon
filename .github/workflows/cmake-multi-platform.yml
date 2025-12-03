@@ -1,6 +1,6 @@
 name: Create Release and Build Binaries
 
-# This workflow runs when a new tag is pushed (e.g., v0.0.1, v1.2.3)
+# This workflow runs when a new tag is pushed (e.g., v1.0.0, v1.0.1)
 on:
   push:
     tags:
@@ -34,14 +34,15 @@ jobs:
     name: Build on ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
     needs: create_release # This job runs only after the release has been created.
     strategy:
+      fail-fast: false
       matrix:
         platform:
-          - { os: ubuntu-latest, arch: "x86"}
+          - { os: ubuntu-latest, arch: "x86_64"}
           - { os: ubuntu-24.04-arm, arch: "arm64"}
-          - { os: windows-latest, arch: "x86"}
-          - { os: windows-11-arm, arch: "arm64"} # Windows on ARM
-          - { os: macos-15-intel, arch: "x86"}            # Intel macOS
-          - { os: macos-latest, arch: "arm64"}        # Apple Silicon macOS
+          - { os: windows-latest, arch: "x86_64"}
+          - { os: windows-11-arm, arch: "arm64"} 
+          - { os: macos-15-intel, arch: "x86_64"} 
+          - { os: macos-latest, arch: "arm64"}
 
     runs-on: ${{ matrix.platform.os }}
 
@@ -50,23 +51,30 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure CMake
+        # Force Release build type
         run: cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
-        run: cmake --build ${{ github.workspace }}/build --config Release
+      - name: Build Driver
+        # Explicitly target traceon_driver
+        run: cmake --build ${{ github.workspace }}/build --config Release --target traceon_driver
 
-      - name: Prepare Artifacts for Windows
+      # --- Packaging for Windows ---
+      - name: Prepare Artifacts (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path ${{ github.workspace }}/build/Release/gcp_benchmark.exe -DestinationPath ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
+          # MSVC Release binaries are typically in /Release subdirectory
+          Compress-Archive -Path ${{ github.workspace }}/build/Release/traceon_driver.exe -DestinationPath ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
         shell: pwsh
 
-      - name: Prepare Artifacts for Linux/macOS
+      # --- Packaging for Linux/macOS ---
+      - name: Prepare Artifacts (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz -C ${{ github.workspace }}/build gcp_benchmark
+          # Unix binaries are typically in the build root
+          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz -C ${{ github.workspace }}/build traceon_driver
         shell: bash
 
+      # --- Upload Assets ---
       - name: Upload Release Asset (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-release-asset@v1
@@ -88,4 +96,3 @@ jobs:
           asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
           asset_name: traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
           asset_content_type: application/gzip
-
