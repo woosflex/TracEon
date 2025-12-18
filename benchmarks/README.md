@@ -52,7 +52,7 @@ python benchmark_runner.py
 - 100MB tests: ~5 minutes per scenario  
 - Full matrix: 1-2 hours (32 combinations)
 
-### 2. Real-Data Validation (NCBI Datasets)
+### 2. Real-Data Validation (NCBI Datasets) or Quick Smoke Test
 
 Downloads and tests against actual genomic data from public repositories.
 
@@ -60,24 +60,21 @@ Downloads and tests against actual genomic data from public repositories.
 python validate_real_data.py
 ```
 
-**Datasets tested:**
-- *E. coli* K-12 genome (4.6 MB compressed)
-- *C. elegans* chromosome I (15 MB compressed)
-- Human chromosome 21 (38 MB compressed)
+You can select Quick Validation for a quick run which downloads all the small datasets. 
 
-**Expected runtime:** 10-15 minutes (including downloads)
+**Datasets that will be downloaded:**
+- *Phi X 174 Phage* genome (~2 KB compressed)
+- *Lambda Phage* genome (~12 KB compressed)
+- *E. coli K-12* genome (~1.4 MB compressed)
+- *S. cerevisiae* genome (~12 MB compressed)
+- *Drosophila melanogaster* genome + MT (~38 MB compressed)
+- Human Chromosome 21 (~12 MB compressed)
+- *Arabidopsis thaliana* genome (~30 MB compressed)
+- Human Chromosome 1 (~75 MB compressed)
+- Zebrafish Genome (Sample) (~500 MB sampled)
+- Mouse Genome (Sample) (~790 MB sampled)
 
-### 3. Quick Smoke Test
 
-For rapid validation during development:
-
-```bash
-# Run only 10MB tests (fast)
-python benchmark_runner.py --sizes 10
-
-# Run specific scenario
-python benchmark_runner.py --scenario WGS --sizes 10,100
-```
 
 ---
 

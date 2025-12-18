@@ -196,7 +196,7 @@ FULL_DATASETS = [
         "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/635/GCF_000001635.27_GRCm39/GCF_000001635.27_GRCm39_genomic.fna.gz",
         "filename": "mouse_sample.fasta.gz",
         "type": "fasta",
-        "size": "~400 MB (sampled)",
+        "size": "~790 MB (sampled)",
         "records": "21 chromosomes (sample)",
         "description": "Mouse genome sample (2.7 Gbp total)",
         "full_size_mb": 850,
