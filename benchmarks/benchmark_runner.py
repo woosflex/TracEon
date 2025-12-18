@@ -5,6 +5,7 @@ import random
 import sys
 import threading
 import psutil
+import gzip 
 
 # === CONFIGURATION ===
 TRACEON_BINARY = "../build/traceon_driver"
@@ -18,35 +19,24 @@ FILE_SIZES_MB = [10, 100, 500, 1000]
 
 DATA_TYPES = [
     ("WGS", "fastq", 150),
-    ("WES", "fastq", 100),
-    ("Panel", "fastq", 150),
+    ("WGS_GZ", "fastq.gz", 150),
     ("PacBio", "fastq", 15_000),
+    ("PacBio_GZ", "fastq.gz", 30_000),
     ("Nanopore", "fastq", 30_000),
-    ("RefGenome", "fasta", 1_000_000)
+    ("Nanopore_GZ", "fastq.gz", 30_000),
+    ("RefGenome", "fasta", 1_000_000),
+    ("RefGenome_GZ", "fasta.gz", 1_000_000)
 ]
 
 # === SHIM SCRIPTS ===
-BP_PARSE_SCRIPT = "import sys; from Bio import SeqIO; [x for x in SeqIO.parse(sys.argv[1], sys.argv[2])]"
+BP_PARSE_SCRIPT = "import sys, gzip; from Bio import SeqIO; open_func = gzip.open if sys.argv[1].endswith('.gz') else open; [x for x in SeqIO.parse(open_func(sys.argv[1], 'rt'), sys.argv[2])]"
 
-BP_LOOKUP_SCRIPT = """
-import sys, random
-from Bio import SeqIO
-try:
-    rd = SeqIO.to_dict(SeqIO.parse(sys.argv[1], sys.argv[2]))
-    random.seed(42)
-    for _ in range(int(sys.argv[3])):
-        k = f"{sys.argv[4]}{random.randint(0, int(sys.argv[5])-1)}"
-        _ = rd.get(k)
-except MemoryError: sys.exit(137)
-except Exception: sys.exit(1)
-"""
-
-# Updated shim: Crashes if 0 hits are found, ensuring the speed is real.
 PYFASTX_SCRIPT = """
 import sys, random, pyfastx
 fname, n, prefix, m = sys.argv[1], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
 
-if fname.endswith('.fastq'): db = pyfastx.Fastq(fname)
+# pyfastx handles gzip automatically
+if 'fastq' in fname: db = pyfastx.Fastq(fname)
 else: db = pyfastx.Fasta(fname)
 
 random.seed(42)
@@ -57,10 +47,9 @@ for _ in range(n):
         hits += 1
     except: pass
 
-# SANITY CHECK: If we found nothing, the benchmark is invalid.
 if hits == 0:
-    sys.stderr.write("Error: pyfastx found 0 records! Check ID format.\\n")
-    sys.exit(1) # Return error code
+    sys.stderr.write("Error: pyfastx found 0 records!\\n")
+    sys.exit(1)
 """
 
 # === UTILITIES ===
@@ -92,7 +81,7 @@ def parse_val(out, key):
     except: return 0.0
 
 def generate_dataset(fname, fmt, target_mb, avg_len):
-    if fmt == "fastq":
+    if "fastq" in fmt:
         bytes_per_rec = (avg_len * 2) + 50
         prefix = "r"
     else:
@@ -107,7 +96,10 @@ def generate_dataset(fname, fmt, target_mb, avg_len):
     buf_size = 10_000_000
     buf = "".join(random.choices("ACGT", k=buf_size))
     
-    with open(fname, "w") as f:
+    opener = gzip.open if fname.endswith(".gz") else open
+    mode = "wt" if fname.endswith(".gz") else "w"
+
+    with opener(fname, mode) as f:
         for i in range(num_seqs):
             s_len = avg_len
             if s_len > buf_size: 
@@ -116,7 +108,7 @@ def generate_dataset(fname, fmt, target_mb, avg_len):
                 start = random.randint(0, buf_size - s_len)
                 seq = buf[start:start+s_len]
                 
-            if fmt == "fastq":
+            if "fastq" in fmt:
                 f.write(f"@{prefix}{i}\n{seq}\n+\n{'I'*s_len}\n")
             else:
                 f.write(f">{prefix}{i}\n{seq}\n")
@@ -124,19 +116,22 @@ def generate_dataset(fname, fmt, target_mb, avg_len):
 
 def run_benchmark(label, fmt, size_mb, avg_len):
     fname = f"bench_{label}_{size_mb}MB.{fmt}"
-    bin_file = f"bench_{label}_{size_mb}MB.traceon" 
+    bin_file = f"bench_{label}_{size_mb}MB.traceon"
     
     n_seqs, prefix = generate_dataset(fname, fmt, size_mb, avg_len)
+    actual_size_mb = os.path.getsize(fname) / (1024 * 1024)
     
-    # Increase min lookups to ensure stable measurement
     iters = min(MAX_LOOKUPS, max(1000, int(TARGET_LOOKUP_VOLUME_MB*1024*1024/avg_len)))
     
     res = {}
+    res['FileSize'] = actual_size_mb
 
     # 1. PARSING
-    res['SeqTk'] = run_cmd([SEQTK_BINARY, "fqchk", fname]) if fmt == "fastq" else (0,0,0)
+    res['SeqTk'] = run_cmd([SEQTK_BINARY, "fqchk", fname]) if "fastq" in fmt else (0,0,0)
     res['SeqKit'] = run_cmd([SEQKIT_BINARY, "stats", fname])
-    res['BioPy'] = run_cmd([sys.executable, "-c", BP_PARSE_SCRIPT, fname, fmt])
+    
+    clean_fmt = "fastq" if "fastq" in fmt else "fasta"
+    res['BioPy'] = run_cmd([sys.executable, "-c", BP_PARSE_SCRIPT, fname, clean_fmt])
     res['TracEon'] = run_cmd([TRACEON_BINARY, "load", fname])
 
     # 2. LIFECYCLE
@@ -146,16 +141,17 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     res['Restore'] = parse_val(out, "Restore_Time_s")
 
     # 3. LOOKUPS
-    res['BioPy_L'] = run_cmd([sys.executable, "-c", BP_LOOKUP_SCRIPT, fname, fmt, str(iters), prefix, str(n_seqs)])
+    # NOTE: BioPython lookup test removed as per instructions
     res['PyFastX_L'] = run_cmd([sys.executable, "-c", PYFASTX_SCRIPT, fname, str(iters), prefix, str(n_seqs)])
 
     p = subprocess.Popen([TRACEON_BINARY, "lookup", bin_file, str(iters), prefix, str(n_seqs)], stdout=subprocess.PIPE, text=True)
     out, _ = p.communicate()
     res['TracEon_L'] = parse_val(out, "Throughput")
+    res['Record_Count'] = n_seqs
 
     # Cleanup
     if os.path.exists(fname): os.remove(fname)
-    if os.path.exists(bin_file): os.remove(bin_file) # Clean up .traceon
+    if os.path.exists(bin_file): os.remove(bin_file)
     if os.path.exists(fname+".fxi"): os.remove(fname+".fxi")
     if os.path.exists(fname+".fai"): os.remove(fname+".fai")
     
@@ -169,14 +165,15 @@ def main():
     print(f"Starting Matrix Benchmark: {len(FILE_SIZES_MB)} Sizes x {len(DATA_TYPES)} Scenarios")
 
     for size_mb in FILE_SIZES_MB:
-        print(f"\n" + "="*180)
+        print(f"\n" + "="*200)
         print(f"  FILE SIZE: {size_mb} MB")
-        print(f"{'SCENARIO':<12} | {'SEQTK':<6} | {'SEQKIT':<6} | {'BIOPY':<6} | {'TRACEON':<7} | {'RESTORE':<7} | {'TRACEON OPS/s':<15} | {'PYFASTX OPS/s':<15} | {'RAM DIFF':<15}")
-        print("-" * 180)
+        print(f"{'SCENARIO':<12} | {'RECS':<9} | {'SEQTK':<6} | {'SEQKIT':<6} | {'BIOPY':<6} | {'TRACEON':<7} | {'RESTORE':<7} | {'TRACEON OPS':<12} | {'PYFASTX OPS':<12} | {'MEM TRA':<8} | {'MEM PFX':<8} | {'vs FILE':<8}")
+        print("-" * 200)
         
         for (label, fmt, avg_len) in DATA_TYPES:
             r = run_benchmark(label, fmt, size_mb, avg_len)
             
+            recs = f"{r['Record_Count']:,}"
             stk = f"{r['SeqTk'][1]:.2f}" if r['SeqTk'][1] > 0 else "-"
             skt = f"{r['SeqKit'][1]:.2f}" if r['SeqKit'][1] > 0 else "-"
             bio = f"{r['BioPy'][1]:.2f}"
@@ -191,22 +188,28 @@ def main():
             if pfx_dur > 0:
                 ops_pfx_val = iters/pfx_dur
                 ops_pfx = f"{int(ops_pfx_val):,}"
-                if ops_pfx_val > 10_000_000: ops_pfx += " (?)"
             else:
                 ops_pfx = "-"
             
-            bp_rc, _, bp_ram_val = r['BioPy_L']
-            tra_ram_val = r['TracEon'][2]
+            # Memory Stats
+            tra_mem = r['TracEon'][2]
+            pfx_mem = r['PyFastX_L'][2]
+            file_sz = r['FileSize']
             
-            if bp_rc != 0: ram_str = f"{tra_ram_val:.0f}MB (BioPy CRASH)"
-            elif bp_ram_val > 0:
-                diff_pct = (1 - tra_ram_val / bp_ram_val) * 100
-                ram_str = f"{tra_ram_val:.0f}MB (-{diff_pct:.0f}%)"
-            else: ram_str = f"{tra_ram_val:.0f}MB (?)"
+            tra_mem_str = f"{tra_mem:.0f}"
+            pfx_mem_str = f"{pfx_mem:.0f}"
             
-            print(f"{label:<12} | {stk:<6} | {skt:<6} | {bio:<6} | {tra:<7} | {rst:<7} | {ops_tra:<15} | {ops_pfx:<15} | {ram_str:<15}")
+            # Compare TracEon RAM vs File Size (overhead)
+            # Shows how much larger/smaller the loaded structure is vs disk
+            if file_sz > 0:
+                overhead_pct = ((tra_mem / file_sz) - 1) * 100
+                vs_file = f"{overhead_pct:+.0f}%"
+            else:
+                vs_file = "?"
             
-    print("="*180)
+            print(f"{label:<12} | {recs:<9} | {stk:<6} | {skt:<6} | {bio:<6} | {tra:<7} | {rst:<7} | {ops_tra:<12} | {ops_pfx:<12} | {tra_mem_str:<8} | {pfx_mem_str:<8} | {vs_file:<8}")
+            
+    print("="*200)
 
 if __name__ == "__main__":
     main()

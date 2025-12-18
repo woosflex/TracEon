@@ -24,14 +24,11 @@ enum class FileFormat : uint8_t {
     UNKNOWN = 0xFF
 };
 
-/**
- * @struct SequenceView
- * @brief Lightweight pointer triplet for genomic records.
- * * Designed for Zero-Copy architecture.
- * - Key ownership is handled by the HashMap (std::string).
- * - View lifetime is tied to the SmartStrategy's Arena/MMAP.
- */
 struct SequenceView {
+    // NOTE:
+    // - The Map Key (std::string) owns the normalized identifier used for hashing/lookups.
+    // - SequenceView.id, sequence, and quality are NON-OWNING views pointing
+    //   into either the mmap buffer (binary mode) or the text_arena_ buffer (load mode).
     std::string_view id;       
     std::string_view sequence; 
     std::string_view quality;  
@@ -40,20 +37,8 @@ struct SequenceView {
 using GenomeIndex = HashMap<std::string, SequenceView>; 
 using NGSIndex = HashMap<uint64_t, SequenceView>;       
 
-enum class IndexMode {
-    GENOME, 
-    NGS     
-};
+enum class IndexMode { GENOME, NGS };
 
-/**
- * @class SmartStrategy
- * @brief Core engine implementing the Hybrid Architecture.
- * * Features:
- * - Arena Allocation for text data
- * - Memory Mapping for binary restoration
- * - Lock-Free atomic read path
- * - Templated Multithreaded Parsers
- */
 class SmartStrategy : public IEncodingStrategy {
 public:
     SmartStrategy();
@@ -62,9 +47,23 @@ public:
     std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
     std::string decode(const std::vector<unsigned char>& data) const override;
 
+    /**
+     * @brief Load file with automatic format detection.
+     * Detects .gz extension and GZIP magic bytes.
+     */
     void loadFile(const std::string& filepath);
+    
+    /**
+     * @brief Explicitly load a GZIP-compressed file.
+     * Throws if file is not valid GZIP.
+     */
+    void loadGzipFile(const std::string& filepath);
+
     void loadBinary(const std::string& filepath);
     void saveBinary(const std::string& filepath) const;
+
+    // --- Manual Entry Support ---
+    void addEntry(const std::string& id, const std::string& seq, const std::string& qual);
 
     std::string_view getView(const std::string_view& sequence_id) const;
     std::string getSequence(const std::string& sequence_id) const;
@@ -89,7 +88,6 @@ private:
     /**
      * Lock-Free Read Signal
      * True only when all data is loaded and immutable.
-     * Establishes Happens-Before relationship for readers.
      */
     std::atomic<bool> data_ready_{false};
 
@@ -98,10 +96,17 @@ private:
     bool hasRNA(std::string_view data) const;
     uint64_t hash_key(std::string_view key) const; 
     
-    // Internal cleanup helper (No Lock)
     void clearInternal();
+    
+    /**
+     * @brief Internal GZIP loader (used by both public methods)
+     * Reads compressed stream into text_arena_ without parsing.
+     */
+    void loadGzipInternal(const std::string& filepath);
+    
+    // Helper to centralize parsing logic
+    void parseArena();
 
-    // Templated Parsers
     template <typename MapType> void parseFastaInternal(std::string_view content, MapType& map);
     template <typename MapType> void parseFastqInternal(std::string_view content, MapType& map);
     template <typename MapType> void parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map);

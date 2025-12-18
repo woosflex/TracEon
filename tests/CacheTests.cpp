@@ -1,7 +1,7 @@
 #include <catch2/catch_all.hpp>
 #include <fstream>
 #include <filesystem>
-#include "../include/Cache.h"
+#include "Cache.h"
 
 TEST_CASE("Cache Functionality", "[cache]") {
 
