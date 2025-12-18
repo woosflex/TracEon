@@ -1,5 +1,5 @@
-#include "../include/Cache.h"
-#include "../include/SmartStrategy.h"
+#include "Cache.h"
+#include "SmartStrategy.h"
 #include <stdexcept>
 
 namespace TracEon {

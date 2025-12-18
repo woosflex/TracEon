@@ -2,7 +2,7 @@
 
 **Date:** December 2025  
 **Applies to:** TracEon v1.0.0 "Avalon"  
-**Deciders:** Adnan Raza
+**Deciders:** Adnan Raza (Woosflex)
 
 ## Context
 

@@ -1,7 +1,7 @@
 #include <catch2/catch_all.hpp>
 #include <fstream>
-#include "../include/Cache.h"
-#include "../include/DecodedRecordTypes.h"
+#include "Cache.h"
+#include "DecodedRecordTypes.h"
 
 TEST_CASE("FASTQ File Loading", "[fastq]") {
     SECTION("Can load a simple FASTQ file") {
