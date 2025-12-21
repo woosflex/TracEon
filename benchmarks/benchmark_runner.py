@@ -121,7 +121,10 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     n_seqs, prefix = generate_dataset(fname, fmt, size_mb, avg_len)
     actual_size_mb = os.path.getsize(fname) / (1024 * 1024)
     
-    iters = min(MAX_LOOKUPS, max(1000, int(TARGET_LOOKUP_VOLUME_MB*1024*1024/avg_len)))
+    MIN_ITERS = 100_000
+    
+    calc_iters = int(TARGET_LOOKUP_VOLUME_MB * 1024 * 1024 / avg_len)
+    iters = min(MAX_LOOKUPS, max(MIN_ITERS, calc_iters))
     
     res = {}
     res['FileSize'] = actual_size_mb
