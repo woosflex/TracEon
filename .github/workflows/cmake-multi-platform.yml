@@ -4,7 +4,7 @@ name: Create Release and Build Binaries
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 # Add permissions for the GITHUB_TOKEN to create a release and write assets
 permissions:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -37,12 +37,12 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { os: ubuntu-latest, arch: "x86_64"}
-          - { os: ubuntu-24.04-arm, arch: "arm64"}
-          - { os: windows-latest, arch: "x86_64"}
-          - { os: windows-11-arm, arch: "arm64"} 
-          - { os: macos-15-intel, arch: "x86_64"} 
-          - { os: macos-latest, arch: "arm64"}
+          - { os: ubuntu-latest, arch: "x86_64" }
+          - { os: ubuntu-24.04-arm, arch: "arm64" }
+          - { os: windows-latest, arch: "x86_64" }
+          - { os: windows-11-arm, arch: "arm64" }
+          - { os: macos-15-intel, arch: "x86_64" }
+          - { os: macos-latest, arch: "arm64" }
 
     runs-on: ${{ matrix.platform.os }}
 
@@ -96,3 +96,4 @@ jobs:
           asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
           asset_name: traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
           asset_content_type: application/gzip
+
