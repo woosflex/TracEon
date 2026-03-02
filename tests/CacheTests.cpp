@@ -19,7 +19,7 @@ TEST_CASE("Cache Functionality", "[cache]") {
 
     SECTION("Can load a simple FASTA file") {
         TracEon::Cache cache;
-        std::string test_file_path = "simple.fasta"; // Create locally for test
+        std::string test_file_path = "simple.fasta";
         
         {
              std::ofstream out(test_file_path);
@@ -33,6 +33,26 @@ TEST_CASE("Cache Functionality", "[cache]") {
         REQUIRE(cache.get("seq1") == "GATTACA");
         REQUIRE(cache.get("seq2") == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
         
+        std::filesystem::remove(test_file_path);
+    }
+
+    SECTION("Can load a multi-line FASTA file") {
+        TracEon::Cache cache;
+        std::string test_file_path = "multiline_cache.fasta";
+
+        {
+            std::ofstream out(test_file_path);
+            // Two-line wrapped sequence (classic NCBI style)
+            out << ">seq1\nACGT\nACGT\n>seq2\nTTTT\n";
+            out.close();
+        }
+
+        cache.loadFile(test_file_path);
+
+        REQUIRE(cache.size() == 2);
+        REQUIRE(cache.get("seq1") == "ACGTACGT");
+        REQUIRE(cache.get("seq2") == "TTTT");
+
         std::filesystem::remove(test_file_path);
     }
 
