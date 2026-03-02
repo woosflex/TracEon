@@ -52,7 +52,7 @@ struct MMapHandle {
     }
 };
 
-static const char MAGIC_BYTES[] = "MMAP";
+static const char MAGIC_BYTES[] = "TRO\x01"; // v1.1+ format (was "MMAP" in v1.0)
 
 SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN), file_cache_(GenomeIndex{}) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
@@ -73,6 +73,7 @@ void SmartStrategy::clearInternal() {
     else std::get<NGSIndex>(file_cache_).clear();
     text_arena_.clear();
     text_arena_.shrink_to_fit();
+    manual_store_.clear();
     mmap_handle_.reset();
 }
 
@@ -84,9 +85,22 @@ void SmartStrategy::clearCache() {
 void SmartStrategy::addEntry(const std::string& id, const std::string& seq, const std::string& qual) {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
     data_ready_.store(false, std::memory_order_release);
-    std::string_view id_view(id); std::string_view seq_view(seq); std::string_view qual_view(qual);
-    if (std::holds_alternative<GenomeIndex>(file_cache_)) { std::get<GenomeIndex>(file_cache_).emplace(id, SequenceView{id_view, seq_view, qual_view}); }
-    else { std::get<NGSIndex>(file_cache_).emplace(hash_key(id), SequenceView{id_view, seq_view, qual_view}); }
+
+    // Store copies in manual_store_ (std::deque: push_back never invalidates
+    // references to existing elements, so these string_views stay valid).
+    manual_store_.push_back(id);
+    std::string_view id_view(manual_store_.back());
+    manual_store_.push_back(seq);
+    std::string_view seq_view(manual_store_.back());
+    manual_store_.push_back(qual);
+    std::string_view qual_view(manual_store_.back());
+
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        std::get<GenomeIndex>(file_cache_).emplace(id, SequenceView{id_view, seq_view, qual_view});
+    } else {
+        std::get<NGSIndex>(file_cache_).emplace(hash_key(id), SequenceView{id_view, seq_view, qual_view});
+    }
+    data_ready_.store(true, std::memory_order_release);
 }
 
 // --- GZIP Loader ---
@@ -96,14 +110,8 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
 
     const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
     std::vector<char> temp_buffer;
-    
-    std::ifstream fsize(filepath, std::ios::ate | std::ios::binary);
-    if (fsize) {
-        size_t compressed_size = fsize.tellg();
-        temp_buffer.reserve(compressed_size * 3);
-    }
-    fsize.close();
-    
+    temp_buffer.reserve(CHUNK_SIZE * 4); // modest initial reservation; grows geometrically below
+
     auto chunk = std::make_unique<char[]>(CHUNK_SIZE);
     while (true) {
         int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
@@ -114,12 +122,42 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
             throw std::runtime_error("GZIP read error: " + std::string(error_msg));
         }
         if (bytes_read == 0) break;
+        // Geometric growth: double capacity when needed to minimise reallocations.
+        if (temp_buffer.size() + bytes_read > temp_buffer.capacity()) {
+            temp_buffer.reserve(std::max(temp_buffer.capacity() * 2, temp_buffer.size() + bytes_read));
+        }
         size_t old_size = temp_buffer.size();
         temp_buffer.resize(old_size + bytes_read);
         std::memcpy(temp_buffer.data() + old_size, chunk.get(), bytes_read);
     }
     gzclose(file);
     text_arena_ = std::move(temp_buffer);
+}
+
+void SmartStrategy::normalizeFastaArena() {
+    if (text_arena_.empty()) return;
+    char* write = text_arena_.data();
+    const char* read = text_arena_.data();
+    const char* end = read + text_arena_.size();
+
+    // Skip any leading blank lines
+    while (read < end && (*read == '\n' || *read == '\r')) ++read;
+
+    while (read < end) {
+        if (*read != '>') break; // Not FASTA, stop
+        // Copy header line verbatim, including the terminating '\n'
+        while (read < end && *read != '\n' && *read != '\r') *write++ = *read++;
+        if (read < end && *read == '\r') ++read; // strip \r
+        if (read < end && *read == '\n') *write++ = *read++; // keep \n
+
+        // Copy sequence chars, stripping all newlines, until the next '>' or end
+        while (read < end && *read != '>') {
+            char c = *read++;
+            if (c != '\n' && c != '\r') *write++ = c;
+        }
+        *write++ = '\n'; // terminate the (now single-line) sequence
+    }
+    text_arena_.resize(static_cast<size_t>(write - text_arena_.data()));
 }
 
 void SmartStrategy::parseArena() {
@@ -131,6 +169,13 @@ void SmartStrategy::parseArena() {
     bool isFastq = (content[0] == '@');
     bool use_ngs_mode = false; // Force Hybrid
     const size_t MULTITHREAD_THRESHOLD = 10 * 1024 * 1024;
+
+    // Normalize multi-line FASTA in-place before any parser runs.
+    // Ensures sequence string_views never contain embedded newlines.
+    if (!isFastq) {
+        normalizeFastaArena();
+        content = std::string_view(text_arena_.data(), text_arena_.size());
+    }
 
     if (use_ngs_mode) {
         file_cache_ = NGSIndex{};
@@ -190,7 +235,7 @@ void SmartStrategy::loadFile(const std::string& filepath) {
 
 // --- Templated Parsers ---
 template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map) {
-    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
@@ -230,7 +275,7 @@ template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(
 }
 
 template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map) {
-    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
@@ -360,36 +405,73 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     clearInternal();
     mmap_handle_ = std::make_unique<MMapHandle>();
 #ifdef _WIN32
-    mmap_handle_->hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    GetFileSizeEx(mmap_handle_->hFile, (PLARGE_INTEGER)&mmap_handle_->size);
+    mmap_handle_->hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (mmap_handle_->hFile == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Cannot open binary cache: " + filepath);
+    LARGE_INTEGER file_size{};
+    if (!GetFileSizeEx(mmap_handle_->hFile, &file_size))
+        throw std::runtime_error("GetFileSizeEx failed: " + filepath);
+    mmap_handle_->size = static_cast<size_t>(file_size.QuadPart);
     mmap_handle_->hMap = CreateFileMappingA(mmap_handle_->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mmap_handle_->hMap)
+        throw std::runtime_error("CreateFileMapping failed: " + filepath);
     mmap_handle_->data = MapViewOfFile(mmap_handle_->hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!mmap_handle_->data)
+        throw std::runtime_error("MapViewOfFile failed: " + filepath);
 #else
     mmap_handle_->fd = open(filepath.c_str(), O_RDONLY);
-    struct stat sb; fstat(mmap_handle_->fd, &sb);
-    mmap_handle_->size = sb.st_size;
+    if (mmap_handle_->fd == -1)
+        throw std::runtime_error("Cannot open binary cache: " + filepath);
+    struct stat sb{};
+    if (fstat(mmap_handle_->fd, &sb) == -1)
+        throw std::runtime_error("fstat failed: " + filepath);
+    mmap_handle_->size = static_cast<size_t>(sb.st_size);
     mmap_handle_->data = mmap(NULL, mmap_handle_->size, PROT_READ, MAP_PRIVATE, mmap_handle_->fd, 0);
+    if (mmap_handle_->data == MAP_FAILED)
+        throw std::runtime_error("mmap failed: " + filepath);
 #endif
+
     const char* ptr = static_cast<const char*>(mmap_handle_->data);
     const char* end = ptr + mmap_handle_->size;
-    if (mmap_handle_->size < 5 || std::strncmp(ptr, MAGIC_BYTES, 4) != 0) throw std::runtime_error("Invalid binary");
-    ptr += 4;
-    uint8_t mode = *reinterpret_cast<const uint8_t*>(ptr);
-    ptr += 1;
-    uint64_t count = *reinterpret_cast<const uint64_t*>(ptr);
-    ptr += sizeof(uint64_t);
+
+    // Bounds-checked read helper. Uses memcpy to avoid unaligned-access UB on ARM.
+    auto safe_advance = [&](size_t n) -> const char* {
+        if (ptr + n > end)
+            throw std::runtime_error("Binary cache is truncated or corrupt: " + filepath);
+        const char* result = ptr;
+        ptr += n;
+        return result;
+    };
+
+    // Validate magic / format version
+    if (mmap_handle_->size < 5 || std::strncmp(safe_advance(4), MAGIC_BYTES, 4) != 0) {
+        throw std::runtime_error(
+            "Invalid or outdated binary cache (re-generate with save()): " + filepath);
+    }
+
+    uint8_t mode;
+    std::memcpy(&mode, safe_advance(1), 1);
+    uint64_t count;
+    std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+    // Sanity-cap count to avoid looping on a corrupt large value.
+    constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+    if (count > MAX_RECORDS)
+        throw std::runtime_error("Binary cache record count implausible, file may be corrupt: " + filepath);
+
     if (mode == 0) {
         file_cache_ = GenomeIndex{};
         auto& map = std::get<GenomeIndex>(file_cache_);
         map.reserve(count);
         for (uint64_t i = 0; i < count; ++i) {
-            uint32_t len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-            std::string_view id_view(ptr, len); ptr += len;
-            uint32_t seq_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-            std::string_view seq(ptr, seq_len); ptr += seq_len;
-            uint32_t qual_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+            std::string_view id_view(safe_advance(len), len);
+            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+            std::string_view seq(safe_advance(seq_len), seq_len);
+            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
             std::string_view qual;
-            if (qual_len > 0) { qual = std::string_view(ptr, qual_len); ptr += qual_len; }
+            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
             map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
         }
     } else {
@@ -397,14 +479,14 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
         auto& map = std::get<NGSIndex>(file_cache_);
         map.reserve(count);
         for (uint64_t i = 0; i < count; ++i) {
-            uint64_t hash = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
-            uint32_t len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-            std::string_view id_view(ptr, len); ptr += len;
-            uint32_t seq_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
-            std::string_view seq(ptr, seq_len); ptr += seq_len;
-            uint32_t qual_len = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
+            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+            std::string_view id_view(safe_advance(len), len);
+            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+            std::string_view seq(safe_advance(seq_len), seq_len);
+            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
             std::string_view qual;
-            if (qual_len > 0) { qual = std::string_view(ptr, qual_len); ptr += qual_len; }
+            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
             map.emplace(hash, SequenceView{id_view, seq, qual});
         }
     }
@@ -418,7 +500,7 @@ std::string_view SmartStrategy::getView(const std::string_view& sequence_id) con
     if (data_ready_.load(std::memory_order_acquire)) {
         if (std::holds_alternative<GenomeIndex>(file_cache_)) {
             const auto& map = std::get<GenomeIndex>(file_cache_);
-            auto it = map.find(std::string(sequence_id)); 
+            auto it = map.find(sequence_id); // heterogeneous lookup: no std::string allocation
             if (it != map.end()) return it->second.sequence;
         } else {
             const auto& map = std::get<NGSIndex>(file_cache_);

@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — v1.1.0 "Bakuya" (planned)
+
+### Planned for v1.1.0 "Bakuya" (Q1 2026)
+*Twin swords - Dual optimization paths*
+
+- SIMD prefetching for hash probes (target: 20M OPS/s on 100MB RAM datasets)
+- Adaptive capacity estimation for different file types
+- Benchmark against production datasets from collaborators
+
+---
+
+## [1.0.1] — Patch Release
+
+### 🐛 Fixed (Critical)
+
+- **`addEntry()` dangling string_views (UB)**: `SequenceView` members were views into
+  function-parameter strings that went out of scope immediately. Replaced with
+  `std::deque<std::string> manual_store_` whose elements have reference stability
+  (push_back never invalidates existing references per the C++ standard).
+
+- **`loadBinary()` mmap with no error handling**: `open()` / `fstat()` / `mmap()` failures
+  on Linux, and `CreateFileA()` / `MapViewOfFile()` failures on Windows, all went
+  unchecked — leading to reads from invalid/NULL pointers (crash/UB). Full error
+  propagation added via `std::runtime_error`.
+
+- **`loadBinary()` no bounds checking**: Reading from the mmap buffer advanced `ptr`
+  without verifying it stayed within `[data, data+size)`. A corrupt or truncated binary
+  cache file would cause out-of-bounds reads. A `safe_advance(n)` lambda now throws
+  on any overrun, and a record-count sanity cap (1B) prevents runaway loops.
+
+- **Unaligned reads in `loadBinary()`**: `*reinterpret_cast<const uint32_t*>(ptr)` is
+  undefined behaviour on strict-alignment architectures (ARM). All integer reads now use
+  `std::memcpy` which the compiler optimises away on x86/x64 while remaining portable.
+
+- **Multi-line FASTA sequences contained embedded newlines**: NCBI-style wrapped FASTA
+  (60 chars/line) produced sequence `string_view`s with internal `\n` chars. A new
+  `normalizeFastaArena()` pass compacts the arena in-place before any parser runs, so
+  every sequence is guaranteed to be a single contiguous string. Works for both
+  single-threaded and multithreaded parse paths.
+
+### ✨ Added
+
+- **Heterogeneous lookup on hot read path**: `GenomeIndex` now uses `StringHashMap`
+  (from `MapDefs.h`) with a `TransparentStringHash` and `std::equal_to<>`. `getView()`
+  can now call `map.find(sequence_id)` with a `string_view` directly — no `std::string`
+  heap allocation per lookup. Requires C++20; falls back to `std::unordered_map` without
+  robin_hood.
+
+- **Binary cache format versioning**: Magic changed from `"MMAP"` to `"TRO\x01"`.
+  Opening an old v1.0 binary cache now throws a descriptive `std::runtime_error` instead
+  of silently producing garbage data.
+
+### 🔧 Changed
+
+- **GZIP buffer growth**: Removed the single upfront `3×compressed_size` reservation
+  (inaccurate for highly compressible or incompressible data). The decompression loop
+  now doubles `temp_buffer` capacity geometrically when needed, matching standard
+  container growth behaviour.
+
+- **Thread count guard**: Both multithreaded parser templates now use
+  `std::max(1u, std::thread::hardware_concurrency())` to avoid division-by-zero on
+  platforms where `hardware_concurrency()` returns 0.
+
+- **`clearInternal()`**: Now also clears `manual_store_`, freeing strings added via
+  `addEntry()` when the cache is reloaded or destroyed.
+
+### 🧪 Testing
+
+- 15 new assertions across 7 new test cases: multi-line FASTA normalization,
+  `addEntry` stable-view correctness, `loadFile` / `loadBinary` on missing files,
+  truncated binary, old-format rejection, initial state validation.
+- Total: **43 assertions in 12 test cases** (was 28 in 6).
+
+---
+
 ## [1.0.0] - 2025-12-16 "Avalon"
 
 ### 🎯 Codename
@@ -187,39 +262,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 5. **RecordTypes.h Structure**: `SequenceView` defined in `SmartStrategy.h`
    - Architectural decision for internal implementation details
    - Public API abstracts this via `Cache.h`
-
----
-
-## [Unreleased]
-
-### Planned for v1.1.0 "Bakuya" (Q1 2026)
-*Twin swords - Dual optimization paths*
-
-- SIMD prefetching for hash probes (target: 20M OPS/s on 100MB RAM datasets)
-- Optimized GZIP buffering with better chunk management
-- Adaptive capacity estimation for different file types
-- Benchmark against production datasets from collaborators
-
-### Planned for v1.2.0 "Caladbolg" (Q2 2026)
-*Rainbow sword - Spectrum of compression*
-
-- Binary cache compression using LZ4 (target: 3x size reduction)
-- Transparent decompression for reference genomes
-- Smart compression algorithm selection based on data characteristics
-
-### Planned for v2.0.0 "Durandal" (Q3 2026)
-*Peerless - Language-agnostic access*
-
-- C API for Python/R/Julia bindings
-- Streaming API for datasets larger than RAM
-- Foreign Function Interface (FFI) with zero-copy guarantees
-
-### Planned for v2.1.0 "Excalibur" (Q4 2026)
-*Holy sword - Distributed power*
-
-- Distributed caching across multiple nodes
-- NUMA-aware architecture for >8 core systems
-- Network protocol for shared genomic databases
 
 ---
 

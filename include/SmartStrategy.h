@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <deque>
 #include <memory>
 #include <shared_mutex>
 #include <variant>
@@ -29,13 +30,15 @@ struct SequenceView {
     // - The Map Key (std::string) owns the normalized identifier used for hashing/lookups.
     // - SequenceView.id, sequence, and quality are NON-OWNING views pointing
     //   into either the mmap buffer (binary mode) or the text_arena_ buffer (load mode).
+    //   For entries added via addEntry(), they point into manual_store_.
     std::string_view id;       
     std::string_view sequence; 
     std::string_view quality;  
 };
 
-using GenomeIndex = HashMap<std::string, SequenceView>; 
-using NGSIndex = HashMap<uint64_t, SequenceView>;       
+// GenomeIndex: string keys with transparent lookup (find by string_view, no allocation).
+using GenomeIndex = StringHashMap<SequenceView>;
+using NGSIndex = HashMap<uint64_t, SequenceView>;
 
 enum class IndexMode { GENOME, NGS };
 
@@ -82,6 +85,11 @@ private:
     std::unique_ptr<MMapHandle> mmap_handle_;
     std::variant<GenomeIndex, NGSIndex> file_cache_;
     
+    // Stable string storage for entries added via addEntry().
+    // std::deque provides reference stability: push_back never invalidates
+    // references/pointers to existing elements, so string_views into it are safe.
+    std::deque<std::string> manual_store_;
+
     FileFormat detected_format_;
     mutable std::shared_mutex cache_mutex_;
 
@@ -98,6 +106,14 @@ private:
     
     void clearInternal();
     
+    /**
+     * @brief Normalize multi-line FASTA sequences in-place within text_arena_.
+     * Removes embedded newlines from sequence regions so parsers always see
+     * single-line sequences. Header lines are preserved verbatim.
+     * Only call for FASTA (first char '>'). No-op for empty arenas.
+     */
+    void normalizeFastaArena();
+
     /**
      * @brief Internal GZIP loader (used by both public methods)
      * Reads compressed stream into text_arena_ without parsing.
