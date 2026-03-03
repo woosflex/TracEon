@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "SmartStrategy.h"
+#include "SimdUtils.h"
 #include <fstream>
 #include <filesystem>
 #include <thread>
@@ -164,4 +165,60 @@ TEST_CASE("loadBinary rejects old MMAP format", "[strategy][errors]") {
     TracEon::SmartStrategy strategy;
     REQUIRE_THROWS_AS(strategy.loadBinary(old_file), std::runtime_error);
     fs::remove(old_file);
+}
+// ── simd_find_char unit tests ─────────────────────────────────────────────────
+// These tests verify correctness of the SIMD and scalar paths regardless of
+// which ISA extension is active at compile time.  The cases are designed so
+// that both the "full SIMD lane" path and the scalar tail path are exercised:
+//   AVX2  → full loop: strings ≥32 bytes; tail: strings 1–31 bytes
+//   NEON  → full loop: strings ≥16 bytes; tail: strings 1–15 bytes
+//   memchr → all sizes covered by the libc implementation
+
+TEST_CASE("simd_find_char — basic correctness", "[simd]") {
+    using TracEon::simd_find_char;
+
+    // 64 bytes: exercises at least one full SIMD lane on both AVX2 and NEON.
+    // The target char '>' is placed at index 32 (just past one AVX2 lane).
+    const std::string data(32, 'A');                     // 32 × 'A'
+    const std::string rest = ">" + std::string(31, 'C'); // '>' then 31 × 'C'
+    const std::string buf  = data + rest;                // 64 bytes total
+    const char* b = buf.data();
+    const char* e = b + buf.size();
+
+    REQUIRE(simd_find_char(b, e, '>') == b + 32);  // found exactly at index 32
+    REQUIRE(simd_find_char(b, e, 'A') == b);        // first byte matches
+    REQUIRE(simd_find_char(b, e, 'C') == b + 33);  // first 'C' after the '>'
+    REQUIRE(simd_find_char(b, e, 'Z') == e);        // not present → returns end
+}
+
+TEST_CASE("simd_find_char — scalar tail (< SIMD lane size)", "[simd]") {
+    using TracEon::simd_find_char;
+
+    // 7 bytes: always handled by the scalar tail on any SIMD width.
+    const std::string buf = "ACGT\nAT";
+    const char* b = buf.data();
+    const char* e = b + buf.size();
+
+    REQUIRE(simd_find_char(b, e, '\n') == b + 4);
+    REQUIRE(simd_find_char(b, e, 'T')  == b + 3);  // first 'T' at index 3
+    REQUIRE(simd_find_char(b, e, 'Z')  == e);
+}
+
+TEST_CASE("simd_find_char — empty range", "[simd]") {
+    using TracEon::simd_find_char;
+    const char* p = "X";
+    REQUIRE(simd_find_char(p, p, 'X') == p);  // end == begin → never match
+}
+
+TEST_CASE("simd_find_char — first and last byte", "[simd]") {
+    using TracEon::simd_find_char;
+
+    // 33 bytes: straddles one AVX2 lane boundary.
+    const std::string buf = ">" + std::string(31, 'N') + "<";
+    const char* b = buf.data();
+    const char* e = b + buf.size();
+
+    REQUIRE(simd_find_char(b, e, '>') == b);       // first byte
+    REQUIRE(simd_find_char(b, e, '<') == e - 1);   // last byte (scalar tail)
+    REQUIRE(simd_find_char(b, e, 'N') == b + 1);   // second byte
 }
