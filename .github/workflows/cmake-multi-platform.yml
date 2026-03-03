@@ -24,12 +24,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
 
-  # This job builds the binaries for each OS and architecture in parallel.
   build:
     name: Build on ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
     needs: create_release # This job runs only after the release has been created.
@@ -77,23 +76,14 @@ jobs:
       # --- Upload Assets ---
       - name: Upload Release Asset (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
-          asset_name: traceon-windows-${{ matrix.platform.arch }}.zip
-          asset_content_type: application/zip
+          tag_name: ${{ github.ref_name }}
+          files: ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
 
       - name: Upload Release Asset (Linux/macOS)
         if: runner.os != 'Windows'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
-          asset_name: traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
-          asset_content_type: application/gzip
-
+          tag_name: ${{ github.ref_name }}
+          files: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
