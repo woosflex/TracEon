@@ -1,4 +1,5 @@
 #include "SmartStrategy.h"
+#include "SimdUtils.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -136,26 +137,49 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
 
 void SmartStrategy::normalizeFastaArena() {
     if (text_arena_.empty()) return;
-    char* write = text_arena_.data();
-    const char* read = text_arena_.data();
-    const char* end = read + text_arena_.size();
+    char*       write = text_arena_.data();
+    const char* read  = text_arena_.data();
+    const char* end   = read + text_arena_.size();
 
     // Skip any leading blank lines
     while (read < end && (*read == '\n' || *read == '\r')) ++read;
 
     while (read < end) {
-        if (*read != '>') break; // Not FASTA, stop
-        // Copy header line verbatim, including the terminating '\n'
-        while (read < end && *read != '\n' && *read != '\r') *write++ = *read++;
-        if (read < end && *read == '\r') ++read; // strip \r
-        if (read < end && *read == '\n') *write++ = *read++; // keep \n
+        if (*read != '>') break;
 
-        // Copy sequence chars, stripping all newlines, until the next '>' or end
-        while (read < end && *read != '>') {
-            char c = *read++;
-            if (c != '\n' && c != '\r') *write++ = c;
+        // ── Copy header line up to (but not including) \r\n ─────────────────
+        // simd_find_char scans 32 bytes/iter (AVX2) or 16 bytes/iter (NEON).
+        const char* nl      = simd_find_char(read, end, '\n');
+        const char* hdr_end = (nl > read && *(nl - 1) == '\r') ? nl - 1 : nl;
+        size_t hdr_len      = static_cast<size_t>(hdr_end - read);
+        // write <= read always (compaction), so memmove handles overlap safely
+        std::memmove(write, read, hdr_len);
+        write += hdr_len;
+        if (nl < end) *write++ = '\n'; // keep the terminating newline
+        read = (nl < end) ? nl + 1 : end; // advance past \n
+
+        // ── Locate the end of this record: next '>' or end of arena ──────────
+        // Biggest win on large genomes: 32 bytes/iter instead of 1 byte/iter
+        // for the O(sequence_length) scan that formerly drove the inner loop.
+        const char* rec_end = simd_find_char(read, end, '>');
+
+        // ── Copy sequence bytes, stripping all \r and \n ─────────────────────
+        // Use simd_find_char to jump to the next \n, then bulk-copy the
+        // non-newline run with memmove.  Tail bytes (<32 or <16) handled by
+        // simd_find_char's scalar fall-through — no special case needed here.
+        while (read < rec_end) {
+            const char* line_nl  = simd_find_char(read, rec_end, '\n');
+            // Strip a trailing \r if it immediately precedes the \n (or rec_end)
+            const char* copy_end = (line_nl > read && *(line_nl - 1) == '\r')
+                                   ? line_nl - 1 : line_nl;
+            size_t run = static_cast<size_t>(copy_end - read);
+            if (run) std::memmove(write, read, run);
+            write += run;
+            // Advance past the \n; step to rec_end if no \n was found
+            read = (line_nl < rec_end) ? line_nl + 1 : rec_end;
         }
-        *write++ = '\n'; // terminate the (now single-line) sequence
+        *write++ = '\n'; // terminate the now-single-line sequence
+        // read == rec_end (pointing at '>' of next record, or end)
     }
     text_arena_.resize(static_cast<size_t>(write - text_arena_.data()));
 }
