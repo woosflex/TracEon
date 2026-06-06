@@ -8,8 +8,16 @@ project(TracEon)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- ZLIB Support ---
-add_subdirectory(third_party/zlib)
+# --- ZLIB Support (zlib-ng via FetchContent, zlib-compat mode) ---
+include(FetchContent)
+FetchContent_Declare(
+        zlib-ng
+        GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
+        GIT_TAG        2.2.2
+)
+set(ZLIB_COMPAT ON)
+set(WITH_NATIVE_INSTRUCTIONS ON)
+FetchContent_MakeAvailable(zlib-ng)
 
 # --- LZ4 Support ---
 add_subdirectory(third_party/lz4/build/cmake)
@@ -44,7 +52,7 @@ target_include_directories(traceon_core PUBLIC
 )
 
 # Link traceon_core to both zlib and lz4
-target_link_libraries(traceon_core PUBLIC zlib_static lz4_static)
+target_link_libraries(traceon_core PUBLIC zlibstatic lz4_static)
 
 # ── Architecture-aware runtime dispatch macros (Fat Binary) ───────────────
 # Detect host processor and enable compile-time macros that allow the code to
