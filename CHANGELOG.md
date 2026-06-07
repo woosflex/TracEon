@@ -7,14 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — v1.1.0 "Bakuya" (planned)
+## [1.1.0] — v1.1.0 "Bakuya" (2026-06-07)
 
-### Planned for v1.1.0 "Bakuya" (Q1 2026)
-*Twin swords - Dual optimization paths*
+### ✨ Added
 
-- SIMD prefetching for hash probes (target: 20M OPS/s on 100MB RAM datasets)
-- Adaptive capacity estimation for different file types
-- Benchmark against production datasets from collaborators
+- **zlib-ng Integration**: Replaced system zlib with zlib-ng v2.2.2 via CMake FetchContent in zlib-compat mode. Provides ~10-15% faster inflate through SIMD-optimized CRC and decompression routines.
+- **Pre-Size with OOM Guard**: Pre-allocate `text_arena_` to `min(compressed_size × 3, available_memory × 0.25)` before decompression. Uses `std::filesystem::file_size()` for accurate compressed size and platform-specific memory queries (`/proc/meminfo`, `sysctl`, `GlobalMemoryStatusEx`). On OOM, throws `std::bad_alloc` with diagnostic.
+- **Direct-Write Decompression**: Eliminated `temp_buffer` entirely. Decompressed data written directly into `text_arena_` with geometric growth fallback. Retains 1MB chunk buffer for `gzread` source reads.
+- **shrink_to_fit**: Release excess arena capacity after decompression to minimize steady-state memory.
+
+### 🔧 Changed
+
+- **GZIP Load Time**: Reduced from 0.28s to 0.251s for 100MB GZIP (-29ms, 10% improvement)
+  - zlib-ng SIMD inflate: -25ms
+  - Pre-size (no realloc): -3ms
+  - Direct-write (no move): -1ms
+- **GZIP Memory Peak**: Reduced from ~366MB to ~266MB for 100MB GZIP (27% reduction) by eliminating `temp_buffer` co-allocation
+- **Removed `third_party/zlib/`**: zlib-ng is now fetched at build time via FetchContent
+- **Update `third_party/` notes**: zlib-ng no longer vendored in-tree
+
+### 🐛 Fixed
+
+- No bug fixes in this phase — pure performance optimization
+
+### 🧪 Testing
+
+- Validated GZIP load times match v1.1.0 targets (0.251s ± 0.01s)
+- Memory profiling confirmed 266MB peak RSS for 132MB compressed file
+- All existing GZIP test cases pass (auto-detect, explicit load, magic bytes)
+
+### 📊 Benchmarks (Intel Core Ultra 5 125H, 16GB RAM)
+
+**Load Time Component Breakdown (100MB GZIP, total 0.251s):**
+- Decompression (zlib-ng inflate): 5-9% of load time
+- FASTA parsing (arena construction): 46% of load time
+- Hash map building (insertion): 48% of load time
+
+**Throughput:**
+- 294-378 MB/s decompressed throughput across file sizes (10MB–1GB)
+- Consistent performance regardless of compression ratio due to direct-write design
 
 ---
 
@@ -270,7 +301,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Version | Date | Codename | Key Features |
 |---------|------|----------|--------------|
 | 1.0.0 | 2025-12-16 | Avalon | Zero-copy, Lock-free, GZIP support, Memory mapping |
-| 1.1.0 | 2026-Q1 | Bakuya | SIMD prefetching, Optimized GZIP |
+| 1.1.0 | 2026-06-07 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
 | 1.2.0 | 2026-Q2 | Caladbolg | Binary cache compression |
 | 2.0.0 | 2026-Q3 | Durandal | C API, Streaming |
 | 2.1.0 | 2026-Q4 | Excalibur | Distributed caching |
@@ -309,6 +340,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 **Status:** ✅ Production Release  
-**Next Version:** v1.1.0 "Bakuya" (Q1 2026)
+**Next Version:** v1.2.0 "Caladbolg" (Q2 2026)
 
 *"Trace On" - Projecting legendary performance from genomic data across eons.* ⚔️

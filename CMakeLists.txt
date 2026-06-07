@@ -8,8 +8,16 @@ project(TracEon)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- ZLIB Support ---
-add_subdirectory(third_party/zlib)
+# --- ZLIB Support (zlib-ng via FetchContent, zlib-compat mode) ---
+include(FetchContent)
+FetchContent_Declare(
+        zlib-ng
+        GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
+        GIT_TAG        2.2.2
+)
+set(ZLIB_COMPAT ON)
+set(WITH_NATIVE_INSTRUCTIONS ON)
+FetchContent_MakeAvailable(zlib-ng)
 
 # --- LZ4 Support ---
 add_subdirectory(third_party/lz4/build/cmake)
@@ -39,12 +47,36 @@ add_library(traceon_core STATIC ${CORE_SOURCES})
 target_include_directories(traceon_core PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib
     ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
 )
 
+# GCC 16.1.1+ removed implicit <cstdint> includes; robin_hood.h needs UINT64_C
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include cstdint")
+endif()
+
 # Link traceon_core to both zlib and lz4
-target_link_libraries(traceon_core PUBLIC zlib_static lz4_static)
+target_link_libraries(traceon_core PUBLIC zlibstatic lz4_static)
+
+# ── Architecture-aware runtime dispatch macros (Fat Binary) ───────────────
+# Detect host processor and enable compile-time macros that allow the code to
+# compile AVX2/NEON variants while deferring runtime selection to the
+# dispatcher (no global -mavx2 is applied; avoids SIGILL on older CPUs).
+include(CheckCXXCompilerFlag)
+string(TOLOWER "${CMAKE_HOST_SYSTEM_PROCESSOR}" TRACEON_HOST_PROC)
+message(STATUS "TracEon: host processor = ${TRACEON_HOST_PROC}")
+if(TRACEON_HOST_PROC MATCHES "x86_64|amd64")
+    # Check if the compiler understands -mavx2; if so, define TRACEON_HAS_AVX2
+    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_MAVX2)
+    if(COMPILER_SUPPORTS_MAVX2)
+        target_compile_definitions(traceon_core PUBLIC TRACEON_HAS_AVX2)
+        message(STATUS "TracEon: Compiler supports AVX2; defining TRACEON_HAS_AVX2")
+    endif()
+elseif(TRACEON_HOST_PROC MATCHES "aarch64|arm64")
+    target_compile_definitions(traceon_core PUBLIC TRACEON_HAS_NEON)
+    message(STATUS "TracEon: ARM64 target detected; defining TRACEON_HAS_NEON")
+endif()
+# NEON on AArch64 requires no extra compiler flags; runtime dispatch will call NEON path.
 
 # --- Executable Targets ---
 add_executable(trac-eon-test main.cpp)

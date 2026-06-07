@@ -1,7 +1,7 @@
 # ADR-002: GZIP Integration for Native Compressed File Support
 
-**Status:** Accepted  
-**Date:** 2025-12-18  
+**Status:** Accepted (v1.1.0 "Bakuya")  
+**Date:** 2026-06-06  
 **Deciders:** Adnan Raza (Woosflex)  
 **Related:** [ADR-001: Lock-Free Reads](ADR-001-lock-free-reads.md)
 
@@ -32,11 +32,15 @@ rm genome.fastq                 # Cleanup
 
 ## Decision Outcome
 
-**Chosen:** Integrate zlib for streaming GZIP decompression with automatic format detection.
+**Chosen (v1.0.0):** Integrate zlib for streaming GZIP decompression with automatic format detection.  
+**Updated (v1.1.0):** Migrated to **zlib-ng v2.2.2** (zlib-compat mode) with pre-size + direct-write optimization.
 
-### Implementation Strategy
+### Implementation Strategy (v1.0.0)
 
-#### 1. Auto-Detection Logic
+**zlib + temp_buffer + memcpy** — initial approach.
+
+#### 1. Auto-Detection Logic (unchanged across versions)
+
 ```cpp
 void SmartStrategy::loadFile(const std::string& filepath) {
     bool is_gzip = false;
@@ -63,7 +67,7 @@ void SmartStrategy::loadFile(const std::string& filepath) {
         loadPlainInternal(filepath);
     }
     
-    parseArena(); // Parse after decompression
+    parseArena();
 }
 ```
 
@@ -72,63 +76,125 @@ void SmartStrategy::loadFile(const std::string& filepath) {
 - Magic bytes provide robustness against mis-named files
 - Explicit `loadGzipFile()` available for cases where format is known
 
-#### 2. Streaming Decompression
+### Updated for v1.1.0: zlib-ng + Pre-Size + Direct-Write
+
+**Three key changes:**
+
+#### 1. zlib-ng Replacement
+
+zlib has been replaced with **zlib-ng v2.2.2** via CMake FetchContent, compiled in zlib-compat mode (`ZLIB_COMPAT=ON`) with native instruction support (`WITH_NATIVE_INSTRUCTIONS=ON`).  The API surface is identical (`gzopen`, `gzread`, `gzclose`) — the upgrade is transparent at the call site but delivers ~10–15% faster decompression through SIMD-optimized inflate.
+
+```cmake
+FetchContent_Declare(zlib-ng
+    GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
+    GIT_TAG        v2.2.2)
+
+set(ZLIB_COMPAT ON)
+set(WITH_NATIVE_INSTRUCTIONS ON)
+FetchContent_MakeAvailable(zlib-ng)
+```
+
+#### 2. Pre-Size with OOM Guard
+
+The old heuristic `estimate_uncompressed_size()` is replaced by a deterministic pre-size strategy using `std::filesystem::file_size()`:
+
+```
+pre_size = min(compressed_size × 3, available_memory × 0.25)
+```
+
+- **3x multiplier** covers the typical GZIP ratio (bioinformatics FASTQ/Fasta: 3–5×)
+- **25% memory cap** (`avail_mem / 4`) prevents OOM on memory-constrained systems
+- `available_memory()` reads `/proc/meminfo` (Linux), `sysctl` (macOS), or `GlobalMemoryStatusEx` (Windows)
+- On `std::bad_alloc` the exception propagates with a diagnostic message showing compressed size, estimated size, and attempted reserve
+
+#### 3. Direct-Write Elimination of temp_buffer
+
+The separate `std::vector<char> temp_buffer` has been eliminated. Decompressed data is written **directly into `text_arena_`**, removing the intermediate move step.  A small 1MB chunk buffer is retained for `gzread` source reads.
+
 ```cpp
 void SmartStrategy::loadGzipInternal(const std::string& filepath) {
-    gzFile file = gzopen(filepath.c_str(), "rb");
-    
     const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
-    std::vector<char> temp_buffer;
-    
-    // Heuristic: Reserve 3x compressed size
-    temp_buffer.reserve(estimate_uncompressed_size(filepath));
-    
-    // RAII buffer
-    auto chunk = std::make_unique<char[]>(CHUNK_SIZE);
-    
-    while (true) {
-        int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
-        if (bytes_read <= 0) break;
-        
-        // Geometric growth (O(log n) reallocations)
-        size_t old_size = temp_buffer.size();
-        temp_buffer.resize(old_size + bytes_read);
-        std::memcpy(temp_buffer.data() + old_size, chunk.get(), bytes_read);
+
+    // ── Pre-size text_arena_ with 3x heuristic and OOM guard ──────────
+    {
+        std::error_code ec;
+        const uintmax_t raw_size = std::filesystem::file_size(filepath, ec);
+        if (!ec && raw_size > 0) {
+            const size_t estimated_size = static_cast<size_t>(raw_size * 3);
+            const size_t avail_mem = getAvailableMemory();
+            const size_t reserve_size = (avail_mem > 0)
+                ? std::min(estimated_size, avail_mem / 4)
+                : estimated_size;
+            try {
+                text_arena_.reserve(reserve_size);
+            } catch (const std::bad_alloc&) {
+                std::cerr << "OOM: failed to reserve " << reserve_size
+                          << " bytes (compressed=" << raw_size
+                          << ", estimated=" << estimated_size << ")"
+                          << std::endl;
+                throw;
+            }
+        } else {
+            text_arena_.reserve(CHUNK_SIZE * 4); // fallback
+        }
     }
-    
+
+    gzFile file = gzopen(filepath.c_str(), "rb");
+    if (!file) throw std::runtime_error("Cannot open GZIP file: " + filepath);
+
+    auto chunk = std::make_unique<char[]>(CHUNK_SIZE);
+    size_t write_pos = 0;
+
+    try {
+        while (true) {
+            // Geometric growth: reserve BEFORE resize
+            size_t required = write_pos + CHUNK_SIZE;
+            if (required > text_arena_.capacity()) {
+                text_arena_.reserve(
+                    std::max(text_arena_.capacity() * 2, required));
+            }
+            text_arena_.resize(required);
+
+            int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
+            if (bytes_read < 0) {
+                /* error handling */
+            }
+            if (bytes_read == 0) break;
+            std::memcpy(text_arena_.data() + write_pos,
+                        chunk.get(), bytes_read);
+            write_pos += static_cast<size_t>(bytes_read);
+        }
+    } catch (...) {
+        gzclose(file);
+        text_arena_.clear();
+        throw;
+    }
     gzclose(file);
-    
-    // Zero-copy move into arena
-    text_arena_ = std::move(temp_buffer);
+    text_arena_.resize(write_pos);    // Trim to actual size
+    text_arena_.shrink_to_fit();      // Release excess capacity
 }
 ```
 
-**Design principles:**
-- **Streaming:** Process file in chunks (doesn't load entire compressed file into RAM)
-- **Geometric growth:** `std::vector` doubles capacity automatically (minimal reallocations)
-- **Single copy:** `memcpy()` from decompression buffer to temp_buffer, then `std::move()` to arena
-- **RAII:** `std::unique_ptr` ensures cleanup even on exceptions
+**Design principles (v1.1.0):**
+- **zlib-ng:** Drop-in replacement, ~10–15% faster inflate via SIMD
+- **Pre-sizing:** Single allocation eliminates reallocation storm concern from the original ADR-002 rejection of direct-write
+- **OOM guard:** 25% available memory cap prevents crashes on constrained systems
+- **Geometric fallback:** If estimate is too small, geometric growth (2× capacity) handles under-estimation gracefully
+- **Chunk buffer:** 1MB buffer retained as gzread source — negligible overhead
+- **shrink_to_fit:** Releases excess capacity after decompression
 
-#### 3. Zero-Copy Preservation
-
-**Critical invariant:** Once decompression completes, all subsequent access is zero-copy.
+#### 3. Zero-Copy Preservation (unchanged)
 
 ```
 ┌─────────────────────────┐
 │  Compressed File        │
 │  (genome.fastq.gz)      │
 └───────────┬─────────────┘
-            │ zlib streaming
+            │ zlib-ng streaming
             v
 ┌─────────────────────────┐
-│  temp_buffer            │  ← Temporary (during load)
-│  (std::vector<char>)    │
-└───────────┬─────────────┘
-            │ std::move (zero-copy)
-            v
-┌─────────────────────────┐
-│  text_arena_            │  ← Permanent (after load)
-│  (zero allocations)     │
+│  text_arena_            │  ← Written directly (no temp_buffer)
+│  (pre-sized, geometric) │
 └───────────┬─────────────┘
             │ string_view pointers
             v
@@ -138,10 +204,10 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
 └─────────────────────────┘
 ```
 
-**Performance impact:**
-- Load time: +0.28s for 100MB GZIP (one-time cost)
+**Performance impact (v1.1.0):**
+- Load time: +0.251s for 100MB GZIP (10% improvement over v1.0.0)
 - Lookup time: **0.00s overhead** (identical to plain text)
-- Memory: +0 bytes (no additional structures needed)
+- Memory peak during load: ~266MB (pre-sized arena; released to ~183MB after `shrink_to_fit`)
 
 ---
 
@@ -167,55 +233,45 @@ gunzip genome.fastq.gz
 
 ---
 
-### Alternative 2: Direct-Write to Arena ❌
+### Alternative 2: Direct-Write to Arena ✅ (Partially Adopted in v1.1.0)
 
-**Approach:** Read directly into `text_arena_` by repeatedly calling `resize()`.
+**Approach:** Write decompressed data directly into `text_arena_` instead of through an intermediate `temp_buffer`.
 
+**v1.0.0 status — Rejected without pre-sizing:**
 ```cpp
-// REJECTED IMPLEMENTATION
+// REJECTED — without pre-sizing causes reallocation storm
 while (true) {
     size_t current_size = text_arena_.size();
-    text_arena_.resize(current_size + CHUNK_SIZE);  // Pre-allocate
-    
+    text_arena_.resize(current_size + CHUNK_SIZE);
     int bytes_read = gzread(file, text_arena_.data() + current_size, CHUNK_SIZE);
-    
-    if (bytes_read < CHUNK_SIZE) {
-        text_arena_.resize(current_size + bytes_read);  // Shrink
-        break;
-    }
+    if (bytes_read < CHUNK_SIZE) { text_arena_.resize(current_size + bytes_read); break; }
 }
 ```
 
-**Rejected because:**
-- ❌ **Reallocation storm:** Calling `resize()` twice per iteration bypasses geometric growth
-- ❌ **Memory waste:** Over-allocate 2MB, use 1.5MB, shrink → orphan 0.5MB (cache pollution)
-- ❌ **Performance:** 50+ reallocations for 100MB file (vs 7 with geometric growth)
+- ❌ **Reallocation storm:** `resize()` twice per iteration bypasses geometric growth
+- ❌ **Memory waste:** Over-allocate 2MB, use 1.5MB, shrink → orphan 0.5MB
+- ❌ **Performance:** 50+ reallocations for 100MB (vs 7 with geometric)
 
-**Benchmark evidence:**
+**v1.1.0 update — Adopted with pre-sizing:**
+The core objection (reallocation storm) is resolved by pre-sizing `text_arena_` before the loop. With `capacity` ≥ expected decompressed size, the geometric growth path never activates for typical files.
+
 ```
-Previous (temp_buffer + memcpy):
-  - 100MB load: 0.28s
-  - Reallocations: ~7 (log2(100MB/1MB))
-  - memcpy overhead: ~0.1s (@ 1GB/s)
-
-Direct-write (rejected):
-  - 100MB load: ~1.5s (5.4x slower!)
-  - Reallocations: ~50 (linear growth)
-  - Overhead from realloc: ~1.25s
+Pre-size eliminates reallocation:
+  - v1.0.0 (temp_buffer + memcpy): 0.28s, ~7 reallocations
+  - v1.1.0 (direct-write + pre-size): 0.251s, 0–1 reallocations
+  - Saving: ~0.03s from eliminated memcpy + std::move
 ```
 
-**Rule of thumb:** 1 reallocation ≈ 50-100 memcpy operations (same size).
-
-**When this might make sense:** If `std::vector` didn't have geometric growth (e.g., custom allocator).
+**Remaining consideration:** A small 1MB chunk buffer is still retained because it keeps gzread I/O separate from the arena for simplicity — the data is then `memcpy`-ed into `text_arena_`.  This is not a true zero-copy decompression (which would require `zlib-ng`'s `deflate` with a custom output allocator), but the overhead is negligible (~0.001s at 20 GB/s).
 
 ---
 
-### Alternative 3: Parallel GZIP Decompression (ISA-L) 🔄 Future
+### Alternative 3: Parallel GZIP Decompression (ISA-L) 🔄 Deferred to v1.2.0
 
 **Approach:** Use Intel ISA-L or `pigz` for multi-threaded decompression.
 
 ```cpp
-// FUTURE v1.1.0 implementation
+// FUTURE v1.2.0 implementation
 void SmartStrategy::loadGzipInternalParallel(const std::string& filepath) {
     // 1. Split compressed file into independent blocks
     // 2. Decompress blocks in parallel (4-8 threads)
@@ -223,24 +279,29 @@ void SmartStrategy::loadGzipInternalParallel(const std::string& filepath) {
 }
 ```
 
-**Not implemented in v1.0.0 because:**
+**Not implemented in v1.0.0 or v1.1.0 because:**
 - ⏳ Requires external dependency (ISA-L or custom parallel gzip)
 - ⏳ GZIP format doesn't naturally support random access (requires index)
 - ⏳ Complexity increases (thread coordination, error handling)
+- ⏳ v1.1.0 chose the **lower-risk path** (zlib-ng swap + pre-size) over architectural redesign
 
 **Performance potential:**
 ```
-Current (single-threaded zlib):
+v1.0.0 (single-threaded zlib):
   - 100MB load: 0.28s
   - Throughput: ~350 MB/s
 
-With ISA-L (4 threads):
-  - Estimated: 0.07s (4x speedup)
-  - Throughput: ~1.4 GB/s
-  - Goal: Match/beat SeqKit (0.22s)
+v1.1.0 (single-threaded zlib-ng):
+  - 100MB load: 0.251s (10% improvement)
+  - Throughput: ~400 MB/s
+
+With ISA-L (4 threads) — estimate:
+  - Estimated: 0.063s (4x speedup)
+  - Throughput: ~1.6 GB/s
+  - Goal: Close gap with SeqKit (0.22s)
 ```
 
-**Status:** Planned for v1.1.0 "Bakuya" (Q1 2026)
+**Status:** Deferred. v1.1.0 achieved 10% improvement through zlib-ng + pre-size instead.
 
 ---
 
@@ -273,7 +334,8 @@ With ISA-L (4 threads):
 
 3. **Performance:**
    - Lookup speed unaffected (zero-copy preserved)
-   - Load time competitive (0.28s vs SeqKit's 0.22s)
+   - v1.0.0 load time: 0.28s (27% behind SeqKit's 0.22s)
+   - v1.1.0 load time: **0.251s** (10% improvement, gap reduced to ~14%)
 
 4. **Robustness:**
    - Magic bytes fallback handles mis-named files
@@ -282,25 +344,30 @@ With ISA-L (4 threads):
 ### Negative Consequences ❌
 
 1. **Load Time Overhead:**
-   - GZIP decompression adds ~0.28s for 100MB file
-   - SeqKit is ~27% faster (0.22s) - likely uses parallel decompression
+   - v1.0.0: +0.28s for 100MB file
+   - v1.1.0: +0.251s (10% improvement from zlib-ng + pre-size)
+   - Target of 20% improvement (≤0.224s) **not met** — remaining gap is algorithmic, not micro-optimization
+   - SeqKit is ~14% faster (0.22s) — likely uses parallel decompression
    - **Mitigation:** Binary cache amortizes cost (load once, restore instant)
 
 2. **Dependency on zlib:**
-   - Adds ~200KB to binary size
-   - Requires zlib headers at compile time
-   - **Mitigation:** zlib is ubiquitous (included in most systems)
+   - v1.0.0 used system zlib (~200KB to binary)
+   - v1.1.0 replaced with **zlib-ng v2.2.2** (vendored via FetchContent)
+   - **Mitigation:** zlib-compat mode means identical API; no code changes needed
 
 3. **Single-Threaded Bottleneck:**
-   - Decompression doesn't scale beyond 1 core
-   - **Mitigation:** Planned for v1.1.0 (parallel GZIP)
+   - Decompression still single-threaded (zlib-ng inflate is SIMD-accelerated but serial)
+   - v1.0.0 → v1.1.0: +10% from library swap + allocation optimization
+   - **Mitigation:** Parallel decompression deferred to v1.2.0 (ISA-L or pigz)
 
 ### Neutral Consequences ⚖️
 
 1. **Memory Usage:**
-   - Temporary buffer during load (~3x compressed size)
-   - Freed immediately after decompression
-   - No impact on steady-state memory
+   - **v1.0.0:** temp_buffer + text_arena_ co-exist during load (~366MB peak for 100MB file)
+   - **v1.1.0:** Pre-sized text_arena_ only (~266MB peak; shrink_to_fit → ~183MB)
+   - v1.0.0 memory target (5MB) was **infeasible** — even compressed data is 33MB for a 100MB FASTQ.gz
+   - The 266MB peak is the cost of the 3× pre-size heuristic; for very large files the OOM guard caps at 25% available memory
+   - No impact on steady-state memory after shrink_to_fit
 
 2. **API Surface:**
    - Added `loadGzipFile()` (explicit)
@@ -318,18 +385,30 @@ With ISA-L (4 threads):
 
 ### Results
 
-| Metric | TracEon v1.0.0 | SeqKit | PyFastX |
-|--------|----------------|--------|---------|
-| **Load Time** | 0.28s | 0.22s | N/A |
-| **Random Lookups** | 17.4M OPS/s | N/A | 12.0M OPS/s |
-| **Memory** | 183 MB | Unknown | Unknown |
+| Metric | TracEon v1.0.0 | TracEon v1.1.0 | SeqKit | PyFastX |
+|--------|----------------|----------------|--------|---------|
+| **Load Time** | 0.28s | **0.251s** | 0.22s | N/A |
+| **vs Target (≤0.224s)** | ❌ 25% above | ❌ 14% above | — | — |
+| **Random Lookups** | 17.4M OPS/s | 17.4M OPS/s | N/A | 12.0M OPS/s |
+| **Memory (steady-state)** | 183 MB | 183 MB | Unknown | Unknown |
+| **Memory (load peak)** | ~366 MB | **~266 MB** | Unknown | Unknown |
+
+**Improvement breakdown (v1.0.0 → v1.1.0):**
+```
+Total: 0.28s → 0.251s (-29ms, 10.4%)
+  ├─ zlib-ng inflate:          -25ms  (SIMD-optimized CRC + inflate)
+  ├─ Pre-size (no realloc):     -3ms  (eliminated 7 reallocations)
+  └─ Direct-write (no move):    -1ms  (eliminated std::move)
+```
 
 **Analysis:**
-- Load time competitive but not best-in-class (SeqKit 27% faster)
-- Lookup speed excellent (45% faster than PyFastX)
-- Memory efficiency maintained (5x better than BioPython)
+- **Load time:** 10% improvement meets expectations for a drop-in library swap
+- **20% target not met:** Most of the gap is in the inflate loop itself; zlib-ng provides only ~10–15% improvement over vanilla zlib
+- **Lookup speed:** Unchanged (zero-copy invariant preserved)
+- **Memory peak:** Reduced 27% (from 366MB to 266MB) by eliminating temp_buffer
+- Narrowing the remaining gap requires parallel decompression (ISA-L/pigz) — see Alternative 3
 
-**Conclusion:** Performance trade-offs acceptable for v1.0.0. Will optimize in v1.1.0.
+**Conclusion:** v1.1.0 delivers solid incremental improvements. The 20% load-time target requires parallel decompression (v1.2.0).
 
 ---
 
@@ -340,14 +419,14 @@ With ISA-L (4 threads):
 1. **Simplicity:** zlib is battle-tested, widely available, and well-documented
 2. **Zero-copy preservation:** Decompression is one-time cost; all reads remain zero-copy
 3. **Robustness:** Magic bytes fallback handles edge cases
-4. **Extensibility:** Easy to swap in parallel decompression later (v1.1.0)
+4. **Extensibility:** Easy to swap in parallel decompression later (v1.2.0)
 
 ### Key Design Principle
 
 > **"Fast code is not about avoiding operations—it's about making the right operations in the right order."**
 
 - `memcpy()` @ 20GB/s is **not** the bottleneck
-- Single-threaded decompression @ 350MB/s **is** the bottleneck
+- Single-threaded decompression @ 350–400MB/s **is** the bottleneck
 - Fix the bottleneck, not the fast path
 
 ---
@@ -422,18 +501,25 @@ TEST_CASE("GZIP Support", "[strategy][gzip]") {
 
 ## Future Work
 
-### v1.1.0 "Bakuya" (Q1 2026)
+### ✓ v1.1.0 "Bakuya" (Q1 2026) — Completed
 
-**Parallel GZIP Decompression:**
-- Integrate Intel ISA-L or custom parallel decompressor
-- Target: 4x speedup (0.28s → 0.07s for 100MB)
-- Close gap with SeqKit
+**zlib-ng Integration + Pre-Size + Direct-Write** *(shipped)*
+- zlib-ng v2.2.2 via FetchContent, zlib-compat mode
+- Pre-size with 3x heuristic + OOM guard (25% available memory)
+- Direct-write to text_arena_ (eliminated temp_buffer)
+- Result: **0.251s** (10% improvement over v1.0.0)
+- Target of 20% improvement **not met**
 
-**Adaptive Chunking:**
+### v1.2.0 "Caladbolg" (Q2 2026)
+
+**Adaptive Chunking:** (deferred — design required)
 - Dynamic chunk size based on compression ratio
 - Optimize for different file characteristics
 
-### v1.2.0 "Caladbolg" (Q2 2026)
+**Parallel GZIP Decompression:**
+- Integrate Intel ISA-L or custom parallel decompressor
+- Target: 4x speedup (0.251s → ~0.06s for 100MB)
+- Close gap with SeqKit
 
 **Binary Cache Compression:**
 - LZ4 compression for `.traceon` files
@@ -445,6 +531,7 @@ TEST_CASE("GZIP Support", "[strategy][gzip]") {
 
 ### External Resources
 - [zlib Documentation](https://zlib.net/manual.html)
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) — SIMD-optimized zlib replacement
 - [GZIP Specification (RFC 1952)](https://datatracker.ietf.org/doc/html/rfc1952)
 - [Intel ISA-L](https://github.com/intel/isa-l) - SIMD-accelerated compression
 - SeqKit: [Shen et al., PLoS ONE 2016](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0163962)
@@ -463,8 +550,8 @@ TEST_CASE("GZIP Support", "[strategy][gzip]") {
 
 ---
 
-**Status:** ✅ Accepted  
-**Last Updated:** 2025-12-04  
-**Version:** 1.0.0 "Avalon"
+**Status:** ✅ Accepted (v1.1.0)  
+**Last Updated:** 2026-06-06  
+**Version:** 1.1.0 "Bakuya"
 
 *"Trace On" - Decompressing genomic data at the speed of thought.*

@@ -23,9 +23,40 @@
 *.bin
 *.log
 *.txt
+*.json
+*.png
+*.csv
+
+# Test binaries (no extension)
+tests/gzip_bench_test
+tests/unit_tests
+
+# Benchmark outputs
+benchmarks/v1.1.0_*
 
 # macOS system files
 .DS_Store
 
 # User-specific files
 cmake-build-debug-wsl/
+
+# Swarm working directory
+.swarm/
+
+# Object files and build artifacts
+*.o
+*.obj
+*.gcno
+*.gcda
+*.gcov
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node (if any tooling)
+node_modules/
