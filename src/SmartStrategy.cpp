@@ -1,8 +1,10 @@
 #include "SmartStrategy.h"
+#include "SimdUtils.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <stdexcept>
 #include <mutex>
 #include <shared_mutex>
@@ -13,6 +15,7 @@
 #include <functional> 
 #include <cctype>
 #include <zlib.h>
+#include <new>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -23,6 +26,11 @@
     #include <sys/stat.h>
     #include <fcntl.h>
     #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+    #include <sys/sysctl.h>
+    #include <sys/types.h>
 #endif
 
 namespace TracEon {
@@ -103,59 +111,160 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
     data_ready_.store(true, std::memory_order_release);
 }
 
+// ── Cross-platform available memory ───────────────────────────────────────────
+size_t SmartStrategy::getAvailableMemory() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<size_t>(status.ullAvailPhys);
+    }
+    return 0;
+#elif defined(__APPLE__)
+    uint64_t free_pages = 0;
+    uint64_t page_size = 0;
+    size_t len = sizeof(free_pages);
+    if (sysctlbyname("vm.page_free_count", &free_pages, &len, nullptr, 0) != 0) {
+        return 0;
+    }
+    len = sizeof(page_size);
+    if (sysctlbyname("hw.pagesize", &page_size, &len, nullptr, 0) != 0 || page_size == 0) {
+        page_size = 4096;
+    }
+    return static_cast<size_t>(free_pages) * static_cast<size_t>(page_size);
+#else
+    // Linux: parse MemAvailable from /proc/meminfo
+    std::ifstream meminfo("/proc/meminfo");
+    if (meminfo) {
+        std::string line;
+        while (std::getline(meminfo, line)) {
+            if (line.find("MemAvailable:") == 0) {
+                unsigned long long kb = 0;
+                if (std::sscanf(line.c_str(), "MemAvailable: %llu kB", &kb) == 1) {
+                    return static_cast<size_t>(kb * 1024);
+                }
+            }
+        }
+    }
+    return 0;
+#endif
+}
+
 // --- GZIP Loader ---
 void SmartStrategy::loadGzipInternal(const std::string& filepath) {
+    const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
+
+    // Clear any existing data
+    text_arena_.clear();
+
+    // ── Pre-size text_arena_ with 3x heuristic and OOM guard ──────────
+    {
+        std::error_code ec;
+        const uintmax_t raw_size = std::filesystem::file_size(filepath, ec);
+        if (!ec && raw_size > 0) {
+            const size_t estimated_size = static_cast<size_t>(raw_size * 3);
+            const size_t avail_mem = getAvailableMemory();
+            const size_t reserve_size = (avail_mem > 0)
+                ? std::min(estimated_size, avail_mem / 4)
+                : estimated_size;
+            try {
+                text_arena_.reserve(reserve_size);
+            } catch (const std::bad_alloc&) {
+                std::cerr << "SmartStrategy OOM: failed to reserve "
+                          << reserve_size << " bytes for " << filepath
+                          << " (compressed=" << raw_size << ", estimated="
+                          << estimated_size << ")" << std::endl;
+                throw;
+            }
+        } else {
+            text_arena_.reserve(CHUNK_SIZE * 4);
+        }
+    }
+
     gzFile file = gzopen(filepath.c_str(), "rb");
     if (!file) throw std::runtime_error("Cannot open GZIP file: " + filepath);
 
-    const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
-    std::vector<char> temp_buffer;
-    temp_buffer.reserve(CHUNK_SIZE * 4); // modest initial reservation; grows geometrically below
-
     auto chunk = std::make_unique<char[]>(CHUNK_SIZE);
-    while (true) {
-        int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
-        if (bytes_read < 0) {
-            int err;
-            const char* error_msg = gzerror(file, &err);
-            gzclose(file);
-            throw std::runtime_error("GZIP read error: " + std::string(error_msg));
+    size_t write_pos = 0;
+
+    try {
+        while (true) {
+            // Geometric growth: reserve BEFORE resize
+            size_t required = write_pos + CHUNK_SIZE;
+            if (required > text_arena_.capacity()) {
+                text_arena_.reserve(std::max(text_arena_.capacity() * 2, required));
+            }
+            // Resize to make room for gzread (uninitialized bytes are OK)
+            text_arena_.resize(required);
+
+            int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
+            if (bytes_read < 0) {
+                int err;
+                const char* error_msg = gzerror(file, &err);
+                text_arena_.clear();
+                throw std::runtime_error("GZIP read error: " + std::string(error_msg));
+            }
+            if (bytes_read == 0) break;
+            std::memcpy(text_arena_.data() + write_pos, chunk.get(), bytes_read);
+            write_pos += static_cast<size_t>(bytes_read);
         }
-        if (bytes_read == 0) break;
-        // Geometric growth: double capacity when needed to minimise reallocations.
-        if (temp_buffer.size() + bytes_read > temp_buffer.capacity()) {
-            temp_buffer.reserve(std::max(temp_buffer.capacity() * 2, temp_buffer.size() + bytes_read));
-        }
-        size_t old_size = temp_buffer.size();
-        temp_buffer.resize(old_size + bytes_read);
-        std::memcpy(temp_buffer.data() + old_size, chunk.get(), bytes_read);
+    } catch (...) {
+        gzclose(file);
+        text_arena_.clear();
+        throw;
     }
     gzclose(file);
-    text_arena_ = std::move(temp_buffer);
+
+    // Trim to actual size
+    text_arena_.resize(write_pos);
+    text_arena_.shrink_to_fit();
 }
 
 void SmartStrategy::normalizeFastaArena() {
     if (text_arena_.empty()) return;
-    char* write = text_arena_.data();
-    const char* read = text_arena_.data();
-    const char* end = read + text_arena_.size();
+    char*       write = text_arena_.data();
+    const char* read  = text_arena_.data();
+    const char* end   = read + text_arena_.size();
 
     // Skip any leading blank lines
     while (read < end && (*read == '\n' || *read == '\r')) ++read;
 
     while (read < end) {
-        if (*read != '>') break; // Not FASTA, stop
-        // Copy header line verbatim, including the terminating '\n'
-        while (read < end && *read != '\n' && *read != '\r') *write++ = *read++;
-        if (read < end && *read == '\r') ++read; // strip \r
-        if (read < end && *read == '\n') *write++ = *read++; // keep \n
+        if (*read != '>') break;
 
-        // Copy sequence chars, stripping all newlines, until the next '>' or end
-        while (read < end && *read != '>') {
-            char c = *read++;
-            if (c != '\n' && c != '\r') *write++ = c;
+        // ── Copy header line up to (but not including) \r\n ─────────────────
+        // simd_find_char scans 32 bytes/iter (AVX2) or 16 bytes/iter (NEON).
+        const char* nl      = simd_find_char(read, end, '\n');
+        const char* hdr_end = (nl > read && *(nl - 1) == '\r') ? nl - 1 : nl;
+        size_t hdr_len      = static_cast<size_t>(hdr_end - read);
+        // write <= read always (compaction), so memmove handles overlap safely
+        std::memmove(write, read, hdr_len);
+        write += hdr_len;
+        if (nl < end) *write++ = '\n'; // keep the terminating newline
+        read = (nl < end) ? nl + 1 : end; // advance past \n
+
+        // ── Locate the end of this record: next '>' or end of arena ──────────
+        // Biggest win on large genomes: 32 bytes/iter instead of 1 byte/iter
+        // for the O(sequence_length) scan that formerly drove the inner loop.
+        const char* rec_end = simd_find_char(read, end, '>');
+
+        // ── Copy sequence bytes, stripping all \r and \n ─────────────────────
+        // Use simd_find_char to jump to the next \n, then bulk-copy the
+        // non-newline run with memmove.  Tail bytes (<32 or <16) handled by
+        // simd_find_char's scalar fall-through — no special case needed here.
+        while (read < rec_end) {
+            const char* line_nl  = simd_find_char(read, rec_end, '\n');
+            // Strip a trailing \r if it immediately precedes the \n (or rec_end)
+            const char* copy_end = (line_nl > read && *(line_nl - 1) == '\r')
+                                   ? line_nl - 1 : line_nl;
+            size_t run = static_cast<size_t>(copy_end - read);
+            if (run) std::memmove(write, read, run);
+            write += run;
+            // Advance past the \n; step to rec_end if no \n was found
+            read = (line_nl < rec_end) ? line_nl + 1 : rec_end;
         }
-        *write++ = '\n'; // terminate the (now single-line) sequence
+        *write++ = '\n'; // terminate the now-single-line sequence
+        // read == rec_end (pointing at '>' of next record, or end)
     }
     text_arena_.resize(static_cast<size_t>(write - text_arena_.data()));
 }
