@@ -105,6 +105,13 @@ private:
     uint64_t hash_key(std::string_view key) const; 
     
     void clearInternal();
+
+    /**
+     * @brief Cross-platform available physical memory in bytes.
+     * Uses /proc/meminfo (Linux), sysctl (macOS), GlobalMemoryStatusEx (Windows).
+     * Returns 0 on failure (caller falls back to geometric growth).
+     */
+    static size_t getAvailableMemory();
     
     /**
      * @brief Normalize multi-line FASTA sequences in-place within text_arena_.
