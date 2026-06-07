@@ -50,6 +50,11 @@ target_include_directories(traceon_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
 )
 
+# GCC 16.1.1+ removed implicit <cstdint> includes; robin_hood.h needs UINT64_C
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include cstdint")
+endif()
+
 # Link traceon_core to both zlib and lz4
 target_link_libraries(traceon_core PUBLIC zlibstatic lz4_static)
 
