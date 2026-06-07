@@ -121,19 +121,17 @@ size_t SmartStrategy::getAvailableMemory() {
     }
     return 0;
 #elif defined(__APPLE__)
-    int mib[2] = {CTL_VM, VM_MINFREE};
-    int pagesize = 0;
-    unsigned long free_pages = 0;
+    uint64_t free_pages = 0;
+    uint64_t page_size = 0;
     size_t len = sizeof(free_pages);
-    if (sysctl(mib, 2, &free_pages, &len, nullptr, 0) == 0) {
-        int mib2[2] = {CTL_HW, HW_PAGESIZE};
-        len = sizeof(pagesize);
-        if (sysctl(mib2, 2, &pagesize, &len, nullptr, 0) == 0 && pagesize > 0) {
-            return static_cast<size_t>(free_pages) * static_cast<size_t>(pagesize);
-        }
-        return static_cast<size_t>(free_pages) * 4096;
+    if (sysctlbyname("vm.page_free_count", &free_pages, &len, nullptr, 0) != 0) {
+        return 0;
     }
-    return 0;
+    len = sizeof(page_size);
+    if (sysctlbyname("hw.pagesize", &page_size, &len, nullptr, 0) != 0 || page_size == 0) {
+        page_size = 4096;
+    }
+    return static_cast<size_t>(free_pages) * static_cast<size_t>(page_size);
 #else
     // Linux: parse MemAvailable from /proc/meminfo
     std::ifstream meminfo("/proc/meminfo");
