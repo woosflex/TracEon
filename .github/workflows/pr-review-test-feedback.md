@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   actions: read
   checks: read
@@ -17,7 +18,7 @@ tools:
 network:
   allowed:
     - defaults
-    - api.github.com
+    - threat-detection
 safe-outputs:
   add-comment:
     max: 1
