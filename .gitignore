@@ -23,6 +23,16 @@
 *.bin
 *.log
 *.txt
+*.json
+*.png
+*.csv
+
+# Test binaries (no extension)
+tests/gzip_bench_test
+tests/unit_tests
+
+# Benchmark outputs
+benchmarks/v1.1.0_*
 
 # macOS system files
 .DS_Store

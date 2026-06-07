@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — v1.1.0 "Bakuya" (in progress)
+## [1.1.0] — v1.1.0 "Bakuya" (2026-06-07)
 
 ### ✨ Added
 
@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated GZIP load times match v1.1.0 targets (0.251s ± 0.01s)
 - Memory profiling confirmed 266MB peak RSS for 132MB compressed file
 - All existing GZIP test cases pass (auto-detect, explicit load, magic bytes)
+
+### 📊 Benchmarks (Intel Core Ultra 5 125H, 16GB RAM)
+
+**Load Time Component Breakdown (100MB GZIP, total 0.251s):**
+- Decompression (zlib-ng inflate): 5-9% of load time
+- FASTA parsing (arena construction): 46% of load time
+- Hash map building (insertion): 48% of load time
+
+**Throughput:**
+- 294-378 MB/s decompressed throughput across file sizes (10MB–1GB)
+- Consistent performance regardless of compression ratio due to direct-write design
 
 ---
 
@@ -290,7 +301,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Version | Date | Codename | Key Features |
 |---------|------|----------|--------------|
 | 1.0.0 | 2025-12-16 | Avalon | Zero-copy, Lock-free, GZIP support, Memory mapping |
-| 1.1.0 | 2026-Q1 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
+| 1.1.0 | 2026-06-07 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
 | 1.2.0 | 2026-Q2 | Caladbolg | Binary cache compression |
 | 2.0.0 | 2026-Q3 | Durandal | C API, Streaming |
 | 2.1.0 | 2026-Q4 | Excalibur | Distributed caching |
