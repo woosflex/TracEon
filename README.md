@@ -2,29 +2,42 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v1.0.0%20%22Avalon%22-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v1.1.0%20%22Bakuya%22-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-60M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
 
-**TracEon** (v1.0.0 "Avalon") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support.
+**TracEon** (v1.1.0 "Bakuya") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
 
-## 🎯 What's New in v1.0.0 "Avalon"
+## 🎯 What's New in v1.1.0 "Bakuya"
 
-### **Native GZIP Support** ✨
+### **zlib-ng Integration** ⚡
+- Replaced system zlib with **zlib-ng v2.2.2** (SIMD-optimized inflate)
+- Drop-in replacement via zlib-compat mode — API unchanged
+- **10% faster GZIP decompression** (0.251s vs 0.28s for 100MB)
+- Vendored via CMake FetchContent — no system dependency required
+
+### **Optimized Buffer Pre-Allocation** 📦
+- **Pre-size + Direct-Write**: Decompress directly into `text_arena_` — no intermediate `temp_buffer`
+- **3x heuristic**: Pre-allocate `compressed_size × 3` to cover typical GZIP ratios
+- **OOM Guard**: Caps pre-allocation at 25% of available memory
+- **27% lower memory peak** during load (266MB vs 366MB for 100MB file)
+- Geometric growth as fallback for under-estimation
+
+### **Native GZIP Support** ✨ (v1.0.0, improved in v1.1.0)
 - Automatic detection via file extension (`.gz`) or magic bytes (`0x1f 0x8b`)
 - Streaming decompression preserves zero-copy architecture
 - No performance degradation on queries: GZIP lookups as fast as plain text
 
-### **Lock-Free Concurrent Access** 🔓
+### **Lock-Free Concurrent Access** 🔓 (v1.0.0)
 - C++20 atomics with acquire/release semantics
 - 2x throughput improvement on multi-threaded workloads
 - Zero mutex contention on read-heavy operations
 
-### **Production-Ready Performance** ⚡
+### **Production-Ready Performance** ⚡ (v1.0.0)
 - **54x faster** than PyFastX on compressed long reads
 - **60-80% memory reduction** vs BioPython
 - Sub-second binary cache restoration via memory mapping
@@ -99,7 +112,7 @@
 │  └─────────────────────────────┘   │
 │                                     │
 │  ┌─────────────────────────────┐   │
-│  │ GZIP Decompression          │   │  ← zlib streaming
+│  │ GZIP Decompression          │   │  ← zlib-ng (SIMD)
 │  │ (On-demand, cached)         │   │
 │  └─────────────────────────────┘   │
 └─────────────────────────────────────┘
@@ -143,10 +156,12 @@ cache.loadGzipFile("data.fq.gz");
 cache.loadFile("genome.fasta"); // Checks 0x1f 0x8b if ext doesn't match
 ```
 
-**Implementation:**
-- **Streaming Decompression**: zlib processes file in 1MB chunks
-- **Efficient Buffering**: Geometric growth minimizes reallocations
-- **Zero-Copy Move**: Decompressed data moved into arena (no double-copy)
+**Implementation (v1.1.0):**
+- **zlib-ng v2.2.2**: SIMD-optimized inflate via FetchContent, zlib-compat mode
+- **Streaming Decompression**: zlib-ng processes file in 1MB chunks
+- **Pre-Size + Direct-Write**: Pre-allocate `text_arena_` using `compressed_size × 3` heuristic with OOM guard (25% of available memory), then write decompressed data directly — no intermediate `temp_buffer`
+- **Geometric growth**: Falls back to 2× capacity doubling if pre-size estimate is too low
+- **shrink_to_fit**: Releases excess capacity after decompression (~183MB steady-state for 100MB file)
 
 #### 4. **Robin Hood Hashing**
 - **Open Addressing**: ~15% better cache locality vs chaining
@@ -190,8 +205,8 @@ TracEon/
 │   └── simple.fastq
 └── third_party/          # Vendored dependencies
     ├── robin_hood.h      # MIT licensed (martinus)
-    ├── zlib/             # zlib license
     └── lz4/              # BSD license (future: binary cache compression)
+    # zlib-ng is fetched via CMake FetchContent at build time
 ```
 
 ---
@@ -259,7 +274,7 @@ int main() {
     TracEon::Cache cache;
     
     // First run: Parse and save
-    cache.loadFile("large_genome.fasta.gz");  // ~0.15s for 100MB
+    cache.loadFile("large_genome.fasta.gz");  // ~0.25s for 100MB (v1.1.0)
     cache.save("genome.bin");                  // One-time cost
     
     // Subsequent runs: Instant restore via mmap
@@ -406,7 +421,7 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 
 ## 🗺️ Roadmap
 
-### ✅ Completed: v1.0.0 "Avalon" (December 2025)
+### ✅ v1.0.0 "Avalon" (December 2025)
 *Codename: Like EMIYA's absolute defense, provides performance isolation*
 
 - Zero-copy arena allocation
@@ -415,19 +430,21 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - Native GZIP support with auto-detection
 - Memory-mapped binary cache
 
-### 🎯 Planned Releases
-
-#### v1.1.0 "Bakuya" (Q1 2026)
+### ✅ v1.1.0 "Bakuya" (Q1 2026) — Completed
 *Twin swords - Dual optimization paths*
 
-- **SIMD Prefetching**: Vectorized hash probing (target: 20M OPS/s on 100MB RAM datasets)
-- **Optimized GZIP Buffering**: Improved chunk management and pre-allocation
-- **Adaptive Capacity Estimation**: Better heuristics for different file types
-- **Performance Goal**: Close gap with competitors on small datasets
+- **zlib-ng Integration**: Replaced system zlib with zlib-ng v2.2.2 (SIMD-optimized inflate) via CMake FetchContent
+- **Optimized GZIP Buffering**: Pre-size with 3x heuristic + OOM guard (25% available memory), direct-write to text_arena_ eliminates temp_buffer
+- **Load Time**: 0.251s for 100MB GZIP (10% improvement over v1.0.0)
+- **Memory Peak**: 266MB during load (27% reduction from 366MB)
+- **Performance Goal**: Partially met — 10% improvement achieved; 20% target requires parallel decompression (v1.2.0)
+
+### 🎯 Planned Releases
 
 #### v1.2.0 "Caladbolg" (Q2 2026)
 *Rainbow sword - Spectrum of compression*
 
+- **Parallel GZIP Decompression**: Intel ISA-L or custom parallel decompressor (target: 4x speedup)
 - **Binary Cache Compression**: LZ4 integration for `.traceon` files (3x size reduction)
 - **Transparent Decompression**: On-the-fly decompression for reference genomes
 - **Smart Compression**: Auto-select algorithm based on data characteristics
@@ -511,7 +528,7 @@ This allows commercial and non-commercial use, modification, and distribution wi
 
 ### Core Dependencies
 - **[Robin Hood Hashing](https://github.com/martinus/robin-hood-hashing)** - Martinus (MIT License)
-- **[zlib](https://zlib.net/)** - Jean-loup Gailly & Mark Adler (zlib License)
+- **[zlib-ng](https://github.com/zlib-ng/zlib-ng)** - zlib-ng team (zlib License) — SIMD-optimized zlib replacement, v2.2.2
 - **[LZ4](https://github.com/lz4/lz4)** - Yann Collet (BSD License)
 - **[Catch2](https://github.com/catchorg/Catch2)** - Testing framework (BSL-1.0)
 

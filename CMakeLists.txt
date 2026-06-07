@@ -47,7 +47,6 @@ add_library(traceon_core STATIC ${CORE_SOURCES})
 target_include_directories(traceon_core PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib
     ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
 )
 
