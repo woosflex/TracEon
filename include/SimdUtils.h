@@ -90,8 +90,7 @@ namespace TracEon {
 
 // AVX2 implementation compiled with target("avx2") on GCC/Clang when available
 #if defined(TRACEON_HAS_AVX2) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2")))
-[[nodiscard]] inline const char* simd_find_char_avx2(const char* ptr, const char* end, char c) noexcept {
+[[nodiscard]] __attribute__((target("avx2"))) inline const char* simd_find_char_avx2(const char* ptr, const char* end, char c) noexcept {
     const __m256i needle = _mm256_set1_epi8(c);
     while (ptr + 32 <= end) {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
