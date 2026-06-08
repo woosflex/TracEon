@@ -124,14 +124,21 @@ size_t SmartStrategy::getAvailableMemory() {
     uint64_t free_pages = 0;
     uint64_t page_size = 0;
     size_t len = sizeof(free_pages);
-    if (sysctlbyname("vm.page_free_count", &free_pages, &len, nullptr, 0) != 0) {
-        return 0;
+    if (sysctlbyname("vm.page_free_count", &free_pages, &len, nullptr, 0) == 0) {
+        len = sizeof(page_size);
+        if (sysctlbyname("hw.pagesize", &page_size, &len, nullptr, 0) != 0 || page_size == 0) {
+            page_size = 4096;
+        }
+        return static_cast<size_t>(free_pages) * static_cast<size_t>(page_size);
     }
-    len = sizeof(page_size);
-    if (sysctlbyname("hw.pagesize", &page_size, &len, nullptr, 0) != 0 || page_size == 0) {
-        page_size = 4096;
+    // Fallback when vm.page_free_count is unavailable: use a conservative
+    // quarter of physical memory to preserve reserve-cap behavior.
+    uint64_t phys_mem = 0;
+    len = sizeof(phys_mem);
+    if (sysctlbyname("hw.memsize", &phys_mem, &len, nullptr, 0) == 0) {
+        return static_cast<size_t>(phys_mem / 4);
     }
-    return static_cast<size_t>(free_pages) * static_cast<size_t>(page_size);
+    return 0;
 #else
     // Linux: parse MemAvailable from /proc/meminfo
     std::ifstream meminfo("/proc/meminfo");
