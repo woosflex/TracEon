@@ -19,6 +19,14 @@ set(ZLIB_COMPAT ON)
 set(WITH_NATIVE_INSTRUCTIONS ON)
 FetchContent_MakeAvailable(zlib-ng)
 
+# --- ankerl::unordered_dense (header-only, MIT license) ---
+FetchContent_Declare(
+        ankerl_unordered_dense
+        GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+        GIT_TAG        v4.4.0
+)
+FetchContent_MakeAvailable(ankerl_unordered_dense)
+
 # --- LZ4 Support ---
 add_subdirectory(third_party/lz4/build/cmake)
 
@@ -35,6 +43,7 @@ set(TEST_SOURCES
         tests/main.cpp
         tests/CacheTests.cpp
         tests/FastqTests.cpp
+        tests/MapDefsTests.cpp
         tests/SmartStrategyTests.cpp
 )
 
@@ -48,6 +57,7 @@ target_include_directories(traceon_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
     ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
+    ${ankerl_unordered_dense_SOURCE_DIR}/include # ankerl::unordered_dense
 )
 
 # GCC 16.1.1+ removed implicit <cstdint> includes; robin_hood.h needs UINT64_C

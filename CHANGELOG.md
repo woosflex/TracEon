@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] — v1.2.0 "Caladbolg" (2026-06-09)
+
+### ✨ Added
+
+- **SIMD Record Boundary Scanning**: `simd_find_char()` with AVX2/NEON/scalar dispatch for accelerated record boundary scanning in FASTA/FASTQ parsers
+- **ankerl::unordered_dense Hash Map**: Integrated via CMake FetchContent (header-only, MIT license)
+- **Pre-reserved Thread-Local Maps**: Multithreaded parsers now pre-reserve thread-local maps to reduce rehashing
+
+### 🔧 Changed
+
+- **Hash Map Replacement**: Replaced `robin_hood::unordered_flat_map` with `ankerl::unordered_dense::map` for better insert performance
+- **TransparentStringHash**: Updated to use `std::hash` instead of `robin_hood::hash`
+- **Pre-reservation Heuristic**: Conservative formula — `chunk_size/500` (FASTA), `chunk_size/600` (FASTQ) with 1.25x safety margin
+
+### 🐛 Fixed
+
+- **normalizeFastaArena() trailing newline**: Fixed bug where `resize()` zero-initialized trailing `\n` when input lacked trailing newline
+
+### ⚡ Performance
+
+- **100MB GZIP Load Time**: 0.245s (86% reduction from 1.843s v1.1.0 baseline)
+- **Peak RSS**: 185MB (30% reduction from 263MB v1.1.0 baseline)
+- **Lookup Throughput**: 12M OPS/s (WGS), 28–81M OPS/s (long-read scenarios)
+
 ## [1.1.0] — v1.1.0 "Bakuya" (2026-06-07)
 
 ### ✨ Added

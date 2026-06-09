@@ -229,9 +229,13 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
 
 void SmartStrategy::normalizeFastaArena() {
     if (text_arena_.empty()) return;
+    const size_t original_size = text_arena_.size();
+    // Grow vector by 1 to safely write trailing '\n' past original end.
+    // resize() value-initializes the new element, but we overwrite it immediately.
+    text_arena_.resize(original_size + 1);
     char*       write = text_arena_.data();
     const char* read  = text_arena_.data();
-    const char* end   = read + text_arena_.size();
+    const char* end   = read + original_size;  // Read boundary is original content
 
     // Skip any leading blank lines
     while (read < end && (*read == '\n' || *read == '\r')) ++read;
@@ -355,6 +359,15 @@ template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
+    // Pre-reserve thread-local maps to avoid mid-parse rehashing
+    // Use conservative heuristic: assume avg record ~500 bytes (header + sequence + newlines)
+    // This avoids over-reservation with large records while still reducing rehashing
+    {
+        const size_t est_per_thread = chunk_size / 500;
+        for (auto& cache : thread_caches) {
+            cache.reserve(static_cast<size_t>(est_per_thread * 1.25));
+        }
+    }
     auto worker = [&](size_t thread_id, size_t start, size_t end) {
         const char* ptr = content.data() + start;
         const char* chunk_end = content.data() + end;
@@ -366,14 +379,12 @@ template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(
             ++ptr; const char* id_start = ptr;
             while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
             const char* id_end = ptr;
-            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') ++ptr;
+            ptr = simd_find_char(ptr, global_end, '\n');
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
             const char* seq_start = ptr; const char* seq_end = seq_start;
-            while (ptr < global_end) {
-                if (*ptr == '>') { seq_end = ptr; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; break; }
-                ++ptr;
-            }
-            if (ptr >= global_end) { seq_end = global_end; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; }
+            const char* next_record = simd_find_char(ptr, global_end, '>');
+            if (next_record < global_end) { seq_end = next_record; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; ptr = next_record; }
+            else { seq_end = global_end; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; ptr = global_end; }
             std::string_view id(id_start, id_end - id_start);
             std::string_view seq(seq_start, seq_end - seq_start);
             if (!id.empty() && !seq.empty()) {
@@ -395,6 +406,15 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
+    // Pre-reserve thread-local maps to avoid mid-parse rehashing
+    // Use conservative heuristic: assume avg record ~600 bytes (header + seq + qual + newlines)
+    // This avoids over-reservation with large records while still reducing rehashing
+    {
+        const size_t est_per_thread = chunk_size / 600;
+        for (auto& cache : thread_caches) {
+            cache.reserve(static_cast<size_t>(est_per_thread * 1.25));
+        }
+    }
     auto worker = [&](size_t thread_id, size_t start, size_t end) {
         const char* ptr = content.data() + start;
         const char* chunk_end = content.data() + end;
@@ -406,17 +426,19 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
             ++ptr; const char* id_start = ptr;
             while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
             const char* id_end = ptr;
-            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') ++ptr;
+            ptr = simd_find_char(ptr, global_end, '\n');
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
             const char* seq_start = ptr;
-            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') ++ptr;
+            ptr = simd_find_char(ptr, global_end, '\n');
             const char* seq_end = ptr;
+            while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') ++ptr;
+            ptr = simd_find_char(ptr, global_end, '\n');
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
             const char* qual_start = ptr;
-            while (ptr < global_end && *ptr != '\n' && *ptr != '\r') ++ptr;
+            ptr = simd_find_char(ptr, global_end, '\n');
             const char* qual_end = ptr;
+            while (qual_end > qual_start && *(qual_end - 1) == '\r') --qual_end;
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
             std::string_view id(id_start, id_end - id_start);
             std::string_view seq(seq_start, seq_end - seq_start);
@@ -443,9 +465,9 @@ template <typename MapType> void SmartStrategy::parseFastaInternal(std::string_v
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '>') break;
         ++ptr; const char* id_start = ptr; while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr; const char* id_end = ptr;
-        while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr; while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        ptr = simd_find_char(ptr, end, '\n'); if (ptr < end) ++ptr; while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
         const char* seq_start = ptr; const char* seq_end = seq_start;
-        while (ptr < end) { if (*ptr == '>') { seq_end = ptr; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; break; } ++ptr; }
+        const char* next_record = simd_find_char(ptr, end, '>'); if (next_record < end) { seq_end = next_record; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; ptr = next_record; } else { seq_end = end; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; ptr = end; }
         if (ptr >= end) { seq_end = end; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; }
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start);
         if (!id.empty() && !seq.empty()) {
@@ -463,10 +485,13 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '@') break;
         ++ptr; const char* id_start = ptr; while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr; const char* id_end = ptr;
-        while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr; while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        const char* seq_start = ptr; while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr; const char* seq_end = ptr;
-        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr; while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr; while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-        const char* qual_start = ptr; while (ptr < end && *ptr != '\n' && *ptr != '\r') ++ptr; const char* qual_end = ptr; while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        const char* seq_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* seq_end = ptr;
+        while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr; ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        const char* qual_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* qual_end = ptr;
+        while (qual_end > qual_start && *(qual_end - 1) == '\r') --qual_end;
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start); std::string_view qual(qual_start, qual_end - qual_start);
         if (!id.empty() && !seq.empty()) {
             if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(std::string(id), SequenceView{id, seq, qual}); }
