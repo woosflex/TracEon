@@ -326,7 +326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 |---------|------|----------|--------------|
 | 1.0.0 | 2025-12-16 | Avalon | Zero-copy, Lock-free, GZIP support, Memory mapping |
 | 1.1.0 | 2026-06-07 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
-| 1.2.0 | 2026-Q2 | Caladbolg | Binary cache compression |
+| 1.2.0 | 2026-06-09 | Caladbolg | SIMD parsing, ankerl::unordered_dense hash map, 86% load time reduction |
 | 2.0.0 | 2026-Q3 | Durandal | C API, Streaming |
 | 2.1.0 | 2026-Q4 | Excalibur | Distributed caching |
 
@@ -364,6 +364,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 **Status:** ✅ Production Release  
-**Next Version:** v1.2.0 "Caladbolg" (Q2 2026)
+**Next Version:** v1.3.0 "Hrunting" (Q3 2026)
 
 *"Trace On" - Projecting legendary performance from genomic data across eons.* ⚔️

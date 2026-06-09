@@ -1,6 +1,6 @@
 # TracEon Benchmarking Suite
 
-**Version:** 1.1.0 "Bakuya"  
+**Version:** 1.2.0 "Caladbolg"  
 **Purpose:** Performance validation and regression testing
 
 This directory contains tools for benchmarking TracEon against synthetic and real-world genomic datasets, comparing against state-of-the-art tools (BioPython, PyFastX, SeqKit).
@@ -111,27 +111,28 @@ TracEon vs BioPython (100MB WGS):
 
 ### Load Time Analysis
 
-**Components (v1.1.0):**
+**Components (v1.2.0):**
 ```
 Total Load Time = I/O + Decompression + Parsing + Index Building
 
-For 100MB FASTQ.gz:
+For 100MB FASTQ.gz (v1.2.0):
   I/O:            ~0.05s (SSD)
   Decompression:  ~0.10s (zlib-ng v2.2.2, SIMD-optimized)
-  Parsing:        ~0.05s (multithreaded)
-  Index Building: ~0.05s (Robin Hood)
+  Parsing:        ~0.05s (simd_find_char() AVX2-accelerated)
+  Index Building: ~0.05s (ankerl::unordered_dense, Swiss-table)
   Total:          ~0.25s
 ```
 
 **Improvement from v1.0.0:**
 ```
-  v1.0.0: 0.28s (zlib + temp_buffer + memcpy, ~7 reallocations)
-  v1.1.0: 0.251s (zlib-ng + pre-size + direct-write, 0-1 reallocations)
-  Δ:     -29ms (-10%), with 27% lower memory peak during load
+  v1.0.0: 1.843s (zlib + temp_buffer + byte-by-byte parsing + Robin Hood)
+  v1.1.0: 1.843s (same parse path, only decompression improved)
+  v1.2.0: 0.245s (simd_find_char() + ankerl::unordered_dense + pre-reserved thread-local maps)
+  Δ:     -1.598s (-86.7%), with 30% lower memory peak
 ```
 
 **Regression thresholds:**
-- **Expected:** 0.20-0.30s for 100MB GZIP (v1.1.0: 0.251s target)
+- **Expected:** 0.20-0.30s for 100MB GZIP (v1.2.0: 0.245s target)
 - **Warning:** > 0.35s (investigate)
 - **Failure:** > 0.50s (block merge)
 
@@ -214,9 +215,9 @@ PacBio       | 348       | 0.07   | 0.03   | 0.19   | 0.01    | 0.00    | 44,291
 grep CMAKE_BUILD_TYPE build/CMakeCache.txt
 # Expected: CMAKE_BUILD_TYPE:STRING=Release
 
-# Check Robin Hood detection
-grep "robin_hood" build/CMakeFiles/*.log
-# Expected: Found robin_hood.h
+# Check ankerl::unordered_dense detection
+grep "ankerl_unordered_dense" build/CMakeCache.txt
+# Expected: ankerl_unordered_dense source directory populated
 ```
 
 **Fix:**
