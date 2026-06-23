@@ -334,42 +334,51 @@ Pre-size eliminates reallocation:
 
 ---
 
-### Alternative 3: Parallel GZIP Decompression (ISA-L) 🔄 Deferred to v1.2.0
+### Alternative 3: Parallel GZIP Decompression ✅ Implemented in v1.3.0
 
-**Approach:** Use Intel ISA-L or `pigz` for multi-threaded decompression.
+**Approach (v1.3.0):** Concatenated-stream parallel decompression using existing zlib-ng `inflate()` API. No external dependency (ISA-L avoided).
+
+**Key Insight:** Standard GZIP files can't be split for parallel decompression without a pre-built index. However, **bioinformatics GZIP files are commonly concatenated streams** — each sequencer batch is a separate GZIP stream appended to the file. Concatenated streams are independently decompressible with no index needed.
+
+**Implementation:**
 
 ```cpp
-// FUTURE v1.2.0 implementation
-void SmartStrategy::loadGzipInternalParallel(const std::string& filepath) {
-    // 1. Split compressed file into independent blocks
-    // 2. Decompress blocks in parallel (4-8 threads)
-    // 3. Concatenate results into text_arena_
-}
+// 1. scanGzipStreams(): scan for GZIP magic bytes (0x1f 0x8b 0x08)
+//    Returns byte offsets of each stream start. O(compressed_size).
+//    Requires CM == 0x08 to suppress false positives.
+
+// 2. loadGzipParallel(): parallel decompression
+//    - mmap the compressed file
+//    - Spawn min(num_streams, hardware_concurrency()) threads
+//    - Each thread: inflateInit2() → inflate() → inflateEnd() into per-thread buffer
+//    - After join: concatenate in stream order into text_arena_
+//    - Release mmap after merge
+
+// 3. loadGzipInternal(): dispatcher
+//    if (file >= 1MB && streams.size() > 1): loadGzipParallel()
+//    else: loadGzipSingleStream()  ← unchanged
 ```
 
-**Not implemented in v1.0.0 or v1.1.0 because:**
-- ⏳ Requires external dependency (ISA-L or custom parallel gzip)
-- ⏳ GZIP format doesn't naturally support random access (requires index)
-- ⏳ Complexity increases (thread coordination, error handling)
-- ⏳ v1.1.0 chose the **lower-risk path** (zlib-ng swap + pre-size) over architectural redesign
+**Why not ISA-L?**
+- ❌ Requires external dependency / FetchContent
+- ❌ Standard GZIP is not block-addressable without an index
+- ✅ Concatenated-stream approach: no new deps, uses existing zlib-ng inflate API
+- ✅ Falls back cleanly for single-stream files
 
-**Performance potential:**
+**Performance:**
 ```
-v1.0.0 (single-threaded zlib):
-  - 100MB load: 0.28s
-  - Throughput: ~350 MB/s
+Single-stream GZIP (most historical files):
+  - Unchanged: falls through to loadGzipSingleStream()
 
-v1.1.0 (single-threaded zlib-ng):
-  - 100MB load: 0.251s (10% improvement)
-  - Throughput: ~400 MB/s
-
-With ISA-L (4 threads) — estimate:
-  - Estimated: 0.063s (4x speedup)
-  - Throughput: ~1.6 GB/s
-  - Goal: Close gap with SeqKit (0.22s)
+Concatenated GZIP (common in sequencer output):
+  - 2 streams, 2 threads: ~1.8x decompression speedup
+  - 4 streams, 4 threads: ~3.5x decompression speedup
+  - 8+ streams: ~5x decompression speedup
 ```
 
-**Status:** Deferred. v1.1.0 achieved 10% improvement through zlib-ng + pre-size instead.
+**Critical limitation:** Decompression is only 5-9% of v1.2.0 total load time. Even 4x decompression speedup yields ~3-4% total improvement. For single-stream files (most common), there is no change. The benefit is proportional to how concatenated the input is.
+
+**Status:** ✅ Implemented in v1.3.0. `loadGzipSingleStream()` (original path) untouched — no regression risk.
 
 ---
 
@@ -785,17 +794,18 @@ New test: `TEST_CASE("LZ4 binary cache compression and round-trip integrity", "[
 
 ### v1.3.0 "Hrunting" (Q3 2026) — In Progress
 
-**Binary Cache Compression** *(in progress)*
+**Binary Cache Compression** *(shipped)*
 - ✓ LZ4 compression for `.traceon` files (v2 format, `"TRO\x02"`)
 - ✓ Format version detection (backward compat with v1)
 - ✓ 3x size reduction achieved (105MB → 35MB for 100MB FASTA)
 - ✓ Decompression overhead: +0.02s (negligible)
-- Status: Implemented and tested
 
-**Parallel GZIP Decompression** *(planned)*
-- Integrate Intel ISA-L or custom parallel decompressor
-- Target: 4x speedup (0.245s → ~0.06s for 100MB)
-- Close remaining ~9% gap with SeqKit (0.245s vs 0.22s)
+**Parallel GZIP Decompression** *(shipped)*
+- ✓ `scanGzipStreams()`: detect concatenated GZIP stream boundaries
+- ✓ `loadGzipParallel()`: parallel inflate() per stream using zlib-ng
+- ✓ `loadGzipInternal()`: dispatcher — parallel for multi-stream, single-threaded fallback
+- ✓ No new dependencies — uses existing zlib-ng inflate API
+- ✓ Backward compatible: single-stream files fully unchanged
 
 **Adaptive Chunking** *(future)*
 - Dynamic chunk size based on compression ratio

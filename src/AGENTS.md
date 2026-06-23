@@ -46,6 +46,9 @@ Core implementation is owned by the project maintainer. Performance-critical sec
 ### Performance-Sensitive Code Paths
 - `SmartStrategy::loadFile()` — Parse initiation, GZIP detection, chunking for multithreaded parsing
 - `SmartStrategy::loadGzipFile()` — zlib-ng decompression loop, buffer pre-sizing, OOM guarding
+- `SmartStrategy::loadGzipInternal()` — Dispatcher: detects stream count, routes to parallel or single-stream path
+- `SmartStrategy::scanGzipStreams()` — O(n) scan for GZIP stream boundaries; drives parallel dispatch decision
+- `SmartStrategy::loadGzipParallel()` — Per-stream inflate() in parallel threads; merges into text_arena_
 - `SmartStrategy::loadBinary()` — Format version detection, LZ4 decompression (v2), mmap + parsing (v1), record parsing
 - `SmartStrategy::saveBinary()` — Payload serialization, LZ4 compression, header + data write
 - `SmartStrategy::getView()` — Must be O(1) map lookup; no allocations
