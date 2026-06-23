@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] — v1.3.0 "Hrunting" (2026-06-23)
+
+### ✨ Added
+
+- **LZ4 Binary Cache Compression**: `.traceon` binary cache files now use LZ4 compression (format version 0x02). Decompresses at ~1–2 GB/s with ~3x size reduction (~105MB → ~35MB for 100MB FASTA).
+- **Format Version Detection**: `loadBinary()` now detects format version byte and supports backward compatibility with v1 uncompressed format (0x01). Automatic routing based on magic bytes `"TRO\x01"` (v1) vs `"TRO\x02"` (v2).
+- **Serialization Helper**: New private method `serializePayload()` abstracts payload serialization, eliminating code duplication between v1 and v2 paths.
+- **Parallel GZIP Decompression**: Concatenated GZIP streams are now decompressed in parallel. `scanGzipStreams()` scans for GZIP stream boundaries; `loadGzipParallel()` spawns one thread per stream using the zlib-ng `inflate()` API. Single-stream files fall through to the existing single-threaded path unchanged.
+
+### 🔧 Changed
+
+- **Binary Cache Format**: Version byte bumped from `\x01` to `\x02`. Header now includes `original_size` and `compressed_size` fields for decompression.
+- **Binary Cache I/O**: v2 format decompresses LZ4-compressed payload into `text_arena_` before parsing. String views still point into arena (consistent with GZIP path).
+- **GZIP Loader**: `loadGzipInternal()` is now a dispatcher — detects stream count and routes to `loadGzipParallel()` (multi-stream) or `loadGzipSingleStream()` (single-stream, unchanged).
+
+### ⚡ Performance
+
+- **Binary Cache Size**: 3x reduction (e.g., 105MB → ~35MB for 100MB FASTA sequences)
+- **Restore Latency**: Unchanged or faster (LZ4 decompression ~1–2 GB/s, smaller file size reduces I/O)
+- **Parallel GZIP Decompression**: For concatenated GZIP files (common in bioinformatics sequencer output), decompression scales with stream count (~1.8x for 2 streams, ~3.5x for 4 streams)
+- **Lookup Throughput**: Unchanged (12–18M OPS/s WGS range, 28–81M OPS/s long-read scenarios)
+
+---
+
 ## [1.2.0] — v1.2.0 "Caladbolg" (2026-06-09)
 
 ### ✨ Added

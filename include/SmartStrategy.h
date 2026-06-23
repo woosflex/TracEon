@@ -102,9 +102,36 @@ private:
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
-    uint64_t hash_key(std::string_view key) const; 
-    
+    uint64_t hash_key(std::string_view key) const;
+
     void clearInternal();
+
+    /**
+     * @brief Serialize payload (count + all records) into a buffer.
+     * Used by saveBinary() for both v1 and v2 formats.
+     */
+    void serializePayload(std::vector<char>& buf) const;
+
+    /**
+     * @brief Scan a compressed GZIP file for stream boundaries.
+     * Returns byte offsets of each GZIP stream header found.
+     * Size == 1 means single-stream; size > 1 means concatenated streams.
+     */
+    std::vector<size_t> scanGzipStreams(const std::string& filepath) const;
+
+    /**
+     * @brief Decompress concatenated GZIP streams in parallel into text_arena_.
+     * Each stream is decompressed by a separate thread using zlib-ng inflate().
+     * @param filepath Path to the compressed file
+     * @param stream_offsets Stream start byte offsets from scanGzipStreams()
+     */
+    void loadGzipParallel(const std::string& filepath,
+                          const std::vector<size_t>& stream_offsets);
+
+    /**
+     * @brief Single-threaded GZIP decompression into text_arena_ (original path).
+     */
+    void loadGzipSingleStream(const std::string& filepath);
 
     /**
      * @brief Cross-platform available physical memory in bytes.

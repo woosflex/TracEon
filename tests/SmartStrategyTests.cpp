@@ -1312,3 +1312,68 @@ TEST_CASE("Pre-reserved MT FASTQ — last record without trailing newline",
 
     fs::remove(test_file_path);
 }
+
+// Helper: compress bytes with zlib-ng gzwrite into a temp file, read back raw bytes
+static std::vector<char> compress_to_gzip_bytes(const std::string& data, const std::string& tmp_path) {
+    gzFile f = gzopen(tmp_path.c_str(), "wb");
+    gzwrite(f, data.data(), static_cast<unsigned>(data.size()));
+    gzclose(f);
+
+    std::ifstream in(tmp_path, std::ios::binary | std::ios::ate);
+    size_t sz = in.tellg();
+    in.seekg(0);
+    std::vector<char> bytes(sz);
+    in.read(bytes.data(), sz);
+    return bytes;
+}
+
+TEST_CASE("Parallel GZIP decompression — concatenated streams", "[strategy][gzip][parallel]") {
+    std::string part1 = ">seq1\nACGTACGT\n>seq2\nTGCATGCA\n";
+    std::string part2 = ">seq3\nAAAAAAAA\n>seq4\nCCCCCCCC\n";
+
+    std::string tmp1 = "tmp_stream1.gz";
+    std::string tmp2 = "tmp_stream2.gz";
+    std::string concat_path = "tmp_concat.fasta.gz";
+
+    auto bytes1 = compress_to_gzip_bytes(part1, tmp1);
+    auto bytes2 = compress_to_gzip_bytes(part2, tmp2);
+
+    {
+        std::ofstream out(concat_path, std::ios::binary);
+        out.write(bytes1.data(), bytes1.size());
+        out.write(bytes2.data(), bytes2.size());
+    }
+
+    SECTION("All sequences present after concatenated load") {
+        TracEon::SmartStrategy strategy;
+        strategy.loadFile(concat_path);
+
+        REQUIRE(strategy.getFileCacheSize() == 4);
+        REQUIRE(strategy.getSequence("seq1") == "ACGTACGT");
+        REQUIRE(strategy.getSequence("seq2") == "TGCATGCA");
+        REQUIRE(strategy.getSequence("seq3") == "AAAAAAAA");
+        REQUIRE(strategy.getSequence("seq4") == "CCCCCCCC");
+    }
+
+    fs::remove(tmp1);
+    fs::remove(tmp2);
+    fs::remove(concat_path);
+}
+
+TEST_CASE("Parallel GZIP — single-stream fallback unchanged", "[strategy][gzip][parallel]") {
+    std::string data = ">chr1\nACGTACGTACGT\n>chr2\nTTTTGGGGCCCC\n";
+    std::string gz_path = "tmp_single_stream.fasta.gz";
+
+    gzFile f = gzopen(gz_path.c_str(), "wb");
+    gzwrite(f, data.data(), static_cast<unsigned>(data.size()));
+    gzclose(f);
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(gz_path);
+
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("chr1") == "ACGTACGTACGT");
+    REQUIRE(strategy.getSequence("chr2") == "TTTTGGGGCCCC");
+
+    fs::remove(gz_path);
+}

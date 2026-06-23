@@ -15,6 +15,7 @@
 #include <functional> 
 #include <cctype>
 #include <zlib.h>
+#include <lz4.h>
 #include <new>
 
 #ifdef _WIN32
@@ -60,7 +61,8 @@ struct MMapHandle {
     }
 };
 
-static const char MAGIC_BYTES[] = "TRO\x01"; // v1.1+ format (was "MMAP" in v1.0)
+static const char MAGIC_BYTES_V1[] = "TRO\x01"; // v1.1 format (uncompressed)
+static const char MAGIC_BYTES_V2[] = "TRO\x02"; // v1.3 format (LZ4-compressed)
 
 SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN), file_cache_(GenomeIndex{}) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
@@ -157,14 +159,180 @@ size_t SmartStrategy::getAvailableMemory() {
 #endif
 }
 
-// --- GZIP Loader ---
-void SmartStrategy::loadGzipInternal(const std::string& filepath) {
+// --- GZIP Loaders ---
+
+// Minimum compressed size to try parallel decompression (avoid overhead for tiny files)
+static constexpr size_t PARALLEL_GZIP_THRESHOLD = 1024 * 1024; // 1MB
+
+std::vector<size_t> SmartStrategy::scanGzipStreams(const std::string& filepath) const {
+    std::vector<size_t> offsets;
+
+    std::ifstream f(filepath, std::ios::binary | std::ios::ate);
+    if (!f) return offsets;
+
+    size_t file_size = static_cast<size_t>(f.tellg());
+    if (file_size < 18) return offsets; // Too small to contain even one GZIP stream
+
+    // Read entire compressed file into memory for scanning
+    std::vector<unsigned char> compressed(file_size);
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(compressed.data()), file_size)) return offsets;
+
+    // Scan for GZIP header magic: 0x1f 0x8b, followed by CM byte (must be 0x08 = deflate).
+    // Requiring CM == 0x08 prevents false positives from 0x1f 0x8b appearing in payload.
+    for (size_t i = 0; i + 2 < file_size; ++i) {
+        if (compressed[i] == 0x1f && compressed[i + 1] == 0x8b && compressed[i + 2] == 0x08) {
+            offsets.push_back(i);
+        }
+    }
+
+    // Fallback: if no header found (shouldn't happen for valid GZIP), return offset 0
+    if (offsets.empty()) offsets.push_back(0);
+
+    return offsets;
+}
+
+void SmartStrategy::loadGzipParallel(const std::string& filepath,
+                                      const std::vector<size_t>& stream_offsets) {
+    // mmap the compressed file for zero-copy read access across threads
+    auto mmap = std::make_unique<MMapHandle>();
+#ifdef _WIN32
+    mmap->hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (mmap->hFile == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Cannot open GZIP file: " + filepath);
+    LARGE_INTEGER fs{};
+    GetFileSizeEx(mmap->hFile, &fs);
+    mmap->size = static_cast<size_t>(fs.QuadPart);
+    mmap->hMap = CreateFileMappingA(mmap->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    mmap->data = MapViewOfFile(mmap->hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!mmap->data) throw std::runtime_error("mmap failed: " + filepath);
+#else
+    mmap->fd = open(filepath.c_str(), O_RDONLY);
+    if (mmap->fd == -1) throw std::runtime_error("Cannot open GZIP file: " + filepath);
+    struct stat sb{};
+    fstat(mmap->fd, &sb);
+    mmap->size = static_cast<size_t>(sb.st_size);
+    mmap->data = ::mmap(NULL, mmap->size, PROT_READ, MAP_PRIVATE, mmap->fd, 0);
+    if (mmap->data == MAP_FAILED) throw std::runtime_error("mmap failed: " + filepath);
+#endif
+
+    const unsigned char* compressed_data = static_cast<const unsigned char*>(mmap->data);
+    size_t file_size = mmap->size;
+
+    size_t num_streams = stream_offsets.size();
+    size_t avail_mem = getAvailableMemory();
+
+    // Build per-stream compressed sizes
+    std::vector<size_t> stream_compressed_sizes(num_streams);
+    for (size_t i = 0; i < num_streams; ++i) {
+        size_t stream_end = (i + 1 < num_streams) ? stream_offsets[i + 1] : file_size;
+        stream_compressed_sizes[i] = stream_end - stream_offsets[i];
+    }
+
+    // Decompress each stream in parallel into its own buffer
+    size_t num_threads = std::min(num_streams, static_cast<size_t>(std::thread::hardware_concurrency()));
+    if (num_threads == 0) num_threads = 1;
+
+    std::vector<std::vector<char>> decompressed_chunks(num_streams);
+    std::vector<std::string> thread_errors(num_streams);
+
+    auto decompress_stream = [&](size_t stream_idx) {
+        const unsigned char* src = compressed_data + stream_offsets[stream_idx];
+        size_t src_size = stream_compressed_sizes[stream_idx];
+
+        size_t estimated = src_size * 3;
+        if (avail_mem > 0)
+            estimated = std::min(estimated, avail_mem / 4 / num_streams);
+
+        auto& out = decompressed_chunks[stream_idx];
+        out.resize(estimated > 0 ? estimated : src_size * 3);
+
+        z_stream strm = {};
+        if (inflateInit2(&strm, 15 + 16) != Z_OK) {
+            thread_errors[stream_idx] = "inflateInit2 failed";
+            return;
+        }
+
+        strm.next_in  = const_cast<Bytef*>(src);
+        strm.avail_in = static_cast<uInt>(src_size);
+
+        size_t write_pos = 0;
+        int ret = Z_OK;
+
+        while (ret != Z_STREAM_END) {
+            // Geometric growth if buffer is full
+            if (write_pos == out.size()) {
+                out.resize(out.size() * 2);
+            }
+
+            strm.next_out  = reinterpret_cast<Bytef*>(out.data() + write_pos);
+            strm.avail_out = static_cast<uInt>(out.size() - write_pos);
+
+            ret = inflate(&strm, Z_NO_FLUSH);
+
+            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+                inflateEnd(&strm);
+                thread_errors[stream_idx] = "inflate error: " + std::to_string(ret);
+                return;
+            }
+
+            write_pos = out.size() - strm.avail_out;
+
+            if (ret == Z_BUF_ERROR) {
+                // Output full but not done — grow and continue
+                out.resize(out.size() * 2);
+                continue;
+            }
+        }
+
+        inflateEnd(&strm);
+        out.resize(write_pos);
+        out.shrink_to_fit();
+    };
+
+    // Spawn threads in batches of num_threads
+    for (size_t batch_start = 0; batch_start < num_streams; batch_start += num_threads) {
+        size_t batch_end = std::min(batch_start + num_threads, num_streams);
+        std::vector<std::thread> threads;
+        for (size_t i = batch_start; i < batch_end; ++i) {
+            threads.emplace_back(decompress_stream, i);
+        }
+        for (auto& t : threads) t.join();
+    }
+
+    // Release mmap — compressed data no longer needed
+    mmap.reset();
+
+    // Check for per-thread errors (throw after joining all threads)
+    for (size_t i = 0; i < num_streams; ++i) {
+        if (!thread_errors[i].empty()) {
+            throw std::runtime_error("Parallel GZIP stream " + std::to_string(i) +
+                                     " failed: " + thread_errors[i]);
+        }
+    }
+
+    // Merge decompressed chunks into text_arena_ in stream order
+    size_t total = 0;
+    for (const auto& chunk : decompressed_chunks) total += chunk.size();
+
+    text_arena_.clear();
+    text_arena_.reserve(total);
+    for (auto& dc : decompressed_chunks) {
+        size_t pos = text_arena_.size();
+        text_arena_.resize(pos + dc.size());
+        std::memcpy(text_arena_.data() + pos, dc.data(), dc.size());
+        dc.clear();
+        dc.shrink_to_fit(); // Release per-stream memory as we go
+    }
+}
+
+void SmartStrategy::loadGzipSingleStream(const std::string& filepath) {
     const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
 
-    // Clear any existing data
     text_arena_.clear();
 
-    // ── Pre-size text_arena_ with 3x heuristic and OOM guard ──────────
+    // Pre-size text_arena_ with 3x heuristic and OOM guard
     {
         std::error_code ec;
         const uintmax_t raw_size = std::filesystem::file_size(filepath, ec);
@@ -196,12 +364,10 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
 
     try {
         while (true) {
-            // Geometric growth: reserve BEFORE resize
             size_t required = write_pos + CHUNK_SIZE;
             if (required > text_arena_.capacity()) {
                 text_arena_.reserve(std::max(text_arena_.capacity() * 2, required));
             }
-            // Resize to make room for gzread (uninitialized bytes are OK)
             text_arena_.resize(required);
 
             int bytes_read = gzread(file, chunk.get(), CHUNK_SIZE);
@@ -222,9 +388,24 @@ void SmartStrategy::loadGzipInternal(const std::string& filepath) {
     }
     gzclose(file);
 
-    // Trim to actual size
     text_arena_.resize(write_pos);
     text_arena_.shrink_to_fit();
+}
+
+void SmartStrategy::loadGzipInternal(const std::string& filepath) {
+    std::error_code ec;
+    const uintmax_t file_size = std::filesystem::file_size(filepath, ec);
+    const bool large_enough = (!ec && file_size >= PARALLEL_GZIP_THRESHOLD);
+
+    if (large_enough) {
+        auto streams = scanGzipStreams(filepath);
+        if (streams.size() > 1) {
+            loadGzipParallel(filepath, streams);
+            return;
+        }
+    }
+
+    loadGzipSingleStream(filepath);
 }
 
 void SmartStrategy::normalizeFastaArena() {
@@ -500,45 +681,81 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
     }
 }
 
-void SmartStrategy::saveBinary(const std::string& filepath) const {
-    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    std::ofstream out(filepath, std::ios::binary);
-    if (!out) throw std::runtime_error("Cannot write: " + filepath);
-    out.write(MAGIC_BYTES, 4);
+void SmartStrategy::serializePayload(std::vector<char>& buf) const {
     uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
-    out.write(reinterpret_cast<const char*>(&mode), 1);
+
     if (mode == 0) {
         const auto& map = std::get<GenomeIndex>(file_cache_);
         uint64_t count = map.size();
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+
         for (const auto& [key, view] : map) {
             uint32_t len = static_cast<uint32_t>(key.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(key.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), key.data(), key.data() + len);
+
             len = static_cast<uint32_t>(view.sequence.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.sequence.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+
             len = static_cast<uint32_t>(view.quality.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            if (len > 0) out.write(view.quality.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
         }
     } else {
         const auto& map = std::get<NGSIndex>(file_cache_);
         uint64_t count = map.size();
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+
         for (const auto& [key, view] : map) {
-            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&key), reinterpret_cast<const char*>(&key) + sizeof(key));
+
             uint32_t len = static_cast<uint32_t>(view.id.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.id.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.id.data(), view.id.data() + len);
+
             len = static_cast<uint32_t>(view.sequence.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.sequence.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+
             len = static_cast<uint32_t>(view.quality.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            if (len > 0) out.write(view.quality.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
         }
     }
+}
+
+void SmartStrategy::saveBinary(const std::string& filepath) const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot write: " + filepath);
+
+    // Serialize uncompressed payload
+    std::vector<char> payload;
+    serializePayload(payload);
+
+    // Compress payload with LZ4
+    size_t max_compressed_size = LZ4_compressBound(payload.size());
+    std::vector<char> compressed(max_compressed_size);
+    int compressed_size = LZ4_compress_default(payload.data(), compressed.data(),
+                                                static_cast<int>(payload.size()),
+                                                static_cast<int>(max_compressed_size));
+    if (compressed_size <= 0)
+        throw std::runtime_error("LZ4 compression failed for binary cache: " + filepath);
+    compressed.resize(compressed_size);
+
+    // Write v2 format: magic | mode | original_size | compressed_size | compressed_data
+    out.write(MAGIC_BYTES_V2, 4);
+    uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+    out.write(reinterpret_cast<const char*>(&mode), 1);
+
+    uint64_t original_size = static_cast<uint64_t>(payload.size());
+    uint64_t compressed_len = static_cast<uint64_t>(compressed_size);
+    out.write(reinterpret_cast<const char*>(&original_size), sizeof(original_size));
+    out.write(reinterpret_cast<const char*>(&compressed_len), sizeof(compressed_len));
+    out.write(compressed.data(), compressed_size);
+
+    if (!out) throw std::runtime_error("Binary cache write failed: " + filepath);
 }
 
 void SmartStrategy::loadBinary(const std::string& filepath) {
@@ -585,52 +802,137 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
         return result;
     };
 
-    // Validate magic / format version
-    if (mmap_handle_->size < 5 || std::strncmp(safe_advance(4), MAGIC_BYTES, 4) != 0) {
-        throw std::runtime_error(
-            "Invalid or outdated binary cache (re-generate with save()): " + filepath);
-    }
+    // Check magic bytes and determine format version
+    if (mmap_handle_->size < 5)
+        throw std::runtime_error("Binary cache too small to contain header: " + filepath);
+
+    const char* magic = safe_advance(4);
+    uint8_t format_version = magic[3];
+
+    if (std::strncmp(magic, "TRO", 3) != 0)
+        throw std::runtime_error("Invalid binary cache magic bytes: " + filepath);
 
     uint8_t mode;
     std::memcpy(&mode, safe_advance(1), 1);
-    uint64_t count;
-    std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
 
-    // Sanity-cap count to avoid looping on a corrupt large value.
-    constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
-    if (count > MAX_RECORDS)
-        throw std::runtime_error("Binary cache record count implausible, file may be corrupt: " + filepath);
+    // --- V2 Format (LZ4-compressed) ---
+    if (format_version == 0x02) {
+        uint64_t original_size, compressed_size;
+        std::memcpy(&original_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+        std::memcpy(&compressed_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
 
-    if (mode == 0) {
-        file_cache_ = GenomeIndex{};
-        auto& map = std::get<GenomeIndex>(file_cache_);
-        map.reserve(count);
-        for (uint64_t i = 0; i < count; ++i) {
-            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-            std::string_view id_view(safe_advance(len), len);
-            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-            std::string_view seq(safe_advance(seq_len), seq_len);
-            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-            std::string_view qual;
-            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-            map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
-        }
-    } else {
-        file_cache_ = NGSIndex{};
-        auto& map = std::get<NGSIndex>(file_cache_);
-        map.reserve(count);
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
-            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-            std::string_view id_view(safe_advance(len), len);
-            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-            std::string_view seq(safe_advance(seq_len), seq_len);
-            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-            std::string_view qual;
-            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-            map.emplace(hash, SequenceView{id_view, seq, qual});
+        // Bounds check for compressed data
+        if (ptr + compressed_size > end)
+            throw std::runtime_error("Binary cache v2 is truncated: " + filepath);
+
+        const char* compressed_data = safe_advance(compressed_size);
+
+        // Decompress into text_arena_
+        text_arena_.resize(original_size);
+        int decompressed_size = LZ4_decompress_safe(compressed_data, text_arena_.data(),
+                                                     static_cast<int>(compressed_size),
+                                                     static_cast<int>(original_size));
+        if (decompressed_size < 0)
+            throw std::runtime_error("LZ4 decompression failed for binary cache: " + filepath);
+        if (decompressed_size != static_cast<int>(original_size))
+            throw std::runtime_error("LZ4 decompressed size mismatch: " + filepath);
+
+        // Release mmap handle since we now own the data in text_arena_
+        mmap_handle_.reset();
+
+        // Parse from text_arena_
+        const char* arena_ptr = text_arena_.data();
+        const char* arena_end = arena_ptr + text_arena_.size();
+
+        auto arena_safe_advance = [&](size_t n) -> const char* {
+            if (arena_ptr + n > arena_end)
+                throw std::runtime_error("Binary cache v2 payload is corrupt: " + filepath);
+            const char* result = arena_ptr;
+            arena_ptr += n;
+            return result;
+        };
+
+        uint64_t count;
+        std::memcpy(&count, arena_safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+        if (count > MAX_RECORDS)
+            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+
+        if (mode == 0) {
+            file_cache_ = GenomeIndex{};
+            auto& map = std::get<GenomeIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+            }
+        } else {
+            file_cache_ = NGSIndex{};
+            auto& map = std::get<NGSIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t hash; std::memcpy(&hash, arena_safe_advance(8), 8);
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(hash, SequenceView{id_view, seq, qual});
+            }
         }
     }
+    // --- V1 Format (uncompressed, mmap'd) ---
+    else if (format_version == 0x01) {
+        uint64_t count;
+        std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+        if (count > MAX_RECORDS)
+            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+
+        if (mode == 0) {
+            file_cache_ = GenomeIndex{};
+            auto& map = std::get<GenomeIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+                std::string_view id_view(safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+                std::string_view seq(safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
+                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+            }
+        } else {
+            file_cache_ = NGSIndex{};
+            auto& map = std::get<NGSIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
+                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+                std::string_view id_view(safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+                std::string_view seq(safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
+                map.emplace(hash, SequenceView{id_view, seq, qual});
+            }
+        }
+    } else {
+        throw std::runtime_error("Unknown binary cache format version: " + filepath);
+    }
+
     determine_format_from_cache();
     data_ready_.store(true, std::memory_order_release);
 }
