@@ -102,9 +102,15 @@ private:
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
-    uint64_t hash_key(std::string_view key) const; 
-    
+    uint64_t hash_key(std::string_view key) const;
+
     void clearInternal();
+
+    /**
+     * @brief Serialize payload (count + all records) into a buffer.
+     * Used by saveBinary() for both v1 and v2 formats.
+     */
+    void serializePayload(std::vector<char>& buf) const;
 
     /**
      * @brief Cross-platform available physical memory in bytes.

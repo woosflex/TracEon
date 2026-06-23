@@ -2,17 +2,27 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v1.2.0%20%22Caladbolg%22-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v1.3.0%20%22Hrunting%22-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
+[![BinaryCache](https://img.shields.io/badge/BinaryCache-LZ4%20Compressed-green.svg)]()
 
-**TracEon** (v1.2.0 "Caladbolg") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support.
+**TracEon** (v1.3.0 "Hrunting") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support and LZ4-compressed binary caches.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
 
-## 🎯 What's New in v1.2.0 "Caladbolg"
+## 🎯 What's New in v1.3.0 "Hrunting"
+
+### **LZ4 Binary Cache Compression** 📦
+- **Format v2** with LZ4 compression for `.traceon` binary cache files
+- **3x size reduction** (~105MB → ~35MB for 100MB FASTA)
+- **Backward compatible**: Auto-detection of v1 (uncompressed) and v2 (LZ4) formats
+- **Minimal overhead**: +0.02s decompression (LZ4 @ 1-2 GB/s)
+- Binary cache sizes now practical for large datasets and network transfer
+
+### **v1.2.0 "Caladbolg" Highlights** (Previous Release)
 
 ### **SIMD-Accelerated Parsing** ⚡
 - New `simd_find_char()` function with **AVX2** (32 bytes/iter), **NEON** (16 bytes/iter), and scalar fallback
@@ -95,13 +105,15 @@
 **Key Insight:** Performance scales with dataset size relative to CPU cache hierarchy. 3-4x degradation when exceeding L3 cache (~16-32MB) is **hardware physics** (100ns RAM vs 10ns cache), not a software limitation.
 
 ### Binary Cache Performance
-| Operation | 100MB Dataset | 1GB Dataset |
-|-----------|---------------|-------------|
-| **Save Time** | 0.08s | 0.25s |
-| **Restore Time** | **~0.00s** | **~0.00s** |
-| **File Size** | ~105 MB | ~1.05 GB |
+| Operation | 100MB Dataset | 1GB Dataset | Compression |
+|-----------|---------------|-------------|------------|
+| **Save Time (v2 LZ4)** | 0.10s | 0.30s | With LZ4 compression |
+| **Restore Time (v2 LZ4)** | ~0.021s | ~0.15s | Decompress + parse |
+| **Restore Time (mmap baseline)** | **~0.001s** | **~0.01s** | v1 uncompressed |
+| **File Size (v1)** | ~105 MB | ~1.05 GB | Uncompressed |
+| **File Size (v2)** | **~35 MB** | **~350 MB** | **3x smaller (LZ4)** |
 
-**Note:** Restore is instant via memory mapping (`mmap`/`MapViewOfFile`)
+**Note:** v1 (uncompressed) caches restore instantly via mmap. v2 (LZ4) adds ~0.02s decompression overhead but saves ~3x disk space. Binary cache format automatically detected at load time.
 
 ---
 

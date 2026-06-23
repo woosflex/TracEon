@@ -15,6 +15,7 @@
 #include <functional> 
 #include <cctype>
 #include <zlib.h>
+#include <lz4.h>
 #include <new>
 
 #ifdef _WIN32
@@ -60,7 +61,8 @@ struct MMapHandle {
     }
 };
 
-static const char MAGIC_BYTES[] = "TRO\x01"; // v1.1+ format (was "MMAP" in v1.0)
+static const char MAGIC_BYTES_V1[] = "TRO\x01"; // v1.1 format (uncompressed)
+static const char MAGIC_BYTES_V2[] = "TRO\x02"; // v1.3 format (LZ4-compressed)
 
 SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN), file_cache_(GenomeIndex{}) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
@@ -500,45 +502,81 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
     }
 }
 
-void SmartStrategy::saveBinary(const std::string& filepath) const {
-    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    std::ofstream out(filepath, std::ios::binary);
-    if (!out) throw std::runtime_error("Cannot write: " + filepath);
-    out.write(MAGIC_BYTES, 4);
+void SmartStrategy::serializePayload(std::vector<char>& buf) const {
     uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
-    out.write(reinterpret_cast<const char*>(&mode), 1);
+
     if (mode == 0) {
         const auto& map = std::get<GenomeIndex>(file_cache_);
         uint64_t count = map.size();
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+
         for (const auto& [key, view] : map) {
             uint32_t len = static_cast<uint32_t>(key.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(key.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), key.data(), key.data() + len);
+
             len = static_cast<uint32_t>(view.sequence.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.sequence.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+
             len = static_cast<uint32_t>(view.quality.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            if (len > 0) out.write(view.quality.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
         }
     } else {
         const auto& map = std::get<NGSIndex>(file_cache_);
         uint64_t count = map.size();
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+
         for (const auto& [key, view] : map) {
-            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&key), reinterpret_cast<const char*>(&key) + sizeof(key));
+
             uint32_t len = static_cast<uint32_t>(view.id.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.id.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.id.data(), view.id.data() + len);
+
             len = static_cast<uint32_t>(view.sequence.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            out.write(view.sequence.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+
             len = static_cast<uint32_t>(view.quality.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            if (len > 0) out.write(view.quality.data(), len);
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
         }
     }
+}
+
+void SmartStrategy::saveBinary(const std::string& filepath) const {
+    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot write: " + filepath);
+
+    // Serialize uncompressed payload
+    std::vector<char> payload;
+    serializePayload(payload);
+
+    // Compress payload with LZ4
+    size_t max_compressed_size = LZ4_compressBound(payload.size());
+    std::vector<char> compressed(max_compressed_size);
+    int compressed_size = LZ4_compress_default(payload.data(), compressed.data(),
+                                                static_cast<int>(payload.size()),
+                                                static_cast<int>(max_compressed_size));
+    if (compressed_size <= 0)
+        throw std::runtime_error("LZ4 compression failed for binary cache: " + filepath);
+    compressed.resize(compressed_size);
+
+    // Write v2 format: magic | mode | original_size | compressed_size | compressed_data
+    out.write(MAGIC_BYTES_V2, 4);
+    uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+    out.write(reinterpret_cast<const char*>(&mode), 1);
+
+    uint64_t original_size = static_cast<uint64_t>(payload.size());
+    uint64_t compressed_len = static_cast<uint64_t>(compressed_size);
+    out.write(reinterpret_cast<const char*>(&original_size), sizeof(original_size));
+    out.write(reinterpret_cast<const char*>(&compressed_len), sizeof(compressed_len));
+    out.write(compressed.data(), compressed_size);
+
+    if (!out) throw std::runtime_error("Binary cache write failed: " + filepath);
 }
 
 void SmartStrategy::loadBinary(const std::string& filepath) {
@@ -585,52 +623,137 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
         return result;
     };
 
-    // Validate magic / format version
-    if (mmap_handle_->size < 5 || std::strncmp(safe_advance(4), MAGIC_BYTES, 4) != 0) {
-        throw std::runtime_error(
-            "Invalid or outdated binary cache (re-generate with save()): " + filepath);
-    }
+    // Check magic bytes and determine format version
+    if (mmap_handle_->size < 5)
+        throw std::runtime_error("Binary cache too small to contain header: " + filepath);
+
+    const char* magic = safe_advance(4);
+    uint8_t format_version = magic[3];
+
+    if (std::strncmp(magic, "TRO", 3) != 0)
+        throw std::runtime_error("Invalid binary cache magic bytes: " + filepath);
 
     uint8_t mode;
     std::memcpy(&mode, safe_advance(1), 1);
-    uint64_t count;
-    std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
 
-    // Sanity-cap count to avoid looping on a corrupt large value.
-    constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
-    if (count > MAX_RECORDS)
-        throw std::runtime_error("Binary cache record count implausible, file may be corrupt: " + filepath);
+    // --- V2 Format (LZ4-compressed) ---
+    if (format_version == 0x02) {
+        uint64_t original_size, compressed_size;
+        std::memcpy(&original_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+        std::memcpy(&compressed_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
 
-    if (mode == 0) {
-        file_cache_ = GenomeIndex{};
-        auto& map = std::get<GenomeIndex>(file_cache_);
-        map.reserve(count);
-        for (uint64_t i = 0; i < count; ++i) {
-            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-            std::string_view id_view(safe_advance(len), len);
-            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-            std::string_view seq(safe_advance(seq_len), seq_len);
-            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-            std::string_view qual;
-            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-            map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
-        }
-    } else {
-        file_cache_ = NGSIndex{};
-        auto& map = std::get<NGSIndex>(file_cache_);
-        map.reserve(count);
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
-            uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-            std::string_view id_view(safe_advance(len), len);
-            uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-            std::string_view seq(safe_advance(seq_len), seq_len);
-            uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-            std::string_view qual;
-            if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-            map.emplace(hash, SequenceView{id_view, seq, qual});
+        // Bounds check for compressed data
+        if (ptr + compressed_size > end)
+            throw std::runtime_error("Binary cache v2 is truncated: " + filepath);
+
+        const char* compressed_data = safe_advance(compressed_size);
+
+        // Decompress into text_arena_
+        text_arena_.resize(original_size);
+        int decompressed_size = LZ4_decompress_safe(compressed_data, text_arena_.data(),
+                                                     static_cast<int>(compressed_size),
+                                                     static_cast<int>(original_size));
+        if (decompressed_size < 0)
+            throw std::runtime_error("LZ4 decompression failed for binary cache: " + filepath);
+        if (decompressed_size != static_cast<int>(original_size))
+            throw std::runtime_error("LZ4 decompressed size mismatch: " + filepath);
+
+        // Release mmap handle since we now own the data in text_arena_
+        mmap_handle_.reset();
+
+        // Parse from text_arena_
+        const char* arena_ptr = text_arena_.data();
+        const char* arena_end = arena_ptr + text_arena_.size();
+
+        auto arena_safe_advance = [&](size_t n) -> const char* {
+            if (arena_ptr + n > arena_end)
+                throw std::runtime_error("Binary cache v2 payload is corrupt: " + filepath);
+            const char* result = arena_ptr;
+            arena_ptr += n;
+            return result;
+        };
+
+        uint64_t count;
+        std::memcpy(&count, arena_safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+        if (count > MAX_RECORDS)
+            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+
+        if (mode == 0) {
+            file_cache_ = GenomeIndex{};
+            auto& map = std::get<GenomeIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+            }
+        } else {
+            file_cache_ = NGSIndex{};
+            auto& map = std::get<NGSIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t hash; std::memcpy(&hash, arena_safe_advance(8), 8);
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(hash, SequenceView{id_view, seq, qual});
+            }
         }
     }
+    // --- V1 Format (uncompressed, mmap'd) ---
+    else if (format_version == 0x01) {
+        uint64_t count;
+        std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+        if (count > MAX_RECORDS)
+            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+
+        if (mode == 0) {
+            file_cache_ = GenomeIndex{};
+            auto& map = std::get<GenomeIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+                std::string_view id_view(safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+                std::string_view seq(safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
+                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+            }
+        } else {
+            file_cache_ = NGSIndex{};
+            auto& map = std::get<NGSIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
+                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
+                std::string_view id_view(safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
+                std::string_view seq(safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
+                map.emplace(hash, SequenceView{id_view, seq, qual});
+            }
+        }
+    } else {
+        throw std::runtime_error("Unknown binary cache format version: " + filepath);
+    }
+
     determine_format_from_cache();
     data_ready_.store(true, std::memory_order_release);
 }
