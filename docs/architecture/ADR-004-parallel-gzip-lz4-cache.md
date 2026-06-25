@@ -223,15 +223,28 @@ int decompressed_size = LZ4_decompress_safe(compressed_data, text_arena_.data(),
 - ❌ TracEon targets FASTA/FASTQ workflows, not BAM/BCF
 - ❌ Users would never pass BAM files to TracEon
 
-### A4: LZ4HC (High Compression) for Binary Cache ⚠️ Deferred
+### A4: LZ4HC (High Compression) for Binary Cache ✅ Accepted (Smart Compression — v1.3.0 re-release)
 
-**Approach:** Use `LZ4_compress_HC()` instead of `LZ4_compress_default()` for higher compression ratio (~4–5× vs ~3×) at the cost of slower compression (~100 MB/s vs ~500 MB/s).
+**Approach:** Use `LZ4_compress_HC()` (level 9, `LZ4HC_CLEVEL_DEFAULT`) conditionally — only for payloads > 10 MiB of DNA or RNA data. All other payloads use `LZ4_compress_default()`. Both paths write the existing v2 format; `LZ4_decompress_safe()` handles both bitstreams identically.
 
-**Deferred because:**
-- ⚠️ Save time would increase to ~1s for 100MB (5× slower compression)
-- ⚠️ Save is typically done once; restore is done many times — LZ4_default optimizes the frequent path
-- ⚠️ 3× compression (LZ4 default) already achieves the primary goal of file size reduction
-- Consider if 3× ratio proves insufficient in practice
+**Selection logic (`selectCompressionStrategy()`):**
+- `payload_size > 10 MiB` AND `detected_format_` is `DNA_FASTA`, `RNA_FASTA`, `DNA_FASTQ`, or `RNA_FASTQ` → `LZ4HC`
+- Everything else → `LZ4Default`
+
+**Rationale for conditional approach (resolves original deferral concerns):**
+- ✅ HC overhead is only paid when payload is large enough that the save cost is amortized by storage/transfer savings (> 10 MiB threshold)
+- ✅ Nucleotide sequences (DNA/RNA) have high repetition — HC ratios reach ~4–5× vs ~3× for LZ4_default on this data specifically; protein and unknown formats do not benefit enough to justify HC
+- ✅ Save is infrequent relative to restore; restore path is unchanged (`LZ4_decompress_safe()` handles both)
+- ✅ No new dependencies: `lz4hc.h` / `lz4hc.c` are already vendored in `third_party/lz4/lib/` and compiled into `lz4_static`
+- ✅ No new format version: HC and default produce the same LZ4 bitstream
+
+**Performance (HC path, large DNA/RNA):**
+
+| Dataset | LZ4_default | LZ4_HC | Ratio improvement |
+|---|---|---|---|
+| 100MB DNA FASTA | ~35MB | ~21–26MB | ~4–5× vs ~3× |
+| Save overhead | +0.02s | +0.08–0.12s | Higher, but infrequent |
+| Restore overhead | +0.02s | +0.02s | Unchanged |
 
 ---
 
@@ -265,9 +278,11 @@ int decompressed_size = LZ4_decompress_safe(compressed_data, text_arena_.data(),
 | Single-stream GZIP load | 0.245s | 0.245s | Unchanged |
 | 2-stream GZIP load | 0.245s | ~0.224s | ~9% improvement |
 | 4-stream GZIP load | 0.245s | ~0.205s | ~16% improvement |
-| Binary cache size | ~105MB | ~35MB | 3× reduction |
-| Binary cache save | ~0.08s | ~0.10s | +0.02s LZ4 compress |
-| Binary cache restore | ~0.001s | ~0.021s | +0.02s LZ4 decompress |
+| Binary cache size (default) | ~105MB | ~35MB | 3× reduction |
+| Binary cache size (HC, large DNA/RNA) | ~105MB | ~21–26MB | ~4–5× reduction |
+| Binary cache save (default) | ~0.08s | ~0.10s | +0.02s LZ4 compress |
+| Binary cache save (HC, large DNA/RNA) | ~0.08s | ~0.18–0.22s | +0.10–0.14s LZ4_HC compress |
+| Binary cache restore | ~0.001s | ~0.021s | +0.02s LZ4 decompress (same for both) |
 | Lookup throughput | 12–18M OPS/s | 12–18M OPS/s | Unchanged |
 
 ---

@@ -16,6 +16,7 @@
 #include <cctype>
 #include <zlib.h>
 #include <lz4.h>
+#include <lz4hc.h>
 #include <new>
 
 #ifdef _WIN32
@@ -725,6 +726,24 @@ void SmartStrategy::serializePayload(std::vector<char>& buf) const {
     }
 }
 
+CompressionMode
+SmartStrategy::selectCompressionStrategy(size_t payload_size) const {
+    constexpr size_t LARGE_THRESHOLD = 10u * 1024u * 1024u; // 10 MiB
+
+    if (payload_size > LARGE_THRESHOLD) {
+        switch (detected_format_) {
+            case FileFormat::DNA_FASTA:
+            case FileFormat::RNA_FASTA:
+            case FileFormat::DNA_FASTQ:
+            case FileFormat::RNA_FASTQ:
+                return CompressionMode::LZ4HC;
+            default:
+                break;
+        }
+    }
+    return CompressionMode::LZ4Default;
+}
+
 void SmartStrategy::saveBinary(const std::string& filepath) const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
     std::ofstream out(filepath, std::ios::binary);
@@ -734,20 +753,33 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
     std::vector<char> payload;
     serializePayload(payload);
 
-    // Compress payload with LZ4
-    size_t max_compressed_size = LZ4_compressBound(payload.size());
-    std::vector<char> compressed(max_compressed_size);
-    int compressed_size = LZ4_compress_default(payload.data(), compressed.data(),
-                                                static_cast<int>(payload.size()),
-                                                static_cast<int>(max_compressed_size));
+    const CompressionMode comp_mode = selectCompressionStrategy(payload.size());
+    const size_t max_compressed = static_cast<size_t>(
+        LZ4_compressBound(static_cast<int>(payload.size())));
+    std::vector<char> compressed(max_compressed);
+
+    int compressed_size = 0;
+    if (comp_mode == CompressionMode::LZ4HC) {
+        compressed_size = LZ4_compress_HC(
+            payload.data(), compressed.data(),
+            static_cast<int>(payload.size()),
+            static_cast<int>(max_compressed),
+            LZ4HC_CLEVEL_DEFAULT);
+    } else {
+        compressed_size = LZ4_compress_default(
+            payload.data(), compressed.data(),
+            static_cast<int>(payload.size()),
+            static_cast<int>(max_compressed));
+    }
+
     if (compressed_size <= 0)
         throw std::runtime_error("LZ4 compression failed for binary cache: " + filepath);
-    compressed.resize(compressed_size);
+    compressed.resize(static_cast<size_t>(compressed_size));
 
-    // Write v2 format: magic | mode | original_size | compressed_size | compressed_data
+    // Write v2 format: magic | index_mode | original_size | compressed_size | compressed_data
     out.write(MAGIC_BYTES_V2, 4);
-    uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
-    out.write(reinterpret_cast<const char*>(&mode), 1);
+    uint8_t index_mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+    out.write(reinterpret_cast<const char*>(&index_mode), 1);
 
     uint64_t original_size = static_cast<uint64_t>(payload.size());
     uint64_t compressed_len = static_cast<uint64_t>(compressed_size);

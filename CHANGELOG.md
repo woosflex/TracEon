@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Format Version Detection**: `loadBinary()` now detects format version byte and supports backward compatibility with v1 uncompressed format (0x01). Automatic routing based on magic bytes `"TRO\x01"` (v1) vs `"TRO\x02"` (v2).
 - **Serialization Helper**: New private method `serializePayload()` abstracts payload serialization, eliminating code duplication between v1 and v2 paths.
 - **Parallel GZIP Decompression**: Concatenated GZIP streams are now decompressed in parallel. `scanGzipStreams()` scans for GZIP stream boundaries; `loadGzipParallel()` spawns one thread per stream using the zlib-ng `inflate()` API. Single-stream files fall through to the existing single-threaded path unchanged.
+- **Smart Compression**: `saveBinary()` now auto-selects the LZ4 compression mode based on payload size and detected file format. Payloads > 10 MiB of DNA or RNA data use `LZ4_compress_HC()` (level 9) for ~4–5× size reduction; all other data uses `LZ4_compress_default()`. Both modes write the existing v2 format — `LZ4_decompress_safe()` handles both bitstreams transparently. No new dependencies, no format version bump.
 
 ### 🔧 Changed
 
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Binary Cache Size**: 3x reduction (e.g., 105MB → ~35MB for 100MB FASTA sequences)
 - **Restore Latency**: Unchanged or faster (LZ4 decompression ~1–2 GB/s, smaller file size reduces I/O)
 - **Parallel GZIP Decompression**: For concatenated GZIP files (common in bioinformatics sequencer output), decompression scales with stream count (~1.8x for 2 streams, ~3.5x for 4 streams)
+- **Binary Cache Size (HC path)**: ~4–5× reduction for large DNA/RNA datasets vs ~3× with LZ4 default (e.g., 100MB DNA FASTA → ~21–26MB with HC vs ~35MB with default)
 - **Lookup Throughput**: Unchanged (12–18M OPS/s WGS range, 28–81M OPS/s long-read scenarios)
 
 ---

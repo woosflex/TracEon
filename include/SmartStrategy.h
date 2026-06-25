@@ -25,6 +25,11 @@ enum class FileFormat : uint8_t {
     UNKNOWN = 0xFF
 };
 
+enum class CompressionMode {
+    LZ4Default, ///< LZ4_compress_default() — fast, general case
+    LZ4HC,      ///< LZ4_compress_HC() — higher ratio for large nucleotide data
+};
+
 struct SequenceView {
     // NOTE:
     // - The Map Key (std::string) owns the normalized identifier used for hashing/lookups.
@@ -111,6 +116,15 @@ private:
      * Used by saveBinary() for both v1 and v2 formats.
      */
     void serializePayload(std::vector<char>& buf) const;
+
+    /**
+     * @brief Choose a compression algorithm based on payload size and detected format.
+     *
+     * Rules (in priority order):
+     *  1. payload_size > 10 MiB AND format is DNA/RNA → LZ4HC  (high repetition)
+     *  2. everything else                              → LZ4Default
+     */
+    CompressionMode selectCompressionStrategy(size_t payload_size) const;
 
     /**
      * @brief Scan a compressed GZIP file for stream boundaries.

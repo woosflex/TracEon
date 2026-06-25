@@ -491,15 +491,15 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **Memory Peak**: 185MB during load (30% reduction from 263MB)
 - **normalizeFastaArena() fix**: Trailing newline bug resolved
 
-### 🎯 Planned Releases
-
-#### v1.3.0 "Hrunting" (Q3 2026)
+### ✅ v1.3.0 "Hrunting" (Q3 2026) — Completed
 *Hound of the red plains - Relentless pursuit of speed*
 
-- **Binary Cache Compression**: LZ4 integration for `.traceon` files (3x size reduction)
-- **Parallel GZIP Decompression**: Intel ISA-L or custom parallel decompressor (target: 4x speedup)
+- **Binary Cache Compression**: LZ4 integration for `.traceon` files (~3–5× size reduction)
+- **Parallel GZIP Decompression**: Concatenated-stream detection + parallel inflate (target: 4x speedup)
 - **Transparent Decompression**: On-the-fly decompression for reference genomes
-- **Smart Compression**: Auto-select algorithm based on data characteristics
+- **Smart Compression**: `saveBinary()` auto-selects LZ4_HC for large DNA/RNA payloads (> 10 MiB), LZ4_default otherwise — no new dependencies, no format bump
+
+### 🎯 Planned Releases
 
 #### v2.0.0 "Durandal" (Q4 2026)
 *Peerless - Language-agnostic access*

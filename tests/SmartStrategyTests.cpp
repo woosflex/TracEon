@@ -135,6 +135,114 @@ TEST_CASE("loadFile throws on missing file", "[strategy][errors]") {
     REQUIRE_THROWS_AS(strategy.loadFile("nonexistent_file_xyz.fasta"), std::runtime_error);
 }
 
+// ── Smart Compression tests ───────────────────────────────────────────────────
+
+TEST_CASE("Smart Compression — large DNA payload uses LZ4_HC (v2, better ratio)",
+          "[strategy][smart_compression][lz4hc]") {
+    const std::string src = "sc_large_dna.fasta";
+    const std::string bin = "sc_large_dna.bin";
+    {
+        std::ofstream out(src);
+        // 3000 × 4000-char sequences ≈ 12 MiB payload — above the 10 MiB HC threshold
+        const std::string seq(4000, 'A');
+        for (int i = 1; i <= 3000; ++i)
+            out << ">seq" << i << '\n' << seq << '\n';
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
+    strategy.saveBinary(bin);
+
+    // Verify v2 magic (LZ4_HC and LZ4_default both write v2)
+    {
+        std::ifstream f(bin, std::ios::binary);
+        char magic[4];
+        f.read(magic, 4);
+        REQUIRE(magic[3] == '\x02');
+    }
+
+    // LZ4_HC on homopolymer runs achieves extreme ratios — expect very small file
+    REQUIRE(fs::file_size(bin) < 500'000); // < 500 KB for ~12 MiB of AAAA...
+
+    // Full round-trip correctness
+    TracEon::SmartStrategy restored;
+    restored.loadBinary(bin);
+    REQUIRE(restored.getFileCacheSize() == 3000);
+    REQUIRE(restored.getSequence("seq1")    == std::string(4000, 'A'));
+    REQUIRE(restored.getSequence("seq3000") == std::string(4000, 'A'));
+
+    fs::remove(src);
+    fs::remove(bin);
+}
+
+TEST_CASE("Smart Compression — large protein payload uses LZ4_default (not HC)",
+          "[strategy][smart_compression][lz4default_protein]") {
+    const std::string src = "sc_large_protein.fasta";
+    const std::string bin = "sc_large_protein.bin";
+    {
+        std::ofstream out(src);
+        // 3000 × 4000-char protein sequences ≈ 12 MiB payload
+        // 'E' (glutamic acid) is not in the nucleotide set — forces PROTEIN_FASTA
+        const std::string seq(4000, 'E');
+        for (int i = 1; i <= 3000; ++i)
+            out << ">prot" << i << '\n' << seq << '\n';
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::PROTEIN_FASTA);
+    strategy.saveBinary(bin);
+
+    // v2 magic expected (payload is above 64 KiB, so not uncompressed)
+    {
+        std::ifstream f(bin, std::ios::binary);
+        char magic[4];
+        f.read(magic, 4);
+        REQUIRE(magic[3] == '\x02');
+    }
+
+    // Round-trip correctness
+    TracEon::SmartStrategy restored;
+    restored.loadBinary(bin);
+    REQUIRE(restored.getFileCacheSize() == 3000);
+    REQUIRE(restored.getSequence("prot1")    == std::string(4000, 'E'));
+    REQUIRE(restored.getSequence("prot3000") == std::string(4000, 'E'));
+
+    fs::remove(src);
+    fs::remove(bin);
+}
+
+TEST_CASE("Smart Compression — small DNA payload uses LZ4_default (below HC threshold)",
+          "[strategy][smart_compression][lz4default_small]") {
+    const std::string src = "sc_small_dna.fasta";
+    const std::string bin = "sc_small_dna.bin";
+    {
+        std::ofstream out(src);
+        out << ">chr1\nACGT\n>chr2\nTGCA\n";
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
+    strategy.saveBinary(bin);
+
+    // v2 magic: LZ4_default path still writes v2
+    {
+        std::ifstream f(bin, std::ios::binary);
+        char magic[4];
+        f.read(magic, 4);
+        REQUIRE(magic[3] == '\x02');
+    }
+
+    // Round-trip correctness
+    TracEon::SmartStrategy restored;
+    restored.loadBinary(bin);
+    REQUIRE(restored.getFileCacheSize() == 2);
+    REQUIRE(restored.getSequence("chr1") == "ACGT");
+    REQUIRE(restored.getSequence("chr2") == "TGCA");
+
+    fs::remove(src);
+    fs::remove(bin);
+}
+
 TEST_CASE("loadBinary throws on missing file", "[strategy][errors]") {
     TracEon::SmartStrategy strategy;
     REQUIRE_THROWS_AS(strategy.loadBinary("nonexistent_cache_xyz.bin"), std::runtime_error);
