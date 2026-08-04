@@ -6,15 +6,14 @@
 #include <vector>
 #include <memory>
 #include <optional>
-#include <unordered_map>
 
 #include "IEncodingStrategy.h"
 #include "RecordTypes.h"
 #include "DecodedRecordTypes.h"
-#include "MapDefs.h" 
+#include "MapDefs.h"
+#include "SmartStrategy.h"
 
 namespace TracEon {
-    class SmartStrategy;
 
     /**
      * @class Cache
@@ -25,7 +24,7 @@ namespace TracEon {
      */
     class Cache {
     public:
-        Cache();
+        explicit Cache(IndexMode mode = IndexMode::GENOME);
         ~Cache();
 
         // --- Data Access ---
@@ -79,12 +78,13 @@ namespace TracEon {
         
         size_t size() const;
 
+        IndexMode getIndexMode() const;
+
         // --- Internal / Diagnostics ---
         IEncodingStrategy* getStrategy() const;
 
     private:
         std::unique_ptr<SmartStrategy> m_strategy;
-        std::unordered_map<std::string, std::string> m_manual_store;
     };
 
 } // namespace TracEon

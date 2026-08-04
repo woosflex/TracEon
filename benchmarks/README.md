@@ -1,7 +1,8 @@
 # TracEon Benchmarking Suite
 
-**Version:** 1.2.0 "Caladbolg"  
-**Purpose:** Performance validation and regression testing
+**Version:** v1.4.0 "Caliburn"  
+**Purpose:** Performance validation and regression testing  
+**Last Updated:** 2026-07-01
 
 This directory contains tools for benchmarking TracEon against synthetic and real-world genomic datasets, comparing against state-of-the-art tools (BioPython, PyFastX, SeqKit).
 

@@ -2,18 +2,39 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v1.3.0%20%22Hrunting%22-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v1.4.0%20%22Caliburn%22-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
 [![BinaryCache](https://img.shields.io/badge/BinaryCache-LZ4%20Compressed-green.svg)]()
 
-**TracEon** (v1.3.0 "Hrunting") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support and LZ4-compressed binary caches.
+**TracEon** (v1.4.0 "Caliburn") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, LZ4-compressed binary caches, and **workload-optimized index modes** for genomic and NGS applications.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
 
-## 🎯 What's New in v1.3.0 "Hrunting"
+## 🎯 What's New in v1.4.0 "Caliburn"
+
+### **IndexMode Selection** 🎯
+- `Cache(IndexMode::GENOME)` — Default string-keyed index for reference genomes
+- `Cache(IndexMode::NGS)` — Hash-keyed index optimized for short-read NGS workloads
+- Previously `NGSIndex` was compiled but unreachable — now production-ready
+- **`getIndexMode()`** exposes active mode via public API
+
+### **Fixed: `Cache::set()` Data Persistence** 🔧
+- Manually-added entries via `set()` now persist through `save()`/`restore()` cycles
+- Previous bug: `m_manual_store` was never serialized, causing silent data loss
+- Now routes through `SmartStrategy::addEntry()` for unified storage
+
+### **Comprehensive Test Coverage** 🧪
+- **+13 new test cases** (57 → 70), **+64 new assertions** (3776 → 3840)
+- NGSIndex correctness (FASTA/FASTQ load/lookup/save/restore)
+- **Real parallel GZIP benchmarking** (fixed false-positive test using gzip store mode)
+- Format detection (RNA/protein FASTA)
+- Binary cache v1 backward compatibility
+- Edge cases (`clearCache()` + reload, zero-copy views)
+
+### **v1.3.0 "Hrunting" Highlights** (Previous Release)
 
 ### **LZ4 Binary Cache Compression** 📦
 - **Format v2** with LZ4 compression for `.traceon` binary cache files
@@ -498,6 +519,13 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **Parallel GZIP Decompression**: Concatenated-stream detection + parallel inflate (target: 4x speedup)
 - **Transparent Decompression**: On-the-fly decompression for reference genomes
 - **Smart Compression**: `saveBinary()` auto-selects LZ4_HC for large DNA/RNA payloads (> 10 MiB), LZ4_default otherwise — no new dependencies, no format bump
+
+### ✅ v1.4.0 "Caliburn" (Q3 2026) — Completed
+*The sword of selection — choosing the right index mode*
+
+- **IndexMode Selection**: `SmartStrategy(IndexMode::NGS)` / `Cache(IndexMode::NGS)` activates the hash-keyed `NGSIndex` for short-read workloads; `IndexMode::GENOME` (default) retains string-keyed `GenomeIndex`
+- **`Cache::set()` data persistence**: Manually-added entries via `set()` are now serialized by `save()` and restored by `restore()`
+- **Correctness hardening**: Closed test gaps for parallel GZIP, RNA/protein format detection, v1 binary format, `clearCache()` + reload, and zero-copy `Cache::getView()`
 
 ### 🎯 Planned Releases
 

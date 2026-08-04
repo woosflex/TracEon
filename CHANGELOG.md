@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.0] — v1.4.0 "Caliburn" (2026-06-30)
+
+*The sword of selection — choosing the right index mode.*
+
+### ✨ Added
+
+- **IndexMode Selection**: `SmartStrategy(IndexMode mode)` and `Cache(IndexMode mode)` constructors allow choosing between `IndexMode::GENOME` (default, string-keyed `GenomeIndex`) and `IndexMode::NGS` (hash-keyed `NGSIndex`). Previously, `NGSIndex` was compiled in but permanently unreachable.
+- **`Cache::getIndexMode()`**: New method exposes the active index mode from the public `Cache` API.
+- **`Cache::set()` persists via `save()`**: `set()` now routes through `SmartStrategy::addEntry()` instead of a separate `m_manual_store`. Manually-added entries are now serialized by `save()` and restored by `restore()`. The separate `m_manual_store` field in `Cache` has been removed.
+
+### 🔧 Changed
+
+- **`SmartStrategy` constructor signature**: `SmartStrategy()` → `SmartStrategy(IndexMode mode = IndexMode::GENOME)`. Default behavior is identical.
+- **`Cache` constructor signature**: `Cache()` → `Cache(IndexMode mode = IndexMode::GENOME)`. Default behavior is identical.
+- **`Cache::get()` / `getView()` / `hasSequence()` / `size()`**: Removed the `m_manual_store` lookup path; all data now lives in a single `SmartStrategy`-managed store.
+- **`FastqTests.cpp`**: Replaced fragile relative path (`../test_data/simple.fastq`) with a self-generated temp file. Tests now pass regardless of working directory.
+
+### 🧪 Testing
+
+- **+12 new test cases** (57 → 69), **+56 new assertions** (3776 → 3832)
+- **NGSIndex correctness**: FASTA load/lookup, FASTQ load/lookup, save/restore round-trip via NGSIndex
+- **Real parallel GZIP coverage**: Two concatenated streams totalling >1 MB (1200 records × 500-char sequences each), verifying `loadGzipParallel` is actually exercised (previous test used tiny data below the 1 MB threshold and fell through to single-stream path)
+- **RNA FASTA format detection**: `FileFormat::RNA_FASTA` triggered by U-containing sequences
+- **Protein FASTA format detection**: `FileFormat::PROTEIN_FASTA` triggered by protein amino acid sequences
+- **`clearCache()` + reload**: Verifies no dangling string_view into old `text_arena_` after clear and re-load
+- **v1 binary format round-trip**: In-memory construction of a `TRO\x01` blob, written to disk and loaded via `loadBinary()`, verifying backward-compatibility of the v1 format
+- **`Cache::getView()` coverage**: Basic zero-copy view test via public Cache API
+- **`Cache::set()` + `save()` + `restore()`**: Verifies manually-added entries survive a save/restore cycle
+
+---
+
 ## [1.3.0] — v1.3.0 "Hrunting" (2026-06-23)
 
 ### ✨ Added

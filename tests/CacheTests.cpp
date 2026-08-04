@@ -2,6 +2,7 @@
 #include <fstream>
 #include <filesystem>
 #include "Cache.h"
+#include "SmartStrategy.h"
 
 TEST_CASE("Cache Functionality", "[cache]") {
 
@@ -141,5 +142,68 @@ TEST_CASE("Cache Functionality", "[cache]") {
         // Cleanup
         std::filesystem::remove(src_filename);
         std::filesystem::remove(bin_filename);
+    }
+}
+
+TEST_CASE("Cache::getView returns zero-copy view", "[cache]") {
+    std::string fasta_path = "tmp_cache_getview.fasta";
+    {
+        std::ofstream out(fasta_path);
+        out << ">alpha\nACGTTGCA\n>beta\nTTTTAAAA\n";
+    }
+
+    TracEon::Cache cache;
+    cache.loadFile(fasta_path);
+
+    std::string_view v = cache.getView("alpha");
+    REQUIRE(v == "ACGTTGCA");
+    REQUIRE(cache.getView("beta") == "TTTTAAAA");
+    REQUIRE(cache.getView("nonexistent").empty());
+
+    std::filesystem::remove(fasta_path);
+}
+
+TEST_CASE("Cache::set() entries are persisted by save()", "[cache]") {
+    std::string bin_path = "tmp_set_persist.bin";
+
+    TracEon::Cache cache1;
+    cache1.set("manual_key", "ACGT");
+    cache1.set("another_key", "GGGG");
+    REQUIRE(cache1.size() == 2);
+
+    cache1.save(bin_path);
+
+    TracEon::Cache cache2;
+    cache2.restore(bin_path);
+
+    REQUIRE(cache2.size() == 2);
+    REQUIRE(cache2.get("manual_key") == "ACGT");
+    REQUIRE(cache2.get("another_key") == "GGGG");
+
+    std::filesystem::remove(bin_path);
+}
+
+TEST_CASE("Cache IndexMode selection", "[cache]") {
+    SECTION("Default mode is GENOME") {
+        TracEon::Cache cache;
+        REQUIRE(cache.getIndexMode() == TracEon::IndexMode::GENOME);
+    }
+
+    SECTION("NGS mode is retained") {
+        TracEon::Cache cache(TracEon::IndexMode::NGS);
+        REQUIRE(cache.getIndexMode() == TracEon::IndexMode::NGS);
+
+        std::string fasta_path = "tmp_ngs_cache.fasta";
+        {
+            std::ofstream out(fasta_path);
+            out << ">read1\nACGT\n>read2\nTGCA\n";
+        }
+        cache.loadFile(fasta_path);
+        REQUIRE(cache.size() == 2);
+        REQUIRE(cache.get("read1") == "ACGT");
+        REQUIRE(cache.get("read2") == "TGCA");
+        REQUIRE(cache.getIndexMode() == TracEon::IndexMode::NGS);
+
+        std::filesystem::remove(fasta_path);
     }
 }

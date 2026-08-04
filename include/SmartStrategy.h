@@ -13,7 +13,8 @@
 #include <shared_mutex>
 #include <variant>
 #include <filesystem>
-#include <atomic> 
+#include <atomic>
+#include <functional>
 
 namespace TracEon {
 
@@ -49,7 +50,7 @@ enum class IndexMode { GENOME, NGS };
 
 class SmartStrategy : public IEncodingStrategy {
 public:
-    SmartStrategy();
+    explicit SmartStrategy(IndexMode mode = IndexMode::GENOME);
     virtual ~SmartStrategy();
 
     std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
@@ -95,7 +96,24 @@ private:
     // references/pointers to existing elements, so string_views into it are safe.
     std::deque<std::string> manual_store_;
 
+    // Running total of bytes held in manual_store_. Checked against
+    // getAvailableMemory() in addEntry() so manual entries — the only
+    // remaining unbounded growth path in this class — fail loudly instead
+    // of growing without limit.
+    std::atomic<size_t> manual_store_bytes_{0};
+
+    // Running total of the serialized (uncompressed) binary-cache payload
+    // size, updated incrementally at every record insertion point instead
+    // of being recomputed by walking the whole map at saveBinary() time.
+    // Starts at sizeof(uint64_t): serializePayload() always writes an 8-byte
+    // record-count header up front, even with zero records, so this base
+    // must be present from construction (not just after a parse/restore
+    // that calls refreshPayloadEstimate()) for addEntry()-only usage to
+    // produce a correct estimate.
+    mutable std::atomic<size_t> serialized_size_estimate_{sizeof(uint64_t)};
+
     FileFormat detected_format_;
+    IndexMode index_mode_;
     mutable std::shared_mutex cache_mutex_;
 
     /**
@@ -112,10 +130,12 @@ private:
     void clearInternal();
 
     /**
-     * @brief Serialize payload (count + all records) into a buffer.
-     * Used by saveBinary() for both v1 and v2 formats.
+     * @brief Serialize payload (count + all records), pushing bytes through
+     * `sink` as they're produced rather than materializing a full in-memory
+     * copy. Used by saveBinary() (v3 streaming format) so peak memory during
+     * save stays bounded regardless of dataset size.
      */
-    void serializePayload(std::vector<char>& buf) const;
+    void serializePayload(const std::function<void(const char*, size_t)>& sink) const;
 
     /**
      * @brief Choose a compression algorithm based on payload size and detected format.
@@ -125,6 +145,23 @@ private:
      *  2. everything else                              → LZ4Default
      */
     CompressionMode selectCompressionStrategy(size_t payload_size) const;
+
+    /**
+     * @brief Serialized (uncompressed) payload size, used to pick LZ4 vs
+     * LZ4HC before streaming starts (selectCompressionStrategy() needs a
+     * size up front). Backed by serialized_size_estimate_, which is updated
+     * incrementally at every record insertion rather than recomputed by
+     * walking the whole map here.
+     */
+    size_t estimatePayloadSize() const;
+
+    /**
+     * @brief Recompute serialized_size_estimate_ by walking file_cache_.
+     * Called once after a full (re)parse or binary-cache restore where the
+     * exact size isn't already known for free; addEntry() maintains the
+     * estimate incrementally after this point without needing another walk.
+     */
+    void refreshPayloadEstimate();
 
     /**
      * @brief Scan a compressed GZIP file for stream boundaries.

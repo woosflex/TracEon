@@ -17,7 +17,9 @@
 #include <zlib.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <lz4frame.h>
 #include <new>
+#include <atomic>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -63,9 +65,18 @@ struct MMapHandle {
 };
 
 static const char MAGIC_BYTES_V1[] = "TRO\x01"; // v1.1 format (uncompressed)
-static const char MAGIC_BYTES_V2[] = "TRO\x02"; // v1.3 format (LZ4-compressed)
+static const char MAGIC_BYTES_V2[] = "TRO\x02"; // v1.3 format (LZ4-compressed, single block)
+static const char MAGIC_BYTES_V3[] = "TRO\x03"; // v1.5 format (LZ4 Frame, streamed)
 
-SmartStrategy::SmartStrategy() : detected_format_(FileFormat::UNKNOWN), file_cache_(GenomeIndex{}) {}
+// Streaming (de)compression chunk size for the v3 binary cache format.
+// Bounds peak memory during saveBinary()/loadBinary() to a small constant
+// regardless of dataset size (see ADR-004 follow-up: streaming binary cache).
+static constexpr size_t STREAM_CHUNK_SIZE = 1024 * 1024; // 1MB
+
+SmartStrategy::SmartStrategy(IndexMode mode)
+    : detected_format_(FileFormat::UNKNOWN),
+      index_mode_(mode),
+      file_cache_(mode == IndexMode::NGS ? std::variant<GenomeIndex, NGSIndex>(NGSIndex{}) : std::variant<GenomeIndex, NGSIndex>(GenomeIndex{})) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
 
 std::vector<unsigned char> SmartStrategy::encode(const std::string& data, DataTypeHint hint) const {
@@ -85,6 +96,10 @@ void SmartStrategy::clearInternal() {
     text_arena_.clear();
     text_arena_.shrink_to_fit();
     manual_store_.clear();
+    manual_store_bytes_.store(0, std::memory_order_relaxed);
+    // sizeof(uint64_t): serializePayload()'s record-count header is always
+    // present, even for an empty cache (see serialized_size_estimate_ decl).
+    serialized_size_estimate_.store(sizeof(uint64_t), std::memory_order_relaxed);
     mmap_handle_.reset();
 }
 
@@ -95,21 +110,55 @@ void SmartStrategy::clearCache() {
 
 void SmartStrategy::addEntry(const std::string& id, const std::string& seq, const std::string& qual) {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-    data_ready_.store(false, std::memory_order_release);
+
+    // OOM guard: manual_store_ is the only remaining unbounded growth path
+    // in this class (every load path already guards its own allocations).
+    // Fail loudly instead of growing without limit.
+    const size_t entry_bytes = id.size() + seq.size() + qual.size();
+    const size_t projected = manual_store_bytes_.load(std::memory_order_relaxed) + entry_bytes;
+    const size_t avail_mem = getAvailableMemory();
+    if (avail_mem > 0 && projected > avail_mem / 2) {
+        throw std::runtime_error(
+            "SmartStrategy OOM guard: addEntry() would grow manual_store_ to " +
+            std::to_string(projected) + " bytes (available memory ~" +
+            std::to_string(avail_mem) + " bytes)");
+    }
+
+    // Do NOT flip data_ready_ to false here. getView() checks data_ready_ without
+    // holding a lock (lock-free fast path), so a false→true toggle would cause
+    // concurrent readers to see empty results during the window. The unique_lock
+    // already prevents map corruption; just emit true at the end.
 
     // Store copies in manual_store_ (std::deque: push_back never invalidates
     // references to existing elements, so these string_views stay valid).
-    manual_store_.push_back(id);
-    std::string_view id_view(manual_store_.back());
-    manual_store_.push_back(seq);
-    std::string_view seq_view(manual_store_.back());
-    manual_store_.push_back(qual);
-    std::string_view qual_view(manual_store_.back());
+    // The proactive check above uses system-wide available memory, which a
+    // ulimit/cgroup-constrained process can still exceed sooner — catch
+    // bad_alloc here too so that case throws the same descriptive error
+    // instead of an unguarded std::bad_alloc.
+    std::string_view id_view, seq_view, qual_view;
+    try {
+        manual_store_.push_back(id);
+        id_view = manual_store_.back();
+        manual_store_.push_back(seq);
+        seq_view = manual_store_.back();
+        manual_store_.push_back(qual);
+        qual_view = manual_store_.back();
+    } catch (const std::bad_alloc&) {
+        std::cerr << "SmartStrategy OOM: failed to allocate " << entry_bytes
+                  << " bytes for addEntry()" << std::endl;
+        throw;
+    }
+    manual_store_bytes_.fetch_add(entry_bytes, std::memory_order_relaxed);
 
     if (std::holds_alternative<GenomeIndex>(file_cache_)) {
         std::get<GenomeIndex>(file_cache_).emplace(id, SequenceView{id_view, seq_view, qual_view});
+        serialized_size_estimate_.fetch_add(
+            3 * sizeof(uint32_t) + id.size() + seq.size() + qual.size(), std::memory_order_relaxed);
     } else {
         std::get<NGSIndex>(file_cache_).emplace(hash_key(id), SequenceView{id_view, seq_view, qual_view});
+        serialized_size_estimate_.fetch_add(
+            sizeof(uint64_t) + 3 * sizeof(uint32_t) + id.size() + seq.size() + qual.size(),
+            std::memory_order_relaxed);
     }
     data_ready_.store(true, std::memory_order_release);
 }
@@ -168,26 +217,84 @@ static constexpr size_t PARALLEL_GZIP_THRESHOLD = 1024 * 1024; // 1MB
 std::vector<size_t> SmartStrategy::scanGzipStreams(const std::string& filepath) const {
     std::vector<size_t> offsets;
 
-    std::ifstream f(filepath, std::ios::binary | std::ios::ate);
-    if (!f) return offsets;
+    // mmap instead of reading the whole compressed file into a heap buffer:
+    // loadGzipParallel() mmaps this same file again immediately afterwards,
+    // so a full heap read here was a redundant full-size copy of the
+    // compressed input held in memory purely to scan for magic bytes.
+    MMapHandle mmap_scan;
+#ifdef _WIN32
+    mmap_scan.hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (mmap_scan.hFile == INVALID_HANDLE_VALUE) return offsets;
+    LARGE_INTEGER fs{};
+    if (!GetFileSizeEx(mmap_scan.hFile, &fs)) return offsets;
+    mmap_scan.size = static_cast<size_t>(fs.QuadPart);
+    if (mmap_scan.size < 18) return offsets; // Too small to contain even one GZIP stream
+    mmap_scan.hMap = CreateFileMappingA(mmap_scan.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mmap_scan.hMap) return offsets;
+    mmap_scan.data = MapViewOfFile(mmap_scan.hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!mmap_scan.data) return offsets;
+#else
+    mmap_scan.fd = open(filepath.c_str(), O_RDONLY);
+    if (mmap_scan.fd == -1) return offsets;
+    struct stat sb{};
+    if (fstat(mmap_scan.fd, &sb) == -1) return offsets;
+    mmap_scan.size = static_cast<size_t>(sb.st_size);
+    if (mmap_scan.size < 18) return offsets; // Too small to contain even one GZIP stream
+    mmap_scan.data = ::mmap(NULL, mmap_scan.size, PROT_READ, MAP_PRIVATE, mmap_scan.fd, 0);
+    if (mmap_scan.data == MAP_FAILED) return offsets;
+#endif
 
-    size_t file_size = static_cast<size_t>(f.tellg());
-    if (file_size < 18) return offsets; // Too small to contain even one GZIP stream
+    const unsigned char* compressed = static_cast<const unsigned char*>(mmap_scan.data);
+    size_t file_size = mmap_scan.size;
 
-    // Read entire compressed file into memory for scanning
-    std::vector<unsigned char> compressed(file_size);
-    f.seekg(0);
-    if (!f.read(reinterpret_cast<char*>(compressed.data()), file_size)) return offsets;
+    // Find real stream boundaries by actually decoding each member with zlib
+    // rather than scanning for the 0x1f 0x8b 0x08 magic bytes in isolation.
+    // Highly-compressible genomic payloads make that byte sequence common
+    // enough to appear *inside* a single member's compressed data purely by
+    // chance (observed in practice: NCBI single-member FASTA.gz files with
+    // 2-3 "matches" that were never real stream headers). Splitting at a
+    // bogus offset feeds inflate() a truncated/misaligned deflate stream,
+    // which can decode into gigabytes of garbage via LZ77 back-references —
+    // not a real OOM, but indistinguishable from one without this fix.
+    //
+    // Output is discarded into a small reusable scratch buffer: we only need
+    // to know where each member's compressed data ends (via inflate's
+    // avail_in bookkeeping and Z_STREAM_END), not the decompressed content
+    // itself, so this dry run stays cheap and constant-memory regardless of
+    // file size.
+    std::vector<char> scratch(64 * 1024);
+    size_t offset = 0;
+    while (offset + 3 <= file_size &&
+           compressed[offset] == 0x1f && compressed[offset + 1] == 0x8b &&
+           compressed[offset + 2] == 0x08) {
+        offsets.push_back(offset);
 
-    // Scan for GZIP header magic: 0x1f 0x8b, followed by CM byte (must be 0x08 = deflate).
-    // Requiring CM == 0x08 prevents false positives from 0x1f 0x8b appearing in payload.
-    for (size_t i = 0; i + 2 < file_size; ++i) {
-        if (compressed[i] == 0x1f && compressed[i + 1] == 0x8b && compressed[i + 2] == 0x08) {
-            offsets.push_back(i);
+        z_stream strm = {};
+        if (inflateInit2(&strm, 15 + 16) != Z_OK) break;
+        strm.next_in  = const_cast<Bytef*>(compressed + offset);
+        strm.avail_in = static_cast<uInt>(file_size - offset);
+
+        int ret = Z_OK;
+        while (ret != Z_STREAM_END) {
+            strm.next_out  = reinterpret_cast<Bytef*>(scratch.data());
+            strm.avail_out = static_cast<uInt>(scratch.size());
+            ret = inflate(&strm, Z_NO_FLUSH);
+            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR || ret == Z_BUF_ERROR) {
+                // Not a genuine member boundary (or truncated stream) —
+                // stop scanning; loadGzipParallel/loadGzipSingleStream will
+                // surface the real error when they attempt full decoding.
+                break;
+            }
         }
+
+        size_t consumed = (file_size - offset) - strm.avail_in;
+        inflateEnd(&strm);
+        if (ret != Z_STREAM_END || consumed == 0) break;
+        offset += consumed;
     }
 
-    // Fallback: if no header found (shouldn't happen for valid GZIP), return offset 0
+    // Fallback: if no valid header found (shouldn't happen for valid GZIP), return offset 0
     if (offsets.empty()) offsets.push_back(0);
 
     return offsets;
@@ -222,7 +329,6 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
     size_t file_size = mmap->size;
 
     size_t num_streams = stream_offsets.size();
-    size_t avail_mem = getAvailableMemory();
 
     // Build per-stream compressed sizes
     std::vector<size_t> stream_compressed_sizes(num_streams);
@@ -238,16 +344,36 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
     std::vector<std::vector<char>> decompressed_chunks(num_streams);
     std::vector<std::string> thread_errors(num_streams);
 
+    // Shared budget so concurrently-growing per-stream buffers within the
+    // *current batch* can't collectively exceed available memory. Streams
+    // from earlier batches are merged into text_arena_ and freed as soon as
+    // their batch joins (see batch loop below), so this only ever needs to
+    // account for the up-to-`num_threads` streams live right now — not every
+    // stream in the whole file.
+    std::atomic<size_t> total_reserved_bytes{0};
+    // Refreshed at the start of every batch so the guard reacts to memory
+    // the OS has reclaimed since the previous batch's buffers were freed,
+    // rather than working off one stale snapshot for the whole file.
+    size_t avail_mem = getAvailableMemory();
+
     auto decompress_stream = [&](size_t stream_idx) {
         const unsigned char* src = compressed_data + stream_offsets[stream_idx];
         size_t src_size = stream_compressed_sizes[stream_idx];
 
         size_t estimated = src_size * 3;
         if (avail_mem > 0)
-            estimated = std::min(estimated, avail_mem / 4 / num_streams);
+            estimated = std::min(estimated, avail_mem / 4 / num_threads);
+        size_t reserve_size = estimated > 0 ? estimated : src_size * 3;
 
         auto& out = decompressed_chunks[stream_idx];
-        out.resize(estimated > 0 ? estimated : src_size * 3);
+        try {
+            out.resize(reserve_size);
+        } catch (const std::bad_alloc&) {
+            thread_errors[stream_idx] = "OOM: failed to allocate " +
+                std::to_string(reserve_size) + " bytes for stream decompression";
+            return;
+        }
+        total_reserved_bytes.fetch_add(reserve_size, std::memory_order_relaxed);
 
         z_stream strm = {};
         if (inflateInit2(&strm, 15 + 16) != Z_OK) {
@@ -261,10 +387,32 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
         size_t write_pos = 0;
         int ret = Z_OK;
 
+        // Grows `out` geometrically, guarding against both a single
+        // allocation failure and the combined budget across all threads.
+        auto grow = [&]() -> bool {
+            size_t old_size = out.size();
+            size_t new_size = old_size * 2;
+            if (avail_mem > 0 &&
+                total_reserved_bytes.load(std::memory_order_relaxed) + (new_size - old_size) > avail_mem / 2) {
+                thread_errors[stream_idx] = "OOM guard: aggregate GZIP stream buffers "
+                    "would exceed available memory budget";
+                return false;
+            }
+            try {
+                out.resize(new_size);
+            } catch (const std::bad_alloc&) {
+                thread_errors[stream_idx] = "OOM: failed to grow stream buffer to " +
+                    std::to_string(new_size) + " bytes";
+                return false;
+            }
+            total_reserved_bytes.fetch_add(new_size - old_size, std::memory_order_relaxed);
+            return true;
+        };
+
         while (ret != Z_STREAM_END) {
             // Geometric growth if buffer is full
             if (write_pos == out.size()) {
-                out.resize(out.size() * 2);
+                if (!grow()) { inflateEnd(&strm); return; }
             }
 
             strm.next_out  = reinterpret_cast<Bytef*>(out.data() + write_pos);
@@ -282,7 +430,7 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
 
             if (ret == Z_BUF_ERROR) {
                 // Output full but not done — grow and continue
-                out.resize(out.size() * 2);
+                if (!grow()) { inflateEnd(&strm); return; }
                 continue;
             }
         }
@@ -292,40 +440,53 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
         out.shrink_to_fit();
     };
 
-    // Spawn threads in batches of num_threads
+    // Spawn threads in batches of num_threads. Streams are processed in
+    // index order (batch_start increases monotonically, indices within a
+    // batch are in order), so merging into text_arena_ immediately after
+    // each batch joins — rather than once at the very end — preserves
+    // stream order while keeping at most num_threads decompressed buffers
+    // alive at any given time. This is what lets the OOM guard's
+    // `total_reserved_bytes` reflect real concurrent memory use instead of
+    // accumulating across every stream in the file.
+    text_arena_.clear();
     for (size_t batch_start = 0; batch_start < num_streams; batch_start += num_threads) {
         size_t batch_end = std::min(batch_start + num_threads, num_streams);
+
+        // Refresh the available-memory reading for this batch so the guard
+        // reacts to memory freed by previously-merged batches instead of
+        // working off a snapshot taken before any decompression happened.
+        avail_mem = getAvailableMemory();
+        total_reserved_bytes.store(0, std::memory_order_relaxed);
+
         std::vector<std::thread> threads;
         for (size_t i = batch_start; i < batch_end; ++i) {
             threads.emplace_back(decompress_stream, i);
         }
         for (auto& t : threads) t.join();
+
+        // Check for per-thread errors before merging this batch.
+        for (size_t i = batch_start; i < batch_end; ++i) {
+            if (!thread_errors[i].empty()) {
+                mmap.reset();
+                throw std::runtime_error("Parallel GZIP stream " + std::to_string(i) +
+                                         " failed: " + thread_errors[i]);
+            }
+        }
+
+        // Merge this batch's chunks into text_arena_ and free them
+        // immediately so the next batch's memory budget starts fresh.
+        for (size_t i = batch_start; i < batch_end; ++i) {
+            auto& dc = decompressed_chunks[i];
+            size_t pos = text_arena_.size();
+            text_arena_.resize(pos + dc.size());
+            std::memcpy(text_arena_.data() + pos, dc.data(), dc.size());
+            dc.clear();
+            dc.shrink_to_fit();
+        }
     }
 
     // Release mmap — compressed data no longer needed
     mmap.reset();
-
-    // Check for per-thread errors (throw after joining all threads)
-    for (size_t i = 0; i < num_streams; ++i) {
-        if (!thread_errors[i].empty()) {
-            throw std::runtime_error("Parallel GZIP stream " + std::to_string(i) +
-                                     " failed: " + thread_errors[i]);
-        }
-    }
-
-    // Merge decompressed chunks into text_arena_ in stream order
-    size_t total = 0;
-    for (const auto& chunk : decompressed_chunks) total += chunk.size();
-
-    text_arena_.clear();
-    text_arena_.reserve(total);
-    for (auto& dc : decompressed_chunks) {
-        size_t pos = text_arena_.size();
-        text_arena_.resize(pos + dc.size());
-        std::memcpy(text_arena_.data() + pos, dc.data(), dc.size());
-        dc.clear();
-        dc.shrink_to_fit(); // Release per-stream memory as we go
-    }
 }
 
 void SmartStrategy::loadGzipSingleStream(const std::string& filepath) {
@@ -469,7 +630,7 @@ void SmartStrategy::parseArena() {
         return;
     }
     bool isFastq = (content[0] == '@');
-    bool use_ngs_mode = false; // Force Hybrid
+    bool use_ngs_mode = (index_mode_ == IndexMode::NGS);
     const size_t MULTITHREAD_THRESHOLD = 10 * 1024 * 1024;
 
     // Normalize multi-line FASTA in-place before any parser runs.
@@ -501,6 +662,10 @@ void SmartStrategy::parseArena() {
         }
     }
     determine_format_from_cache();
+    // One-time O(n) walk to seed serialized_size_estimate_ so saveBinary()
+    // doesn't need to re-walk the map on every call; addEntry() maintains
+    // this incrementally after this point.
+    refreshPayloadEstimate();
     data_ready_.store(true, std::memory_order_release);
 }
 
@@ -530,7 +695,25 @@ void SmartStrategy::loadFile(const std::string& filepath) {
     if (!file) throw std::runtime_error("Cannot open file: " + filepath);
     size_t fileSize = file.tellg();
     file.seekg(0, std::ios::beg);
-    text_arena_.resize(fileSize);
+
+    // OOM guard: mirrors loadGzipSingleStream's reserve-with-catch pattern.
+    // Uncompressed loads have no size-reduction headroom (unlike GZIP, where
+    // the compressed size hints at a smaller footprint), so we only guard
+    // against an implausible allocation relative to available memory.
+    const size_t avail_mem = getAvailableMemory();
+    if (avail_mem > 0 && fileSize > avail_mem / 2) {
+        throw std::runtime_error(
+            "SmartStrategy OOM guard: refusing to load " + std::to_string(fileSize) +
+            " bytes from " + filepath + " (available memory ~" +
+            std::to_string(avail_mem) + " bytes)");
+    }
+    try {
+        text_arena_.resize(fileSize);
+    } catch (const std::bad_alloc&) {
+        std::cerr << "SmartStrategy OOM: failed to allocate " << fileSize
+                  << " bytes for " << filepath << std::endl;
+        throw;
+    }
     if (!file.read(text_arena_.data(), fileSize)) throw std::runtime_error("Read failed");
     parseArena();
 }
@@ -682,48 +865,80 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
     }
 }
 
-void SmartStrategy::serializePayload(std::vector<char>& buf) const {
+void SmartStrategy::serializePayload(const std::function<void(const char*, size_t)>& sink) const {
     uint8_t mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+
+    auto emit = [&sink](const void* p, size_t n) {
+        sink(reinterpret_cast<const char*>(p), n);
+    };
 
     if (mode == 0) {
         const auto& map = std::get<GenomeIndex>(file_cache_);
         uint64_t count = map.size();
-        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+        emit(&count, sizeof(count));
 
         for (const auto& [key, view] : map) {
             uint32_t len = static_cast<uint32_t>(key.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            buf.insert(buf.end(), key.data(), key.data() + len);
+            emit(&len, sizeof(len));
+            emit(key.data(), len);
 
             len = static_cast<uint32_t>(view.sequence.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+            emit(&len, sizeof(len));
+            emit(view.sequence.data(), len);
 
             len = static_cast<uint32_t>(view.quality.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
+            emit(&len, sizeof(len));
+            if (len > 0) emit(view.quality.data(), len);
         }
     } else {
         const auto& map = std::get<NGSIndex>(file_cache_);
         uint64_t count = map.size();
-        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+        emit(&count, sizeof(count));
 
         for (const auto& [key, view] : map) {
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&key), reinterpret_cast<const char*>(&key) + sizeof(key));
+            emit(&key, sizeof(key));
 
             uint32_t len = static_cast<uint32_t>(view.id.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            buf.insert(buf.end(), view.id.data(), view.id.data() + len);
+            emit(&len, sizeof(len));
+            emit(view.id.data(), len);
 
             len = static_cast<uint32_t>(view.sequence.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            buf.insert(buf.end(), view.sequence.data(), view.sequence.data() + len);
+            emit(&len, sizeof(len));
+            emit(view.sequence.data(), len);
 
             len = static_cast<uint32_t>(view.quality.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
-            if (len > 0) buf.insert(buf.end(), view.quality.data(), view.quality.data() + len);
+            emit(&len, sizeof(len));
+            if (len > 0) emit(view.quality.data(), len);
         }
     }
+}
+
+size_t SmartStrategy::estimatePayloadSize() const {
+    // O(1): backed by serialized_size_estimate_, kept exact and up to date
+    // by refreshPayloadEstimate() (called once after a fresh parse/restore)
+    // and addEntry() (incremental updates thereafter). This must stay byte-
+    // exact with serializePayload()'s actual output — loadBinary() relies on
+    // it to pre-size text_arena_ before streaming decompression.
+    return serialized_size_estimate_.load(std::memory_order_relaxed);
+}
+
+void SmartStrategy::refreshPayloadEstimate() {
+    // Mirrors serializePayload()'s byte layout without writing anything.
+    // Only called after a full (re)parse/restore — NOT on saveBinary()'s hot
+    // path — so repeated saveBinary() calls don't re-walk the whole map.
+    size_t total = sizeof(uint64_t); // record count
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        const auto& map = std::get<GenomeIndex>(file_cache_);
+        for (const auto& [key, view] : map) {
+            total += 3 * sizeof(uint32_t) + key.size() + view.sequence.size() + view.quality.size();
+        }
+    } else {
+        const auto& map = std::get<NGSIndex>(file_cache_);
+        for (const auto& [key, view] : map) {
+            total += sizeof(key) + 3 * sizeof(uint32_t) + view.id.size() + view.sequence.size() + view.quality.size();
+        }
+    }
+    serialized_size_estimate_.store(total, std::memory_order_relaxed);
 }
 
 CompressionMode
@@ -749,43 +964,70 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
     std::ofstream out(filepath, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot write: " + filepath);
 
-    // Serialize uncompressed payload
-    std::vector<char> payload;
-    serializePayload(payload);
+    // v3 format: stream-serialize + stream-compress via LZ4 Frame (LZ4F)
+    // instead of materializing a full serialized "payload" copy plus a full
+    // "compressed" copy of the whole dataset (the old v2 path's ~3x peak
+    // memory: text_arena_ + payload + compressed, all resident at once).
+    // Peak extra memory here is bounded by STREAM_CHUNK_SIZE regardless of
+    // dataset size.
+    const size_t estimated_size = estimatePayloadSize();
+    const CompressionMode comp_mode = selectCompressionStrategy(estimated_size);
 
-    const CompressionMode comp_mode = selectCompressionStrategy(payload.size());
-    const size_t max_compressed = static_cast<size_t>(
-        LZ4_compressBound(static_cast<int>(payload.size())));
-    std::vector<char> compressed(max_compressed);
-
-    int compressed_size = 0;
-    if (comp_mode == CompressionMode::LZ4HC) {
-        compressed_size = LZ4_compress_HC(
-            payload.data(), compressed.data(),
-            static_cast<int>(payload.size()),
-            static_cast<int>(max_compressed),
-            LZ4HC_CLEVEL_DEFAULT);
-    } else {
-        compressed_size = LZ4_compress_default(
-            payload.data(), compressed.data(),
-            static_cast<int>(payload.size()),
-            static_cast<int>(max_compressed));
-    }
-
-    if (compressed_size <= 0)
-        throw std::runtime_error("LZ4 compression failed for binary cache: " + filepath);
-    compressed.resize(static_cast<size_t>(compressed_size));
-
-    // Write v2 format: magic | index_mode | original_size | compressed_size | compressed_data
-    out.write(MAGIC_BYTES_V2, 4);
+    out.write(MAGIC_BYTES_V3, 4);
     uint8_t index_mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&index_mode), 1);
-
-    uint64_t original_size = static_cast<uint64_t>(payload.size());
-    uint64_t compressed_len = static_cast<uint64_t>(compressed_size);
+    uint64_t original_size = static_cast<uint64_t>(estimated_size);
     out.write(reinterpret_cast<const char*>(&original_size), sizeof(original_size));
-    out.write(reinterpret_cast<const char*>(&compressed_len), sizeof(compressed_len));
-    out.write(compressed.data(), compressed_size);
+
+    LZ4F_preferences_t prefs;
+    std::memset(&prefs, 0, sizeof(prefs));
+    prefs.compressionLevel = (comp_mode == CompressionMode::LZ4HC) ? LZ4HC_CLEVEL_DEFAULT : 0;
+
+    LZ4F_cctx* cctx = nullptr;
+    if (LZ4F_isError(LZ4F_createCompressionContext(&cctx, LZ4F_VERSION)))
+        throw std::runtime_error("LZ4F_createCompressionContext failed: " + filepath);
+
+    struct CtxGuard {
+        LZ4F_cctx* c;
+        ~CtxGuard() { if (c) LZ4F_freeCompressionContext(c); }
+    } guard{cctx};
+
+    std::vector<char> in_buf;
+    in_buf.reserve(STREAM_CHUNK_SIZE);
+    std::vector<char> out_buf(std::max(LZ4F_compressBound(STREAM_CHUNK_SIZE, &prefs),
+                                        static_cast<size_t>(64 * 1024)));
+
+    size_t header_size = LZ4F_compressBegin(cctx, out_buf.data(), out_buf.size(), &prefs);
+    if (LZ4F_isError(header_size))
+        throw std::runtime_error("LZ4F_compressBegin failed: " + filepath);
+    out.write(out_buf.data(), static_cast<std::streamsize>(header_size));
+
+    auto flush_chunk = [&](const char* data, size_t len) {
+        size_t bound = LZ4F_compressBound(len, &prefs);
+        if (out_buf.size() < bound) out_buf.resize(bound);
+        size_t written = LZ4F_compressUpdate(cctx, out_buf.data(), out_buf.size(),
+                                              data, len, nullptr);
+        if (LZ4F_isError(written))
+            throw std::runtime_error("LZ4F_compressUpdate failed: " + filepath);
+        if (written > 0) out.write(out_buf.data(), static_cast<std::streamsize>(written));
+    };
+
+    serializePayload([&](const char* data, size_t len) {
+        in_buf.insert(in_buf.end(), data, data + len);
+        if (in_buf.size() >= STREAM_CHUNK_SIZE) {
+            flush_chunk(in_buf.data(), in_buf.size());
+            in_buf.clear();
+        }
+    });
+    if (!in_buf.empty()) {
+        flush_chunk(in_buf.data(), in_buf.size());
+        in_buf.clear();
+    }
+
+    size_t end_size = LZ4F_compressEnd(cctx, out_buf.data(), out_buf.size(), nullptr);
+    if (LZ4F_isError(end_size))
+        throw std::runtime_error("LZ4F_compressEnd failed: " + filepath);
+    out.write(out_buf.data(), static_cast<std::streamsize>(end_size));
 
     if (!out) throw std::runtime_error("Binary cache write failed: " + filepath);
 }
@@ -846,6 +1088,9 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
 
     uint8_t mode;
     std::memcpy(&mode, safe_advance(1), 1);
+    // Sync index_mode_ with what's stored in the binary so that subsequent
+    // loadFile() / parseArena() calls use the same index type as restored data.
+    index_mode_ = (mode == 1) ? IndexMode::NGS : IndexMode::GENOME;
 
     // --- V2 Format (LZ4-compressed) ---
     if (format_version == 0x02) {
@@ -879,6 +1124,112 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
         auto arena_safe_advance = [&](size_t n) -> const char* {
             if (arena_ptr + n > arena_end)
                 throw std::runtime_error("Binary cache v2 payload is corrupt: " + filepath);
+            const char* result = arena_ptr;
+            arena_ptr += n;
+            return result;
+        };
+
+        uint64_t count;
+        std::memcpy(&count, arena_safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
+        if (count > MAX_RECORDS)
+            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+
+        if (mode == 0) {
+            file_cache_ = GenomeIndex{};
+            auto& map = std::get<GenomeIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+            }
+        } else {
+            file_cache_ = NGSIndex{};
+            auto& map = std::get<NGSIndex>(file_cache_);
+            map.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t hash; std::memcpy(&hash, arena_safe_advance(8), 8);
+                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
+                std::string_view id_view(arena_safe_advance(len), len);
+                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
+                std::string_view seq(arena_safe_advance(seq_len), seq_len);
+                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
+                std::string_view qual;
+                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
+                map.emplace(hash, SequenceView{id_view, seq, qual});
+            }
+        }
+    }
+    // --- V3 Format (LZ4 Frame, streamed) ---
+    else if (format_version == 0x03) {
+        uint64_t original_size;
+        std::memcpy(&original_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+
+        const char* frame_data = ptr; // remaining mmap'd bytes are the LZ4F frame
+        const size_t frame_size = static_cast<size_t>(end - ptr);
+
+        // OOM guard: mirrors the pattern used by loadFile()/loadGzipSingleStream().
+        const size_t avail_mem = getAvailableMemory();
+        if (avail_mem > 0 && original_size > avail_mem / 2) {
+            throw std::runtime_error(
+                "SmartStrategy OOM guard: refusing to decompress " +
+                std::to_string(original_size) + " bytes from " + filepath +
+                " (available memory ~" + std::to_string(avail_mem) + " bytes)");
+        }
+        try {
+            text_arena_.resize(original_size);
+        } catch (const std::bad_alloc&) {
+            std::cerr << "SmartStrategy OOM: failed to allocate " << original_size
+                      << " bytes for " << filepath << std::endl;
+            throw;
+        }
+
+        LZ4F_dctx* dctx = nullptr;
+        if (LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION)))
+            throw std::runtime_error("LZ4F_createDecompressionContext failed: " + filepath);
+        struct DctxGuard {
+            LZ4F_dctx* d;
+            ~DctxGuard() { if (d) LZ4F_freeDecompressionContext(d); }
+        } dguard{dctx};
+
+        const char* src = frame_data;
+        size_t src_remaining = frame_size;
+        char* dst = text_arena_.data();
+        size_t dst_remaining = text_arena_.size();
+        size_t hint = 1;
+
+        while (hint != 0 && src_remaining > 0) {
+            size_t dst_size = dst_remaining;
+            size_t src_size = src_remaining;
+            hint = LZ4F_decompress(dctx, dst, &dst_size, src, &src_size, nullptr);
+            if (LZ4F_isError(hint))
+                throw std::runtime_error("LZ4F_decompress failed for binary cache: " + filepath);
+            dst += dst_size;
+            dst_remaining -= dst_size;
+            src += src_size;
+            src_remaining -= src_size;
+            if (dst_size == 0 && src_size == 0 && hint != 0) break; // no progress; malformed frame
+        }
+        if (dst_remaining != 0)
+            throw std::runtime_error("Binary cache v3 decompressed size mismatch: " + filepath);
+
+        // Release mmap handle since we now own the data in text_arena_
+        mmap_handle_.reset();
+
+        // Parse from text_arena_
+        const char* arena_ptr = text_arena_.data();
+        const char* arena_end = arena_ptr + text_arena_.size();
+
+        auto arena_safe_advance = [&](size_t n) -> const char* {
+            if (arena_ptr + n > arena_end)
+                throw std::runtime_error("Binary cache v3 payload is corrupt: " + filepath);
             const char* result = arena_ptr;
             arena_ptr += n;
             return result;
@@ -966,6 +1317,10 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     }
 
     determine_format_from_cache();
+    // One-time O(n) walk to seed serialized_size_estimate_ for a subsequent
+    // saveBinary() (e.g. re-saving after restoring + addEntry()'ing more
+    // data); addEntry() maintains it incrementally after this point.
+    refreshPayloadEstimate();
     data_ready_.store(true, std::memory_order_release);
 }
 

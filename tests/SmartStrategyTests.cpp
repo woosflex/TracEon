@@ -6,6 +6,12 @@
 #include <thread>
 #include <atomic>
 #include <zlib.h>
+#include <lz4.h>
+#include <cstring>
+#include <cstdint>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -130,6 +136,76 @@ TEST_CASE("addEntry stores data with stable string_views", "[strategy][addentry]
     REQUIRE(strategy.getQuality("manual_seq") == "IIIIIIII");
 }
 
+#ifndef _WIN32
+TEST_CASE("addEntry() throws instead of crashing when the process is memory-constrained",
+          "[strategy][addentry][errors][oom]") {
+    // addEntry()'s proactive guard compares against system-wide available
+    // memory (/proc/meminfo), which a ulimit/cgroup-constrained *process*
+    // can still exceed sooner. Lower RLIMIT_AS (virtual address space) to
+    // just above current usage, then confirm a large addEntry() throws
+    // (via the bad_alloc→runtime_error conversion) instead of crashing.
+    struct rlimit original{};
+    REQUIRE(getrlimit(RLIMIT_AS, &original) == 0);
+
+    // Build the source string *before* constraining the process — addEntry()
+    // makes its own independent copy of it (manual_store_.push_back), so
+    // the limit only needs headroom for one more ~64 MiB allocation on top
+    // of whatever's already resident (including this string itself).
+    TracEon::SmartStrategy strategy;
+    const std::string big_seq(64 * 1024 * 1024, 'A'); // 64 MiB
+
+    struct rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    struct rlimit constrained = original;
+    constexpr long headroom_kb = 16 * 1024; // 16 MiB — not enough for another 64 MiB copy
+    constrained.rlim_cur = static_cast<rlim_t>((usage.ru_maxrss + headroom_kb) * 1024);
+
+    bool limit_applied = (setrlimit(RLIMIT_AS, &constrained) == 0);
+
+    if (limit_applied) {
+        REQUIRE_THROWS(strategy.addEntry("big", big_seq, ""));
+        // Restore so the rest of the test binary isn't constrained.
+        setrlimit(RLIMIT_AS, &original);
+    } else {
+        WARN("setrlimit(RLIMIT_AS) not permitted in this environment — skipping OOM trigger check");
+    }
+}
+#endif
+
+TEST_CASE("Mixed loadFile() + addEntry() round-trips through saveBinary/loadBinary",
+          "[strategy][addentry][smart_compression]") {
+    // Exercises the combination of refreshPayloadEstimate() (seeded once by
+    // loadFile()/parseArena()) and addEntry()'s incremental updates on top
+    // of that base — a path not covered by the pure-file or pure-addEntry
+    // round-trip tests above.
+    const std::string src = "mixed_load_addentry.fasta";
+    const std::string bin = "mixed_load_addentry.bin";
+    {
+        std::ofstream out(src);
+        out << ">seq1\nACGT\n>seq2\nTGCA\n";
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    strategy.addEntry("manual1", "GATTACA", "IIIIIII");
+    strategy.addEntry("manual2", "CATCATCAT", "");
+    REQUIRE(strategy.getFileCacheSize() == 4);
+
+    strategy.saveBinary(bin);
+
+    TracEon::SmartStrategy restored;
+    restored.loadBinary(bin);
+    REQUIRE(restored.getFileCacheSize() == 4);
+    REQUIRE(restored.getSequence("seq1") == "ACGT");
+    REQUIRE(restored.getSequence("seq2") == "TGCA");
+    REQUIRE(restored.getSequence("manual1") == "GATTACA");
+    REQUIRE(restored.getQuality("manual1") == "IIIIIII");
+    REQUIRE(restored.getSequence("manual2") == "CATCATCAT");
+
+    fs::remove(src);
+    fs::remove(bin);
+}
+
 TEST_CASE("loadFile throws on missing file", "[strategy][errors]") {
     TracEon::SmartStrategy strategy;
     REQUIRE_THROWS_AS(strategy.loadFile("nonexistent_file_xyz.fasta"), std::runtime_error);
@@ -137,7 +213,7 @@ TEST_CASE("loadFile throws on missing file", "[strategy][errors]") {
 
 // ── Smart Compression tests ───────────────────────────────────────────────────
 
-TEST_CASE("Smart Compression — large DNA payload uses LZ4_HC (v2, better ratio)",
+TEST_CASE("Smart Compression — large DNA payload uses LZ4_HC (v3, better ratio)",
           "[strategy][smart_compression][lz4hc]") {
     const std::string src = "sc_large_dna.fasta";
     const std::string bin = "sc_large_dna.bin";
@@ -153,12 +229,12 @@ TEST_CASE("Smart Compression — large DNA payload uses LZ4_HC (v2, better ratio
     REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
     strategy.saveBinary(bin);
 
-    // Verify v2 magic (LZ4_HC and LZ4_default both write v2)
+    // Verify v3 magic (LZ4_HC and LZ4_default both write the streaming v3 format)
     {
         std::ifstream f(bin, std::ios::binary);
         char magic[4];
         f.read(magic, 4);
-        REQUIRE(magic[3] == '\x02');
+        REQUIRE(magic[3] == '\x03');
     }
 
     // LZ4_HC on homopolymer runs achieves extreme ratios — expect very small file
@@ -192,12 +268,12 @@ TEST_CASE("Smart Compression — large protein payload uses LZ4_default (not HC)
     REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::PROTEIN_FASTA);
     strategy.saveBinary(bin);
 
-    // v2 magic expected (payload is above 64 KiB, so not uncompressed)
+    // v3 magic expected (payload is above 64 KiB, so not uncompressed)
     {
         std::ifstream f(bin, std::ios::binary);
         char magic[4];
         f.read(magic, 4);
-        REQUIRE(magic[3] == '\x02');
+        REQUIRE(magic[3] == '\x03');
     }
 
     // Round-trip correctness
@@ -224,12 +300,12 @@ TEST_CASE("Smart Compression — small DNA payload uses LZ4_default (below HC th
     REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
     strategy.saveBinary(bin);
 
-    // v2 magic: LZ4_default path still writes v2
+    // v3 magic: LZ4_default path still writes the streaming v3 format
     {
         std::ifstream f(bin, std::ios::binary);
         char magic[4];
         f.read(magic, 4);
-        REQUIRE(magic[3] == '\x02');
+        REQUIRE(magic[3] == '\x03');
     }
 
     // Round-trip correctness
@@ -260,6 +336,92 @@ TEST_CASE("loadBinary rejects corrupt/truncated file", "[strategy][errors]") {
     TracEon::SmartStrategy strategy;
     REQUIRE_THROWS_AS(strategy.loadBinary(bad_file), std::runtime_error);
     fs::remove(bad_file);
+}
+
+// ── Backward compatibility: v1/v2 binary cache readers ──────────────────────
+// saveBinary() now always writes v3 (streaming LZ4 Frame), but loadBinary()
+// must still read caches written by older versions of TracEon. These tests
+// hand-construct valid v1 (uncompressed) and v2 (single-block LZ4) binaries
+// using the same layout the old writers produced, to verify the reader
+// branches for those formats were not broken by the v3 changes.
+
+static void write_genome_payload(std::vector<char>& buf, const std::vector<std::tuple<std::string, std::string, std::string>>& records) {
+    uint64_t count = records.size();
+    buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+    for (const auto& [id, seq, qual] : records) {
+        auto append_field = [&](const std::string& field) {
+            uint32_t len = static_cast<uint32_t>(field.size());
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&len), reinterpret_cast<const char*>(&len) + sizeof(len));
+            buf.insert(buf.end(), field.data(), field.data() + len);
+        };
+        append_field(id);
+        append_field(seq);
+        append_field(qual);
+    }
+}
+
+TEST_CASE("loadBinary reads legacy v1 (uncompressed) format", "[strategy][compat][v1]") {
+    std::string bin = "legacy_v1.bin";
+    std::vector<std::tuple<std::string, std::string, std::string>> records = {
+        {"seq1", "ACGT", ""}, {"seq2", "TGCA", "IIII"}
+    };
+    {
+        std::vector<char> payload;
+        write_genome_payload(payload, records);
+
+        std::ofstream out(bin, std::ios::binary);
+        out.write("TRO\x01", 4);
+        uint8_t mode = 0;
+        out.write(reinterpret_cast<const char*>(&mode), 1);
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadBinary(bin);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("seq1") == "ACGT");
+    REQUIRE(strategy.getSequence("seq2") == "TGCA");
+    REQUIRE(strategy.getQuality("seq2") == "IIII");
+
+    fs::remove(bin);
+}
+
+TEST_CASE("loadBinary reads legacy v2 (single-block LZ4) format", "[strategy][compat][v2]") {
+    std::string bin = "legacy_v2.bin";
+    std::vector<std::tuple<std::string, std::string, std::string>> records = {
+        {"seq1", "ACGT", ""}, {"seq2", "TGCA", "IIII"}
+    };
+    std::vector<char> payload;
+    write_genome_payload(payload, records);
+
+    const size_t max_compressed = static_cast<size_t>(LZ4_compressBound(static_cast<int>(payload.size())));
+    std::vector<char> compressed(max_compressed);
+    int compressed_size = LZ4_compress_default(payload.data(), compressed.data(),
+                                                static_cast<int>(payload.size()),
+                                                static_cast<int>(max_compressed));
+    REQUIRE(compressed_size > 0);
+    compressed.resize(static_cast<size_t>(compressed_size));
+
+    {
+        std::ofstream out(bin, std::ios::binary);
+        out.write("TRO\x02", 4);
+        uint8_t mode = 0;
+        out.write(reinterpret_cast<const char*>(&mode), 1);
+        uint64_t original_size = static_cast<uint64_t>(payload.size());
+        uint64_t compressed_len = static_cast<uint64_t>(compressed_size);
+        out.write(reinterpret_cast<const char*>(&original_size), sizeof(original_size));
+        out.write(reinterpret_cast<const char*>(&compressed_len), sizeof(compressed_len));
+        out.write(compressed.data(), compressed_size);
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadBinary(bin);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("seq1") == "ACGT");
+    REQUIRE(strategy.getSequence("seq2") == "TGCA");
+    REQUIRE(strategy.getQuality("seq2") == "IIII");
+
+    fs::remove(bin);
 }
 
 TEST_CASE("loadBinary rejects old MMAP format", "[strategy][errors]") {
@@ -1484,4 +1646,363 @@ TEST_CASE("Parallel GZIP — single-stream fallback unchanged", "[strategy][gzip
     REQUIRE(strategy.getSequence("chr2") == "TTTTGGGGCCCC");
 
     fs::remove(gz_path);
+}
+
+TEST_CASE("Parallel GZIP — two large streams actually exercise loadGzipParallel", "[strategy][gzip][parallel]") {
+    // Each compressed stream must exceed PARALLEL_GZIP_THRESHOLD/2 (512 KB) so
+    // the concatenated file is > 1 MB, triggering loadGzipParallel.
+    // FASTA nucleotide sequences compress very well with zlib (50-200:1 for
+    // periodic patterns). Solution: use gzip level 0 (store mode), which wraps
+    // data in a valid GZIP container without compression. This keeps the file
+    // size close to the uncompressed size, guaranteeing the threshold is crossed.
+
+    const int SEQ_LEN = 800;
+    const char BASES[] = "ACGT";
+
+    auto make_fasta = [&](const std::string& prefix, int count) {
+        std::string s;
+        for (int i = 0; i < count; ++i) {
+            s += '>';
+            s += prefix;
+            s += std::to_string(i);
+            s += '\n';
+            for (int j = 0; j < SEQ_LEN; ++j)
+                s += BASES[(i + j) % 4];
+            s += '\n';
+        }
+        return s;
+    };
+
+    // Each stream: 1500 records × ~800 bytes ≈ 1.2 MB.
+    // At gzip level 0 (no compression), file size ≈ uncompressed ≈ 1.2 MB per stream.
+    // Total: ~2.4 MB → well above PARALLEL_GZIP_THRESHOLD (1 MB).
+    std::string part1 = make_fasta("stream1_seq", 1500);
+    std::string part2 = make_fasta("stream2_seq", 1500);
+
+    std::string tmp1 = "tmp_large_stream1.gz";
+    std::string tmp2 = "tmp_large_stream2.gz";
+    std::string concat_path = "tmp_large_concat.fasta.gz";
+
+    // "wb0" = gzip store mode (level 0): valid GZIP format, no compression.
+    auto compress_stream = [](const std::string& data, const std::string& path) {
+        gzFile f = gzopen(path.c_str(), "wb0");
+        REQUIRE(f != nullptr);
+        gzwrite(f, data.data(), static_cast<unsigned>(data.size()));
+        gzclose(f);
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        size_t sz = static_cast<size_t>(in.tellg());
+        in.seekg(0);
+        std::vector<char> bytes(sz);
+        in.read(bytes.data(), sz);
+        return bytes;
+    };
+
+    auto bytes1 = compress_stream(part1, tmp1);
+    auto bytes2 = compress_stream(part2, tmp2);
+
+    {
+        std::ofstream out(concat_path, std::ios::binary);
+        out.write(bytes1.data(), bytes1.size());
+        out.write(bytes2.data(), bytes2.size());
+    }
+
+    // Guard: concatenated file must exceed threshold so this test is meaningful.
+    size_t concat_size = static_cast<size_t>(
+        std::filesystem::file_size(concat_path));
+    REQUIRE(concat_size > 1024 * 1024); // must trigger loadGzipParallel
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(concat_path);
+
+    REQUIRE(strategy.getFileCacheSize() == 3000);
+    REQUIRE(strategy.hasSequence("stream1_seq0"));
+    REQUIRE(static_cast<int>(strategy.getSequence("stream1_seq0").size()) == SEQ_LEN);
+    REQUIRE(strategy.hasSequence("stream1_seq1499"));
+    REQUIRE(strategy.hasSequence("stream2_seq0"));
+    REQUIRE(static_cast<int>(strategy.getSequence("stream2_seq0").size()) == SEQ_LEN);
+    REQUIRE(strategy.hasSequence("stream2_seq1499"));
+
+    fs::remove(tmp1);
+    fs::remove(tmp2);
+    fs::remove(concat_path);
+}
+
+TEST_CASE("Parallel GZIP — coincidental magic bytes in a single-member stream don't cause a false split",
+          "[strategy][gzip][parallel]") {
+    // Regression test: scanGzipStreams() used to look for the raw byte
+    // sequence 0x1f 0x8b 0x08 anywhere in the file to find concatenated
+    // stream boundaries. That sequence can appear by chance *inside* a
+    // single member's compressed payload (observed on real NCBI FASTA.gz
+    // files). Splitting there feeds inflate() a misaligned/truncated
+    // deflate stream, which can explode into gigabytes of garbage via LZ77
+    // back-references — tripping the OOM guard on a perfectly valid file.
+    //
+    // Level 0 (store mode) gzip embeds input bytes close to verbatim, so
+    // planting 0x1f 0x8b 0x08 in the plaintext reliably reproduces a
+    // coincidental match in the compressed output.
+    const int SEQ_LEN = 800;
+    const char BASES[] = "ACGT";
+
+    auto make_fasta = [&](const std::string& prefix, int count) {
+        std::string s;
+        for (int i = 0; i < count; ++i) {
+            s += '>';
+            s += prefix;
+            s += std::to_string(i);
+            s += '\n';
+            for (int j = 0; j < SEQ_LEN; ++j)
+                s += BASES[(i + j) % 4];
+            s += '\n';
+        }
+        return s;
+    };
+
+    std::string content = make_fasta("bogus_magic_seq", 1500); // ~1.2 MB, single member
+
+    // Plant a coincidental gzip-header-looking byte triple in the middle of
+    // a sequence line (not on a newline boundary, so it can't be mistaken
+    // for record structure).
+    size_t plant_at = content.size() / 2;
+    content[plant_at]     = static_cast<char>(0x1f);
+    content[plant_at + 1] = static_cast<char>(0x8b);
+    content[plant_at + 2] = static_cast<char>(0x08);
+
+    std::string gz_path = "tmp_false_positive_magic.fasta.gz";
+    gzFile f = gzopen(gz_path.c_str(), "wb0"); // store mode: preserves planted bytes verbatim
+    REQUIRE(f != nullptr);
+    gzwrite(f, content.data(), static_cast<unsigned>(content.size()));
+    gzclose(f);
+
+    size_t gz_size = static_cast<size_t>(std::filesystem::file_size(gz_path));
+    REQUIRE(gz_size > 1024 * 1024); // must trigger loadGzipParallel's dispatch path
+
+    TracEon::SmartStrategy strategy;
+    REQUIRE_NOTHROW(strategy.loadFile(gz_path));
+
+    REQUIRE(strategy.getFileCacheSize() == 1500);
+    REQUIRE(strategy.hasSequence("bogus_magic_seq0"));
+    REQUIRE(static_cast<int>(strategy.getSequence("bogus_magic_seq0").size()) == SEQ_LEN);
+    REQUIRE(strategy.hasSequence("bogus_magic_seq1499"));
+    REQUIRE(static_cast<int>(strategy.getSequence("bogus_magic_seq1499").size()) == SEQ_LEN);
+
+    fs::remove(gz_path);
+}
+
+// ─── NGSIndex Mode ───────────────────────────────────────────────────────────
+
+TEST_CASE("NGSIndex mode — wired up via constructor", "[strategy][ngs]") {
+    TracEon::SmartStrategy strategy(TracEon::IndexMode::NGS);
+    REQUIRE(strategy.getIndexMode() == TracEon::IndexMode::NGS);
+}
+
+TEST_CASE("NGSIndex mode — FASTA load and lookup", "[strategy][ngs]") {
+    std::string fasta_path = "tmp_ngs_fasta.fasta";
+    {
+        std::ofstream out(fasta_path);
+        out << ">read_A\nACGTACGT\n>read_B\nTTTTGGGG\n>read_C\nCCCCAAAA\n";
+    }
+
+    TracEon::SmartStrategy strategy(TracEon::IndexMode::NGS);
+    strategy.loadFile(fasta_path);
+
+    REQUIRE(strategy.getIndexMode() == TracEon::IndexMode::NGS);
+    REQUIRE(strategy.getFileCacheSize() == 3);
+    REQUIRE(strategy.hasSequence("read_A"));
+    REQUIRE(strategy.getSequence("read_A") == "ACGTACGT");
+    REQUIRE(strategy.hasSequence("read_B"));
+    REQUIRE(strategy.getSequence("read_B") == "TTTTGGGG");
+    REQUIRE(strategy.hasSequence("read_C"));
+    REQUIRE(strategy.getSequence("read_C") == "CCCCAAAA");
+    REQUIRE_FALSE(strategy.hasSequence("nonexistent"));
+
+    std::vector<std::string> keys = strategy.getAllKeys();
+    REQUIRE(keys.size() == 3);
+
+    fs::remove(fasta_path);
+}
+
+TEST_CASE("NGSIndex mode — FASTQ load and lookup", "[strategy][ngs]") {
+    std::string fastq_path = "tmp_ngs_fastq.fastq";
+    {
+        std::ofstream out(fastq_path);
+        out << "@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nHHHH\n";
+    }
+
+    TracEon::SmartStrategy strategy(TracEon::IndexMode::NGS);
+    strategy.loadFile(fastq_path);
+
+    REQUIRE(strategy.getIndexMode() == TracEon::IndexMode::NGS);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("read1") == "ACGT");
+    REQUIRE(strategy.getQuality("read1") == "IIII");
+    REQUIRE(strategy.getSequence("read2") == "TGCA");
+    REQUIRE(strategy.getQuality("read2") == "HHHH");
+
+    fs::remove(fastq_path);
+}
+
+TEST_CASE("NGSIndex mode — save and restore round-trip", "[strategy][ngs]") {
+    std::string fasta_path = "tmp_ngs_rtrip.fasta";
+    std::string bin_path   = "tmp_ngs_rtrip.bin";
+    {
+        std::ofstream out(fasta_path);
+        out << ">seq1\nACGT\n>seq2\nGGGG\n";
+    }
+
+    {
+        TracEon::SmartStrategy s1(TracEon::IndexMode::NGS);
+        s1.loadFile(fasta_path);
+        s1.saveBinary(bin_path);
+    }
+
+    TracEon::SmartStrategy s2;
+    s2.loadBinary(bin_path);
+
+    REQUIRE(s2.getIndexMode() == TracEon::IndexMode::NGS);
+    REQUIRE(s2.getFileCacheSize() == 2);
+    REQUIRE(s2.getSequence("seq1") == "ACGT");
+    REQUIRE(s2.getSequence("seq2") == "GGGG");
+
+    fs::remove(fasta_path);
+    fs::remove(bin_path);
+}
+
+TEST_CASE("NGSIndex mode — mixed file-loaded and addEntry round-trip", "[strategy][ngs]") {
+    std::string fasta_path = "tmp_ngs_mixed.fasta";
+    std::string bin_path   = "tmp_ngs_mixed.bin";
+    {
+        std::ofstream out(fasta_path);
+        out << ">file_seq1\nACGT\n>file_seq2\nGGGG\n";
+    }
+
+    {
+        TracEon::SmartStrategy s1(TracEon::IndexMode::NGS);
+        s1.loadFile(fasta_path);
+        s1.addEntry("manual_seq", "TTTT", "");
+        REQUIRE(s1.getFileCacheSize() == 3);
+        REQUIRE(s1.getSequence("manual_seq") == "TTTT");
+        s1.saveBinary(bin_path);
+    }
+
+    // Restore into a fresh default-mode strategy — loadBinary must set NGS mode
+    TracEon::SmartStrategy s2;
+    s2.loadBinary(bin_path);
+
+    REQUIRE(s2.getIndexMode() == TracEon::IndexMode::NGS);
+    REQUIRE(s2.getFileCacheSize() == 3);
+    REQUIRE(s2.getSequence("file_seq1") == "ACGT");
+    REQUIRE(s2.getSequence("file_seq2") == "GGGG");
+    REQUIRE(s2.getSequence("manual_seq") == "TTTT");
+
+    fs::remove(fasta_path);
+    fs::remove(bin_path);
+}
+
+// ─── Format Detection ─────────────────────────────────────────────────────────
+
+TEST_CASE("RNA FASTA format detection", "[strategy][format]") {
+    std::string fasta_path = "tmp_rna.fasta";
+    {
+        std::ofstream out(fasta_path);
+        out << ">transcript1\nAUGCUAUGCUAUGCUA\n>transcript2\nUUUUAAAACCCCGGGG\n";
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(fasta_path);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::RNA_FASTA);
+
+    fs::remove(fasta_path);
+}
+
+TEST_CASE("Protein FASTA format detection", "[strategy][format]") {
+    std::string fasta_path = "tmp_protein.fasta";
+    {
+        std::ofstream out(fasta_path);
+        out << ">prot1\nMKTLLLTLVVVTIVLAMGLSLSEEKE\n>prot2\nACDEFGHIKLMNPQRSTWYVACDE\n";
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(fasta_path);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::PROTEIN_FASTA);
+
+    fs::remove(fasta_path);
+}
+
+// ─── clearCache() + reload ────────────────────────────────────────────────────
+
+TEST_CASE("clearCache() then reload — no dangling views", "[strategy]") {
+    std::string fasta_path = "tmp_clear_reload.fasta";
+    {
+        std::ofstream out(fasta_path);
+        out << ">seq1\nACGT\n>seq2\nTGCA\n";
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(fasta_path);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+
+    strategy.clearCache();
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE_FALSE(strategy.hasSequence("seq1"));
+
+    // Reload the same file — old text_arena_ is gone; new arena must be used
+    strategy.loadFile(fasta_path);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("seq1") == "ACGT");
+    REQUIRE(strategy.getSequence("seq2") == "TGCA");
+
+    fs::remove(fasta_path);
+}
+
+// ─── v1 Binary Format ────────────────────────────────────────────────────────
+
+TEST_CASE("v1 binary format (TRO\\x01) load and retrieve", "[strategy][binary]") {
+    // Construct a valid v1 blob in-memory and write to disk.
+    // Format: magic(4) | mode(1) | count(8) | [id_len(4) id seq_len(4) seq qual_len(4)] ...
+
+    auto append_u32 = [](std::vector<char>& buf, uint32_t v) {
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&v),
+                               reinterpret_cast<const char*>(&v) + 4);
+    };
+    auto append_u64 = [](std::vector<char>& buf, uint64_t v) {
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&v),
+                               reinterpret_cast<const char*>(&v) + 8);
+    };
+    auto append_str = [](std::vector<char>& buf, std::string_view s) {
+        buf.insert(buf.end(), s.begin(), s.end());
+    };
+
+    std::vector<char> blob;
+    // Magic + version
+    const char magic[] = {'T','R','O','\x01'};
+    blob.insert(blob.end(), magic, magic + 4);
+    // mode = 0 (GenomeIndex)
+    blob.push_back(0);
+    // count = 2
+    append_u64(blob, 2);
+    // record 1: "chr1" / "ACGTACGT" / ""
+    append_u32(blob, 4); append_str(blob, "chr1");
+    append_u32(blob, 8); append_str(blob, "ACGTACGT");
+    append_u32(blob, 0);
+    // record 2: "chr2" / "TTTTGGGG" / ""
+    append_u32(blob, 4); append_str(blob, "chr2");
+    append_u32(blob, 8); append_str(blob, "TTTTGGGG");
+    append_u32(blob, 0);
+
+    std::string bin_path = "tmp_v1_format.bin";
+    {
+        std::ofstream out(bin_path, std::ios::binary);
+        out.write(blob.data(), blob.size());
+    }
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadBinary(bin_path);
+
+    REQUIRE(strategy.getIndexMode() == TracEon::IndexMode::GENOME);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("chr1") == "ACGTACGT");
+    REQUIRE(strategy.getSequence("chr2") == "TTTTGGGG");
+    REQUIRE_FALSE(strategy.hasSequence("chr3"));
+
+    fs::remove(bin_path);
 }
