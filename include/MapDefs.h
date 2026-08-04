@@ -2,7 +2,6 @@
 #define TRACEON_MAPDEFS_H
 
 #include <ankerl/unordered_dense.h>
-#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <functional>

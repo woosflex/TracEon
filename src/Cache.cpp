@@ -1,6 +1,5 @@
 #include "Cache.h"
 #include "SmartStrategy.h"
-#include <stdexcept>
 
 namespace TracEon {
 

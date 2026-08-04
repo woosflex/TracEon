@@ -3,14 +3,11 @@
 
 #include <string>
 #include <string_view>
-#include <vector>
 #include <memory>
 #include <optional>
 
 #include "IEncodingStrategy.h"
-#include "RecordTypes.h"
 #include "DecodedRecordTypes.h"
-#include "MapDefs.h"
 #include "SmartStrategy.h"
 
 namespace TracEon {

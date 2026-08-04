@@ -64,10 +64,10 @@ namespace TracEon {
     /**
      * @brief Library version string
      * Format: MAJOR.MINOR.PATCH
-     * Codename: Avalon (EMIYA's absolute defense)
+     * Codename: Caliburn (v1.4.0)
      */
-    constexpr const char* VERSION = "1.0.0";
-    constexpr const char* CODENAME = "Avalon";
+    constexpr const char* VERSION = "1.4.0";
+    constexpr const char* CODENAME = "Caliburn";
     
     /**
      * @brief Check if lock-free optimization is active

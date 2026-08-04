@@ -10,8 +10,6 @@
 #include <shared_mutex>
 #include <thread>
 #include <vector>
-#include <cassert>
-#include <cmath>
 #include <functional> 
 #include <cctype>
 #include <zlib.h>
@@ -64,8 +62,6 @@ struct MMapHandle {
     }
 };
 
-static const char MAGIC_BYTES_V1[] = "TRO\x01"; // v1.1 format (uncompressed)
-static const char MAGIC_BYTES_V2[] = "TRO\x02"; // v1.3 format (LZ4-compressed, single block)
 static const char MAGIC_BYTES_V3[] = "TRO\x03"; // v1.5 format (LZ4 Frame, streamed)
 
 // Streaming (de)compression chunk size for the v3 binary cache format.
@@ -1443,24 +1439,6 @@ bool SmartStrategy::hasRNA(std::string_view data) const {
         if (data[i] == 'U' || data[i] == 'u') return true;
     }
     return false;
-}
-
-// Dummy parsers
-void SmartStrategy::parseFastaOptimized(std::string_view content) { 
-    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastaInternal(content, std::get<GenomeIndex>(file_cache_));
-    else parseFastaInternal(content, std::get<NGSIndex>(file_cache_));
-}
-void SmartStrategy::parseFastqOptimized(std::string_view content) {
-    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastqInternal(content, std::get<GenomeIndex>(file_cache_));
-    else parseFastqInternal(content, std::get<NGSIndex>(file_cache_));
-}
-void SmartStrategy::parseFastaMultithreaded(std::string_view content) {
-    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastaMultithreadedTemplate(content, std::get<GenomeIndex>(file_cache_));
-    else parseFastaMultithreadedTemplate(content, std::get<NGSIndex>(file_cache_));
-}
-void SmartStrategy::parseFastqMultithreaded(std::string_view content) {
-    if (std::holds_alternative<GenomeIndex>(file_cache_)) parseFastqMultithreadedTemplate(content, std::get<GenomeIndex>(file_cache_));
-    else parseFastqMultithreadedTemplate(content, std::get<NGSIndex>(file_cache_));
 }
 
 } // namespace

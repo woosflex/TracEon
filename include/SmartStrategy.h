@@ -3,7 +3,6 @@
 
 #include "IEncodingStrategy.h"
 #include "MapDefs.h"
-#include "RecordTypes.h"
 
 #include <string>
 #include <string_view>
@@ -213,11 +212,6 @@ private:
     template <typename MapType> void parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map);
     template <typename MapType> void parseFastqMultithreadedTemplate(std::string_view content, MapType& dest_map);
 
-    // Wrappers
-    void parseFastaOptimized(std::string_view content);
-    void parseFastqOptimized(std::string_view content);
-    void parseFastaMultithreaded(std::string_view content);
-    void parseFastqMultithreaded(std::string_view content);
 };
 
 } // namespace TracEon
