@@ -70,6 +70,20 @@ include/KmerReferenceIndex.h
 include/kmerindex_c_api.h
 src/kmerindex_c_api.cpp
 
+# Experimental benchmark scripts/vendored tools (not part of core)
+benchmarks/aligner_lookup_benchmark.py
+benchmarks/aligner_lookup_report.md
+benchmarks/aligner_scaling_benchmark.py
+benchmarks/full_genome_benchmark.py
+benchmarks/integrated_pipeline_benchmark.py
+benchmarks/kmer_cache_bench.cpp
+benchmarks/kmer_engine_bench.cpp
+benchmarks/native_kmer_bench.cpp
+benchmarks/real_comparative_benchmark.py
+benchmarks/real_world_benchmark_report.md
+benchmarks/minimap2_src/
+benchmarks/third_party/
+
 # Object files and build artifacts
 *.o
 *.obj
