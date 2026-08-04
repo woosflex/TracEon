@@ -43,6 +43,33 @@ cmake-build-debug-wsl/
 # Swarm working directory
 .swarm/
 
+# Agent working directories (Claude Code, pi, etc.)
+.claude/
+.pi/
+
+# Large generated benchmark data (download/generate on demand)
+real_data/
+benchmarks/*.fastq
+benchmarks/*.fastq.gz
+benchmarks/*.traceon
+benchmarks/*.bin
+benchmarks/*_bench
+benchmarks/minimap2_stock
+benchmarks/minimap2_patched
+
+# Tool output
+graphify-out/
+experiments/
+progress.md
+CLAUDE.md
+
+# Kmer index WIP (experimental, not wired into build yet)
+include/KmerEncoding.h
+include/KmerIndex.h
+include/KmerReferenceIndex.h
+include/kmerindex_c_api.h
+src/kmerindex_c_api.cpp
+
 # Object files and build artifacts
 *.o
 *.obj

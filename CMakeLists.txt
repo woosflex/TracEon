@@ -89,8 +89,6 @@ endif()
 # NEON on AArch64 requires no extra compiler flags; runtime dispatch will call NEON path.
 
 # --- Executable Targets ---
-add_executable(trac-eon-test main.cpp)
-target_link_libraries(trac-eon-test PRIVATE traceon_core)
 
 # --- Benchmark Driver ---
 add_executable(traceon_driver traceon_driver.cpp)
