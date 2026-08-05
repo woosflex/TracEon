@@ -781,9 +781,11 @@ Examples:
     print_info(f"Cached data location: {DATA_DIR.resolve()}")
     print_info(f"To clean up: python validate_real_data.py --clean")
     
-    # Clean up session cache
-    global _session_cache
-    _session_cache.clear()
+    # Clean up the session
+    global _session
+    if _session is not None:
+        _session.close()
+        _session = None
 
 if __name__ == "__main__":
     main()

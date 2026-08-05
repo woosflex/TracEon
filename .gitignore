@@ -80,7 +80,6 @@ benchmarks/kmer_cache_bench.cpp
 benchmarks/kmer_engine_bench.cpp
 benchmarks/native_kmer_bench.cpp
 benchmarks/real_comparative_benchmark.py
-benchmarks/real_world_benchmark_report.md
 benchmarks/minimap2_src/
 benchmarks/third_party/
 
