@@ -17,6 +17,26 @@ We implement a **lock-free read path** using C++20 atomics with acquire/release 
 3. Read operations (`getView()`, `hasSequence()`) bypass the mutex once `data_ready_` is true
 4. Write operations (`loadFile()`, `clearCache()`) continue using exclusive locks
 
+### Enforcing Immutability (v1.4.1 / Bug 3 fix)
+
+Immutability is not just a convention — it is **enforced by the API**:
+
+- A separate `std::atomic<bool> data_loaded_` flag is set **only** by the load
+  paths (`parseArena()` via `loadFile()`/`loadGzipFile()`, and `loadBinary()`)
+  and cleared by `clearInternal()` (`clearCache()`).
+- `addEntry()` (the `Cache::set()` path) checks `data_loaded_` first and throws
+  `std::logic_error` if a load has happened — so the index can never be mutated
+  after it has been published to lock-free readers.
+- `data_loaded_` is distinct from `data_ready_` because `addEntry()` itself sets
+  `data_ready_` so readers can see manually-built entries during a build phase.
+  Using `data_ready_` alone would wrongly reject the second `set()` of a manual
+  build.
+
+**Contract:** `set()`/`addEntry()` is allowed only **before** any load (build
+phase) or **after** `clearCache()`. A loaded cache is truly immutable, which is
+what makes the lock-free read guarantee sound. Build-phase `set()` calls are
+single-threaded by contract (no concurrent readers during a build).
+
 ### Memory Ordering Contract
 ```cpp
 // WRITE SIDE (happens-before relationship)

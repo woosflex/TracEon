@@ -87,6 +87,7 @@ inline uint64_t SmartStrategy::hash_key(std::string_view key) const {
 
 void SmartStrategy::clearInternal() {
     data_ready_.store(false, std::memory_order_release);
+    data_loaded_.store(false, std::memory_order_release);
     if (std::holds_alternative<GenomeIndex>(file_cache_)) std::get<GenomeIndex>(file_cache_).clear();
     else std::get<NGSIndex>(file_cache_).clear();
     text_arena_.clear();
@@ -104,8 +105,41 @@ void SmartStrategy::clearCache() {
     clearInternal();
 }
 
+void SmartStrategy::markDataLoaded() {
+    data_loaded_.store(true, std::memory_order_release);
+}
+
 void SmartStrategy::addEntry(const std::string& id, const std::string& seq, const std::string& qual) {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+
+    // Immutable-after-load contract (Bug 3 fix — see ADR-001). The lock-free
+    // read path (getView()/getQuality()/hasSequence()) checks data_ready_
+    // and then reads the map WITHOUT holding a lock, which is only safe if
+    // the map is truly immutable once published. addEntry() is therefore
+    // only legal while building a cache (before any loadFile()/loadBinary())
+    // or after clearCache(); mutating a loaded cache would race with
+    // concurrent lock-free readers (torn reads, and a segfault on rehash).
+    // Note: data_ready_ alone can't gate this — addEntry() itself publishes
+    // manual entries by setting data_ready_, so a separate data_loaded_ flag
+    // records whether a LOAD has happened.
+    if (data_loaded_.load(std::memory_order_acquire)) {
+        throw std::logic_error(
+            "TracEon: cannot add entries after data has been loaded "
+            "(immutable-after-load contract; call clearCache() first)");
+    }
+
+    // Duplicate-key guard (Bug 2 fix). emplace() keeps the FIRST value for a
+    // given key, so a duplicate set() is a silent no-op. Bail out before
+    // touching manual_store_ or serialized_size_estimate_: an unconditional
+    // estimate increment for a record that was never inserted would inflate
+    // the binary-cache header's declared size, making restore() throw
+    // "Binary cache v3 decompressed size mismatch" (the payload actually
+    // holds fewer bytes than the header claims).
+    if (std::holds_alternative<GenomeIndex>(file_cache_)) {
+        if (std::get<GenomeIndex>(file_cache_).count(id) > 0) return;
+    } else {
+        if (std::get<NGSIndex>(file_cache_).count(hash_key(id)) > 0) return;
+    }
 
     // OOM guard: manual_store_ is the only remaining unbounded growth path
     // in this class (every load path already guards its own allocations).
@@ -120,10 +154,14 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
             std::to_string(avail_mem) + " bytes)");
     }
 
-    // Do NOT flip data_ready_ to false here. getView() checks data_ready_ without
-    // holding a lock (lock-free fast path), so a false→true toggle would cause
-    // concurrent readers to see empty results during the window. The unique_lock
-    // already prevents map corruption; just emit true at the end.
+    // Do NOT flip data_ready_ to false here. getView() checks data_ready_
+    // without holding a lock (lock-free fast path), so a false→true toggle
+    // would cause concurrent readers to see empty results during the window.
+    // The unique_lock already prevents map corruption between concurrent
+    // writers; data_loaded_ (checked above) enforces the stricter
+    // immutable-after-load contract for readers that run after a load.
+    // Build-phase set() calls are single-threaded by contract (see
+    // ADR-001), so mutating the map here is safe; just emit true at the end.
 
     // Store copies in manual_store_ (std::deque: push_back never invalidates
     // references to existing elements, so these string_views stay valid).
@@ -622,6 +660,7 @@ void SmartStrategy::normalizeFastaArena() {
 void SmartStrategy::parseArena() {
     std::string_view content(text_arena_.data(), text_arena_.size());
     if (content.empty()) {
+        markDataLoaded();
         data_ready_.store(true, std::memory_order_release);
         return;
     }
@@ -662,6 +701,7 @@ void SmartStrategy::parseArena() {
     // doesn't need to re-walk the map on every call; addEntry() maintains
     // this incrementally after this point.
     refreshPayloadEstimate();
+    markDataLoaded();
     data_ready_.store(true, std::memory_order_release);
 }
 
@@ -780,8 +820,50 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
         const char* ptr = content.data() + start;
         const char* chunk_end = content.data() + end;
         const char* global_end = content.data() + content.size();
-        if (thread_id > 0) { while (ptr > content.data() && *(ptr - 1) != '\n') --ptr; while (ptr < chunk_end) { if (*ptr == '@') { const char* check = ptr - 1; while (check > content.data() && (*check == '\n' || *check == '\r')) --check; while (check > content.data() && *check != '\n' && *check != '\r') --check; if (check > content.data()) ++check; if (*check != '+') break; } ++ptr; } }
+        if (thread_id > 0) {
+            // ── Chunk-boundary scan (Bug 1 fix) ─────────────────────────────
+            // Find the first GENUINE FASTQ record header at/after the chunk
+            // start. A genuine header is a line whose first char is '@' AND
+            // whose previous line does NOT start with '+' (the previous line
+            // is the previous record's quality line). A quality line that
+            // happens to start with '@' (Phred Q31+ scores) has the '+'
+            // separator line immediately before it, so it fails this test
+            // and is skipped. The old code tested *every* '@' character —
+            // including mid-line quality '@'s — which made the lookbehind
+            // land on the wrong line and misidentify quality characters as
+            // record starts, shifting/dropping records (repro: 100k reads
+            // with '@' in quality → 16,703 loaded).
+            //
+            // Align to the start of the line containing the chunk boundary.
+            while (ptr > content.data() && *(ptr - 1) != '\n') --ptr;
+            while (ptr < chunk_end) {
+                if (*ptr == '@') {
+                    // ptr is at a line start. Walk back to the first byte of
+                    // the previous line and check whether it is the '+'
+                    // separator. The `check <= content.data()` guard avoids
+                    // dereferencing before the buffer when the walk crosses
+                    // the file start (this '@' is then on the first line,
+                    // which is a genuine header of a valid FASTQ file).
+                    const char* check = ptr - 1;
+                    while (check > content.data() && (*check == '\n' || *check == '\r')) --check;
+                    while (check > content.data() && *check != '\n' && *check != '\r') --check;
+                    if (check > content.data()) ++check;
+                    if (check <= content.data() || *check != '+') break; // genuine header
+                    // Previous line is the '+' separator → this '@' is a
+                    // quality line, not a header — keep scanning.
+                }
+                // Advance to the start of the next line.
+                while (ptr < chunk_end && *ptr != '\n') ++ptr;
+                if (ptr < chunk_end) ++ptr; // consume '\n'
+                while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            }
+        }
         while (ptr < chunk_end) {
+            // Strict 4-line FASTQ cycle: header, sequence, '+', quality.
+            // Quality lines are consumed as the 4th line of the cycle and
+            // never re-scanned, so '@' inside quality (Phred Q31+) cannot be
+            // mistaken for a record header. The '+' separator is verified so
+            // a malformed file can't shift the cycle either.
             while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
             if (ptr >= chunk_end || *ptr != '@') break;
             ++ptr; const char* id_start = ptr;
@@ -794,6 +876,7 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
             const char* seq_end = ptr;
             while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            if (ptr >= global_end || *ptr != '+') break; // missing '+' separator
             ptr = simd_find_char(ptr, global_end, '\n');
             while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
             const char* qual_start = ptr;
@@ -843,13 +926,21 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
     size_t estimated_records = (content.size() < 50 * 1024 * 1024) ? content.size() / 150 : content.size() / 200;
     map.reserve(static_cast<size_t>(estimated_records * 1.25));
     while (ptr < end) {
+        // Strict 4-line FASTQ cycle (header, sequence, '+', quality). The
+        // quality line is consumed as the 4th line of the cycle and never
+        // re-scanned, so '@' inside quality (Phred Q31+ scores ≥ 64) cannot
+        // be misparsed as a new record header — the root cause of the record
+        // loss fixed for the multithreaded path. The '+' separator is
+        // verified so a malformed file can't shift the cycle either.
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '@') break;
         ++ptr; const char* id_start = ptr; while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr; const char* id_end = ptr;
         ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
         const char* seq_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* seq_end = ptr;
         while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
-        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr; ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        if (ptr >= end || *ptr != '+') break; // missing '+' separator
+        ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
         const char* qual_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* qual_end = ptr;
         while (qual_end > qual_start && *(qual_end - 1) == '\r') --qual_end;
         while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
@@ -1317,6 +1408,7 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     // saveBinary() (e.g. re-saving after restoring + addEntry()'ing more
     // data); addEntry() maintains it incrementally after this point.
     refreshPayloadEstimate();
+    markDataLoaded();
     data_ready_.store(true, std::memory_order_release);
 }
 

@@ -121,12 +121,32 @@ private:
      */
     std::atomic<bool> data_ready_{false};
 
+    /**
+     * Immutable-after-load signal (Bug 3 fix, ADR-001).
+     *
+     * Distinct from data_ready_: data_ready_ is also set by addEntry() so
+     * lock-free reads can see manually-added entries during a build phase,
+     * which would make it useless as an "is the cache frozen?" test. This
+     * flag is set true ONLY by the load paths (loadFile/loadGzipFile via
+     * parseArena(), and loadBinary()) and reset by clearInternal()
+     * (clearCache()). Once true, the index is truly immutable: addEntry()
+     * throws std::logic_error instead of mutating the map under concurrent
+     * lock-free readers.
+     */
+    std::atomic<bool> data_loaded_{false};
+
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
     uint64_t hash_key(std::string_view key) const;
 
     void clearInternal();
+
+    /**
+     * @brief Set by load paths (loadFile/loadGzipFile/loadBinary) so
+     * addEntry() can enforce the immutable-after-load contract.
+     */
+    void markDataLoaded();
 
     /**
      * @brief Serialize payload (count + all records), pushing bytes through

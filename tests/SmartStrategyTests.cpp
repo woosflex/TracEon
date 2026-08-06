@@ -172,37 +172,31 @@ TEST_CASE("addEntry() throws instead of crashing when the process is memory-cons
 }
 #endif
 
-TEST_CASE("Mixed loadFile() + addEntry() round-trips through saveBinary/loadBinary",
+TEST_CASE("addEntry() round-trips through saveBinary/loadBinary",
           "[strategy][addentry][smart_compression]") {
-    // Exercises the combination of refreshPayloadEstimate() (seeded once by
-    // loadFile()/parseArena()) and addEntry()'s incremental updates on top
-    // of that base — a path not covered by the pure-file or pure-addEntry
-    // round-trip tests above.
-    const std::string src = "mixed_load_addentry.fasta";
-    const std::string bin = "mixed_load_addentry.bin";
-    {
-        std::ofstream out(src);
-        out << ">seq1\nACGT\n>seq2\nTGCA\n";
-    }
+    // Under the immutable-after-load contract (ADR-001, Bug 3 fix), addEntry()
+    // is only legal before any load or after clearCache(), so a manual
+    // build can no longer be mixed with a loadFile() into one object. This
+    // still exercises addEntry()'s incremental serialized_size_estimate_
+    // updates on top of the sizeof(uint64_t) record-count base, and the
+    // loadBinary→saveBinary path (refreshPayloadEstimate seeding) is covered
+    // by the Smart Compression round-trip tests below.
+    const std::string bin = "addentry_roundtrip.bin";
 
     TracEon::SmartStrategy strategy;
-    strategy.loadFile(src);
     strategy.addEntry("manual1", "GATTACA", "IIIIIII");
     strategy.addEntry("manual2", "CATCATCAT", "");
-    REQUIRE(strategy.getFileCacheSize() == 4);
+    REQUIRE(strategy.getFileCacheSize() == 2);
 
     strategy.saveBinary(bin);
 
     TracEon::SmartStrategy restored;
     restored.loadBinary(bin);
-    REQUIRE(restored.getFileCacheSize() == 4);
-    REQUIRE(restored.getSequence("seq1") == "ACGT");
-    REQUIRE(restored.getSequence("seq2") == "TGCA");
+    REQUIRE(restored.getFileCacheSize() == 2);
     REQUIRE(restored.getSequence("manual1") == "GATTACA");
     REQUIRE(restored.getQuality("manual1") == "IIIIIII");
     REQUIRE(restored.getSequence("manual2") == "CATCATCAT");
 
-    fs::remove(src);
     fs::remove(bin);
 }
 
@@ -1867,19 +1861,18 @@ TEST_CASE("NGSIndex mode — save and restore round-trip", "[strategy][ngs]") {
     fs::remove(bin_path);
 }
 
-TEST_CASE("NGSIndex mode — mixed file-loaded and addEntry round-trip", "[strategy][ngs]") {
-    std::string fasta_path = "tmp_ngs_mixed.fasta";
-    std::string bin_path   = "tmp_ngs_mixed.bin";
-    {
-        std::ofstream out(fasta_path);
-        out << ">file_seq1\nACGT\n>file_seq2\nGGGG\n";
-    }
+TEST_CASE("NGSIndex mode — addEntry round-trip (immutable-after-load contract)", "[strategy][ngs]") {
+    // Reworked for the immutable-after-load contract (Bug 3): addEntry() is
+    // only legal before any load or after clearCache(), so the former
+    // loadFile-then-addEntry combination is rejected by design. The NGS
+    // load→save→restore path is covered by the "save and restore round-trip"
+    // test above; this covers the NGS addEntry→save→restore path.
+    std::string bin_path = "tmp_ngs_addentry.bin";
 
     {
         TracEon::SmartStrategy s1(TracEon::IndexMode::NGS);
-        s1.loadFile(fasta_path);
         s1.addEntry("manual_seq", "TTTT", "");
-        REQUIRE(s1.getFileCacheSize() == 3);
+        REQUIRE(s1.getFileCacheSize() == 1);
         REQUIRE(s1.getSequence("manual_seq") == "TTTT");
         s1.saveBinary(bin_path);
     }
@@ -1889,12 +1882,9 @@ TEST_CASE("NGSIndex mode — mixed file-loaded and addEntry round-trip", "[strat
     s2.loadBinary(bin_path);
 
     REQUIRE(s2.getIndexMode() == TracEon::IndexMode::NGS);
-    REQUIRE(s2.getFileCacheSize() == 3);
-    REQUIRE(s2.getSequence("file_seq1") == "ACGT");
-    REQUIRE(s2.getSequence("file_seq2") == "GGGG");
+    REQUIRE(s2.getFileCacheSize() == 1);
     REQUIRE(s2.getSequence("manual_seq") == "TTTT");
 
-    fs::remove(fasta_path);
     fs::remove(bin_path);
 }
 
@@ -2005,4 +1995,234 @@ TEST_CASE("v1 binary format (TRO\\x01) load and retrieve", "[strategy][binary]")
     REQUIRE_FALSE(strategy.hasSequence("chr3"));
 
     fs::remove(bin_path);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bug 1 regression: FASTQ parsers must not misparse '@' in quality lines
+// ═══════════════════════════════════════════════════════════════════════════
+// Phred+33 quality scores ≥ 64 (Q31+) are ASCII '@' or higher, so real FASTQ
+// files routinely contain '@' in quality lines. The old multithreaded
+// chunk-boundary scan tested *every* '@' character (not just line-start
+// headers), and its lookbehind landed on the wrong line for mid-line '@'s,
+// so a quality '@' could be mistaken for a new record header — shifting
+// records and silently dropping most of the file (repro: 100k reads → 16,703).
+// The parsers now consume strict 4-line cycles (header, seq, '+', qual) and
+// the boundary scan only ever inspects line-start '@' characters.
+
+TEST_CASE("FASTQ '@' in quality — multithreaded (>10MB) record count preserved",
+          "[strategy][fastq][bug1][multithreaded]") {
+    const size_t SEQ_LEN = 300;
+    const size_t N = 40000; // 40000 × ~305 B ≈ 12.2 MB → multithreaded path
+    std::string path = "bug1_mt_at_quality.fastq";
+    {
+        std::ofstream out(path, std::ios::binary);
+        for (size_t i = 0; i < N; ++i) {
+            out << "@read" << i << " desc\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << "ACGT"[j % 4];
+            out << "\n+\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << '@'; // Phred Q31+ — every qual char is '@'
+            out << "\n";
+        }
+    }
+    REQUIRE(fs::file_size(path) > 10u * 1024u * 1024u); // must take the multithreaded path
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(path);
+
+    // Every record must be present with intact content — no loss, no garbage.
+    REQUIRE(strategy.getFileCacheSize() == N);
+    REQUIRE(strategy.getSequence("read0").size() == SEQ_LEN);
+    REQUIRE(strategy.getQuality("read0") == std::string(SEQ_LEN, '@'));
+    REQUIRE(strategy.getSequence("read19999").size() == SEQ_LEN);
+    REQUIRE(strategy.hasSequence("read39999"));
+    REQUIRE(strategy.getQuality("read39999") == std::string(SEQ_LEN, '@'));
+
+    fs::remove(path);
+}
+
+TEST_CASE("FASTQ '@' in quality — multithreaded, '@' mid-line",
+          "[strategy][fastq][bug1][multithreaded]") {
+    // '@' NOT at the start of the quality line — the worst case for the old
+    // character-scanning boundary logic.
+    const size_t SEQ_LEN = 300;
+    const size_t N = 40000;
+    std::string path = "bug1_mt_midline_at.fastq";
+    {
+        std::ofstream out(path, std::ios::binary);
+        for (size_t i = 0; i < N; ++i) {
+            out << "@read" << i << "\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << "ACGT"[j % 4];
+            out << "\n+\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << ((j % 3 == 0) ? '@' : 'I');
+            out << "\n";
+        }
+    }
+    REQUIRE(fs::file_size(path) > 10u * 1024u * 1024u);
+
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(path);
+    REQUIRE(strategy.getFileCacheSize() == N);
+    REQUIRE(strategy.hasSequence("read39999"));
+    REQUIRE(strategy.getQuality("read1").size() == SEQ_LEN);
+    REQUIRE(strategy.getQuality("read1")[0] == '@');
+    REQUIRE(strategy.getQuality("read1")[1] == 'I');
+
+    fs::remove(path);
+}
+
+TEST_CASE("FASTQ '@' in quality — single-threaded (<10MB)",
+          "[strategy][fastq][bug1]") {
+    const size_t SEQ_LEN = 100;
+    const size_t N = 5000; // ~500 KB → single-threaded path
+    std::string path = "bug1_st_at_quality.fastq";
+    {
+        std::ofstream out(path, std::ios::binary);
+        for (size_t i = 0; i < N; ++i) {
+            out << "@read" << i << " desc\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << "ACGT"[j % 4];
+            out << "\n+\n";
+            for (size_t j = 0; j < SEQ_LEN; ++j) out << ((j % 2) ? '@' : '~');
+            out << "\n";
+        }
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(path);
+    REQUIRE(strategy.getFileCacheSize() == N);
+    REQUIRE(strategy.getSequence("read0").size() == SEQ_LEN);
+    std::string expected_qual;
+    expected_qual.reserve(SEQ_LEN);
+    for (size_t j = 0; j < SEQ_LEN; ++j) expected_qual += (j % 2) ? '@' : '~';
+    REQUIRE(strategy.getQuality("read0") == expected_qual);
+    REQUIRE(strategy.hasSequence("read4999"));
+
+    fs::remove(path);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bug 2 regression: duplicate-key set() must not corrupt save/restore
+// ═══════════════════════════════════════════════════════════════════════════
+// addEntry() used to call emplace() (a no-op on a duplicate key) while
+// unconditionally incrementing serialized_size_estimate_, so the binary-cache
+// header declared more bytes than the payload held → restore() threw
+// "Binary cache v3 decompressed size mismatch". Semantics: FIRST value wins
+// (emplace keeps the first insertion); duplicates are silent no-ops.
+
+TEST_CASE("Duplicate key set() — first wins, save/restore consistent (GENOME)",
+          "[strategy][bug2][addentry]") {
+    const std::string bin = "bug2_dup.bin";
+    {
+        TracEon::SmartStrategy strategy;
+        strategy.addEntry("dup", "AAAA", "IIII");
+        strategy.addEntry("dup", "CCCC", "JJJJ"); // duplicate → no-op, first wins
+        REQUIRE(strategy.getFileCacheSize() == 1);
+        REQUIRE(strategy.getSequence("dup") == "AAAA");
+        REQUIRE(strategy.getQuality("dup") == "IIII");
+
+        strategy.saveBinary(bin); // header must not over-declare the payload
+    }
+    {
+        TracEon::SmartStrategy restored;
+        REQUIRE_NOTHROW(restored.loadBinary(bin)); // was: throws decompressed size mismatch
+        REQUIRE(restored.getFileCacheSize() == 1);
+        REQUIRE(restored.getSequence("dup") == "AAAA");
+        REQUIRE(restored.getQuality("dup") == "IIII");
+    }
+    fs::remove(bin);
+}
+
+TEST_CASE("Duplicate key set() — first wins, save/restore consistent (NGS)",
+          "[strategy][bug2][addentry][ngs]") {
+    const std::string bin = "bug2_dup_ngs.bin";
+    {
+        TracEon::SmartStrategy strategy(TracEon::IndexMode::NGS);
+        strategy.addEntry("dup", "AAAA", "");
+        strategy.addEntry("dup", "CCCC", "");
+        REQUIRE(strategy.getFileCacheSize() == 1);
+        REQUIRE(strategy.getSequence("dup") == "AAAA");
+        strategy.saveBinary(bin);
+    }
+    {
+        TracEon::SmartStrategy restored;
+        REQUIRE_NOTHROW(restored.loadBinary(bin));
+        REQUIRE(restored.getFileCacheSize() == 1);
+        REQUIRE(restored.getSequence("dup") == "AAAA");
+    }
+    fs::remove(bin);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bug 3 regression: immutable-after-load contract
+// ═══════════════════════════════════════════════════════════════════════════
+// The lock-free read path (getView()/getQuality()/hasSequence()) reads the
+// index without holding a lock once data_ready_ is set. That is only sound
+// if the index is truly immutable after publication, so addEntry() must be
+// rejected once a load has happened (until clearCache() reopens the build).
+
+TEST_CASE("addEntry() before load works — multiple build-phase entries",
+          "[strategy][bug3][addentry]") {
+    TracEon::SmartStrategy strategy;
+    strategy.addEntry("a", "ACGT", "");
+    strategy.addEntry("b", "TGCA", "IIII");
+    strategy.addEntry("c", "GGGG", "");
+    REQUIRE(strategy.getFileCacheSize() == 3);
+    REQUIRE(strategy.getSequence("a") == "ACGT");
+    REQUIRE(strategy.getSequence("b") == "TGCA");
+    REQUIRE(strategy.getQuality("b") == "IIII");
+    REQUIRE(strategy.getSequence("c") == "GGGG");
+}
+
+TEST_CASE("addEntry() after loadFile() throws std::logic_error",
+          "[strategy][bug3][addentry][errors]") {
+    const std::string src = "bug3_after_load.fasta";
+    {
+        std::ofstream out(src);
+        out << ">seq1\nACGT\n>seq2\nTGCA\n";
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    REQUIRE(strategy.getFileCacheSize() == 2);
+
+    REQUIRE_THROWS_AS(strategy.addEntry("late", "TTTT", ""), std::logic_error);
+    // The loaded data must remain intact and readable
+    REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getSequence("seq1") == "ACGT");
+    REQUIRE(strategy.getSequence("seq2") == "TGCA");
+
+    fs::remove(src);
+}
+
+TEST_CASE("addEntry() after loadBinary() throws std::logic_error",
+          "[strategy][bug3][addentry][errors]") {
+    const std::string bin = "bug3_after_restore.bin";
+    {
+        TracEon::SmartStrategy s;
+        s.addEntry("k", "AAAA", "");
+        s.saveBinary(bin);
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadBinary(bin);
+    REQUIRE(strategy.getFileCacheSize() == 1);
+    REQUIRE_THROWS_AS(strategy.addEntry("k2", "CCCC", ""), std::logic_error);
+    REQUIRE(strategy.getFileCacheSize() == 1);
+
+    fs::remove(bin);
+}
+
+TEST_CASE("addEntry() after clearCache() works again",
+          "[strategy][bug3][addentry]") {
+    const std::string src = "bug3_after_clear.fasta";
+    {
+        std::ofstream out(src);
+        out << ">seq1\nACGT\n";
+    }
+    TracEon::SmartStrategy strategy;
+    strategy.loadFile(src);
+    REQUIRE_THROWS_AS(strategy.addEntry("x", "TTTT", ""), std::logic_error);
+
+    strategy.clearCache();
+    strategy.addEntry("y", "GGGG", ""); // allowed again after clearCache()
+    REQUIRE(strategy.getFileCacheSize() == 1);
+    REQUIRE(strategy.getSequence("y") == "GGGG");
+
+    fs::remove(src);
 }

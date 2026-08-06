@@ -26,6 +26,11 @@
 - Previous bug: `m_manual_store` was never serialized, causing silent data loss
 - Now routes through `SmartStrategy::addEntry()` for unified storage
 
+### **Streaming v3 Binary Cache** 📦
+- `saveBinary()` now writes `.traceon` **v3** (`"TRO\x03"`, streaming LZ4 Frame)
+- Payload is streamed through a 1 MB window (`serializePayload()`), so save/restore peak memory stays **constant** regardless of dataset size (the old v2 path materialized full payload + compressed copies)
+- `loadBinary()` remains backward compatible with v2 (LZ4 block) and v1 (uncompressed)
+
 ### **Comprehensive Test Coverage** 🧪
 - **+13 new test cases** (57 → 70), **+64 new assertions** (3776 → 3840)
 - NGSIndex correctness (FASTA/FASTQ load/lookup/save/restore)
@@ -375,6 +380,13 @@ int main() {
     return 0;
 }
 ```
+
+> **⚠️ Immutability contract (ADR-001):** a loaded cache is **immutable**.
+> `set()` is only legal **before** any `loadFile()`/`restore()`, or after
+> `clearCache()` — calling it on a loaded cache throws `std::logic_error`.
+> Concurrent reads of a *loaded* cache are lock-free and safe; build-phase
+> `set()` calls must be single-threaded (they are not meant to race with
+> readers).
 
 See `examples/simple_usage.cpp` for a complete working example.
 

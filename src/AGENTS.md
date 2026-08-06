@@ -22,7 +22,7 @@ Core implementation is owned by the project maintainer. Performance-critical sec
 ### File Responsibilities
 
 **Implementation (src/):**
-- `SmartStrategy.cpp` — Arena, lock-free data_ready_ flag, multithreaded parsing, GZIP decompression, binary cache (LZ4 compression, v1/v2 format detection, mmap), SIMD dispatch
+- `SmartStrategy.cpp` — Arena, lock-free data_ready_ flag, multithreaded parsing, GZIP decompression, binary cache (streaming LZ4 Frame, v1/v2/v3 format detection, mmap), SIMD dispatch
 - `Cache.cpp` — High-level API (loadFile, getView, save, restore, getFastqRecord), routes to SmartStrategy
 - `IEncodingStrategy.cpp` — Strategy interface/base class (minimal, mostly headers)
 
@@ -41,7 +41,7 @@ Core implementation is owned by the project maintainer. Performance-critical sec
 3. **Lock-free**: `data_ready_` is the only inter-thread synchronization; reads use acquire semantics, load completion uses release
 4. **Pre-reserved maps**: Parsers call `ankerl::unordered_dense::map::reserve(capacity)` before inserting to avoid rehashing
 5. **GZIP: allocate-then-decompress**: Pre-allocate `text_arena_` at `compressed_size × 3`, decompress directly in, shrink_to_fit when done
-6. **Binary cache format versioning**: `loadBinary()` detects magic byte version (`0x01` v1 uncompressed, `0x02` v2 LZ4-compressed) and routes to appropriate decompressor
+6. **Binary cache format versioning**: `loadBinary()` detects magic byte version (`0x01` v1 uncompressed, `0x02` v2 LZ4 block, `0x03` v3 streaming LZ4 Frame) and routes to the appropriate decompressor; `saveBinary()` always writes v3
 
 ### Performance-Sensitive Code Paths
 - `SmartStrategy::loadFile()` — Parse initiation, GZIP detection, chunking for multithreaded parsing
@@ -49,7 +49,7 @@ Core implementation is owned by the project maintainer. Performance-critical sec
 - `SmartStrategy::loadGzipInternal()` — Dispatcher: detects stream count, routes to parallel or single-stream path
 - `SmartStrategy::scanGzipStreams()` — O(n) scan for GZIP stream boundaries; drives parallel dispatch decision
 - `SmartStrategy::loadGzipParallel()` — Per-stream inflate() in parallel threads; merges into text_arena_
-- `SmartStrategy::loadBinary()` — Format version detection, LZ4 decompression (v2), mmap + parsing (v1), record parsing
+- `SmartStrategy::loadBinary()` — Format version detection, LZ4 decompression (v3 streaming Frame, v2 block, v1 uncompressed), mmap + parsing, record parsing
 - `SmartStrategy::saveBinary()` — Payload serialization, LZ4 compression, header + data write
 - `SmartStrategy::getView()` — Must be O(1) map lookup; no allocations
 - `simd_find_char()` in SimdUtils.h — Boundary scanning (newline, `>`, `@`, `+`); runtime dispatch critical
@@ -76,10 +76,10 @@ Core implementation is owned by the project maintainer. Performance-critical sec
 3. Test multi-threaded insertion with pre-reserved maps (should not rehash mid-parse)
 
 ### Before Modifying Binary Cache (loadBinary / saveBinary)
-1. Understand v1 (uncompressed) and v2 (LZ4-compressed) formats (see ADR-002, "Binary Cache Compression" section)
+1. Understand v1 (uncompressed), v2 (LZ4 block), and v3 (streaming LZ4 Frame) formats (see ADR-002 "Binary Cache Compression" and ADR-004)
 2. Binary cache format versioning is critical: bumping magic version byte is backward-incompatible for v1 readers
 3. When deserializing: always check magic version byte first, route to appropriate decompressor
-4. When serializing: save to v2 format (LZ4 required for all new caches)
+4. When serializing: save to v3 format (streaming LZ4 Frame — the only format `saveBinary()` writes today)
 5. Test round-trip: save → restore → verify all sequences match
 6. Benchmark: ensure compression ratio is ~3x for typical data and decompression overhead is <0.03s
 

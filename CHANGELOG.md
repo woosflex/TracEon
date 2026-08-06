@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ✨ Added
 
+- **Streaming v3 Binary Cache Format**: `saveBinary()` now writes `.traceon` v3 (`"TRO\x03"`) — a streamed LZ4 Frame instead of a single LZ4 block over the full serialized payload. `serializePayload()` pushes bytes through a 1 MB streaming window, so peak save/load memory stays bounded by `STREAM_CHUNK_SIZE` regardless of dataset size (the old v2 path held text_arena_ + payload + compressed copies all at once). `loadBinary()` still reads v1 (uncompressed) and v2 (LZ4 block) for backward compatibility.
 - **IndexMode Selection**: `SmartStrategy(IndexMode mode)` and `Cache(IndexMode mode)` constructors allow choosing between `IndexMode::GENOME` (default, string-keyed `GenomeIndex`) and `IndexMode::NGS` (hash-keyed `NGSIndex`). Previously, `NGSIndex` was compiled in but permanently unreachable.
 - **`Cache::getIndexMode()`**: New method exposes the active index mode from the public `Cache` API.
 - **`Cache::set()` persists via `save()`**: `set()` now routes through `SmartStrategy::addEntry()` instead of a separate `m_manual_store`. Manually-added entries are now serialized by `save()` and restored by `restore()`. The separate `m_manual_store` field in `Cache` has been removed.
@@ -46,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Format Version Detection**: `loadBinary()` now detects format version byte and supports backward compatibility with v1 uncompressed format (0x01). Automatic routing based on magic bytes `"TRO\x01"` (v1) vs `"TRO\x02"` (v2).
 - **Serialization Helper**: New private method `serializePayload()` abstracts payload serialization, eliminating code duplication between v1 and v2 paths.
 - **Parallel GZIP Decompression**: Concatenated GZIP streams are now decompressed in parallel. `scanGzipStreams()` scans for GZIP stream boundaries; `loadGzipParallel()` spawns one thread per stream using the zlib-ng `inflate()` API. Single-stream files fall through to the existing single-threaded path unchanged.
-- **Smart Compression**: `saveBinary()` now auto-selects the LZ4 compression mode based on payload size and detected file format. Payloads > 10 MiB of DNA or RNA data use `LZ4_compress_HC()` (level 9) for ~4–5× size reduction; all other data uses `LZ4_compress_default()`. Both modes write the existing v2 format — `LZ4_decompress_safe()` handles both bitstreams transparently. No new dependencies, no format version bump.
+- **Smart Compression**: `saveBinary()` now auto-selects the LZ4 compression mode based on payload size and detected file format. Payloads > 10 MiB of DNA or RNA data use `LZ4_compress_HC()` (level 9) for ~4–5× size reduction; all other data uses `LZ4_compress_default()`. Both modes wrote the v2 format — `LZ4_decompress_safe()` handles both bitstreams transparently. **Correction:** the "no format version bump" note below is wrong in hindsight — v1.4.0 replaced the v2 single-block payload with the streaming v3 LZ4-Frame format (see the v1.4.0 entry), and `saveBinary()` has written v3 since.
 
 ### 🔧 Changed
 

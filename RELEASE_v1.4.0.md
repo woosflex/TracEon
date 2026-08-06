@@ -36,7 +36,7 @@ cache.restore("genome.bin");
 auto seq = cache.get("my_seq");  // ✓ Works! (was lost in v1.3.0)
 ```
 
-#### 3. **70 Test Cases, 3840 Assertions** 🧪
+#### 3. **84 Test Cases, 3907 Assertions** 🧪
 - NGSIndex correctness (FASTA/FASTQ/binary round-trips)
 - Real parallel GZIP benchmarking (fixed v1.3.0 false positive)
 - Format detection (RNA/protein FASTA)
@@ -153,7 +153,7 @@ index_mode_ = (mode == 1) ? IndexMode::NGS : IndexMode::GENOME;
 
 ## 🧪 Test Coverage
 
-### New Test Cases (57 → 70)
+### New Test Cases (57 → 84)
 - `Cache::getView()` zero-copy validation
 - `Cache::set()` + `save()` + `restore()` round-trip
 - `Cache IndexMode selection` (GENOME default, NGS explicit)
@@ -165,9 +165,12 @@ index_mode_ = (mode == 1) ? IndexMode::NGS : IndexMode::GENOME;
 - Protein FASTA format detection (non-ACGT)
 - `clearCache()` + reload (no dangling views)
 - v1 binary format (`TRO\x01`) backward compatibility
+- **Bug regression suite (9 new cases)**: FASTQ `'@'`-in-quality record preservation
+  (multithreaded + single-threaded), duplicate-key `set()` save/restore consistency
+  (GENOME + NGS), and the immutable-after-load contract (`set()` throws after load)
 
-### Test Assertions (3776 → 3840)
-**+64 assertions** validating:
+### Test Assertions (3776 → 3907)
+**+131 assertions** validating:
 - Data persistence across serialization boundaries
 - Index mode consistency before/after load
 - Zero-copy view validity after cache operations
@@ -189,7 +192,7 @@ cd build
 ./unit_tests
 
 # Expected output:
-# All tests passed (3840 assertions in 70 test cases)
+# All tests passed (3907 assertions in 84 test cases)
 ```
 
 ### Quick Benchmark
@@ -217,7 +220,7 @@ python quick_benchmark.py  # 2–3 minutes
 
 ## ✅ Verification Checklist
 
-- [x] All 70 unit tests pass (3840 assertions)
+- [x] All 84 unit tests pass (3907 assertions)
 - [x] Zero memory leaks (valgrind verified)
 - [x] Zero performance regressions vs v1.3.0
 - [x] NGSIndex mode tested end-to-end

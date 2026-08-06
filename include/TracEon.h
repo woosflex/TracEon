@@ -1,7 +1,7 @@
 /**
  * @file TracEon.h
  * @brief TracEon: High-Performance Genomic Data Cache
- * @version 1.0.0-rc1
+ * @version 1.4.0
  * @date December 2025
  * 
  * @section DESCRIPTION

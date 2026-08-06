@@ -29,7 +29,7 @@ TracEon is a zero-copy, lock-free C++20 genomic data caching library. This DOX t
 3. **Lock-free reads**: Single `std::atomic<bool> data_ready_` (acquire/release) guards load completion; no mutexes on read path
 4. **Pre-reserved maps**: Multithreaded parsers pre-reserve `ankerl::unordered_dense` maps to avoid mid-parse rehashing
 5. **GZIP: pre-allocate + direct-write**: zlib-ng decompresses directly into `text_arena_` (pre-sized at `compressed_size × 3` with OOM guard)
-6. **Binary cache format versioning**: `.traceon` v2 format (`"TRO\x02"`) uses LZ4 compression; v1 (`"TRO\x01"`) loads without decompression (backward compat)
+6. **Binary cache format versioning**: `.traceon` v3 format (`"TRO\x03"`, LZ4 Frame, streamed) is what `saveBinary()` writes; v2 (`"TRO\x02"`, LZ4 block) and v1 (`"TRO\x01"`, uncompressed) still load for backward compat
 7. **Parallel GZIP**: Concatenated GZIP streams are independently decompressed using zlib-ng `inflate()` API; single-stream files use unmodified `loadGzipSingleStream()` path
 
 ### Workflow Standards
