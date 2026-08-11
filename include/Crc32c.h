@@ -114,6 +114,12 @@ crc32c_x86_run(const uint8_t* data, size_t len, uint32_t crc) noexcept {
 // AArch64 crc32cx/crc32cw/crc32ch/crc32cb instructions. Same raw-running
 // semantics as the x86 path and the table fallback.
 #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+// The intrinsics are declared in <arm_acle.h> on GCC and Clang (including
+// Apple Clang on arm64 macOS). MSVC (_M_ARM64) does not define __aarch64__
+// and falls through to the table fallback below.
+#  if defined(__GNUC__) || defined(__clang__)
+#    include <arm_acle.h>
+#  endif
 [[nodiscard]] inline uint32_t crc32c_arm_run(const uint8_t* data, size_t len,
                                              uint32_t crc) noexcept {
     while (len >= 8) {

@@ -21,9 +21,22 @@ jobs:
     - name: Configure CMake with TSan
       run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
 
-    - name: Build Unit Tests
-      run: cmake --build build --target unit_tests -j 4
+    - name: Build All Test Targets
+      run: cmake --build build -j 4
 
-    - name: Run Tests
+    - name: Run Tests (TSan)
       working-directory: ./build  # This handles the 'cd build' for you
-      run: ctest -R TracEonTests --output-on-failure
+      run: |
+        # The [oom] test applies setrlimit(RLIMIT_AS), which kills the TSan
+        # allocator (FATAL: internal allocator is out of memory). It is a
+        # documented sanitizer incompatibility — the test passes in the normal
+        # suite. The suite is split into per-domain executables so each stays
+        # small enough for sanitizer runtimes.
+        ./unit_tests "~[oom]"
+        ./kmer_tests "~[oom]"
+        ./test_parser_fastq "~[oom]"
+        ./test_parser_fasta "~[oom]"
+        ./test_gzip "~[oom]"
+        ./test_binary_cache "~[oom]"
+        ./test_lifecycle "~[oom]"
+        ./test_api_misc "~[oom]"
