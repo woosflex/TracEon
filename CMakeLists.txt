@@ -179,3 +179,67 @@ target_link_libraries(kmer_c_compile_test PRIVATE traceon_kmer)
 # drive the link with the C++ driver to pull in libstdc++.
 set_target_properties(kmer_c_compile_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME KmerCCompileTest COMMAND kmer_c_compile_test)
+
+# ── Fuzzing targets (libFuzzer / OSS-Fuzz style) ─────────────────────────────
+# Off by default: fuzz/*.cpp are NOT compiled at all on normal builds (they
+# would compile fine with GCC too — each carries a portable file-fed main
+# guarded by #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION — but keeping
+# them out of the default build avoids dead targets and sanitizer flag noise
+# in the regular build/test flow).
+#
+# When ON, clang is REQUIRED (-fsanitize=fuzzer is a clang-only driver) and
+# each fuzz target is built with -fsanitize=fuzzer,address,undefined. The
+# fuzzers are deliberately NOT registered with CTest: CI runs them with an
+# explicit time budget (see .github/workflows/fuzz.yml) instead.
+#
+# Whole-program sanitizer coverage: ASan/UBSan only see bugs in instrumented
+# code, so the core/kmer libraries are instrumented too (PUBLIC — every fuzz
+# executable inherits the flags). Note that this also propagates the flags to
+# any OTHER executable built in this configure (unit_tests, traceon_driver,
+# …); they link the sanitizer runtime because the CI configures with
+# CMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined". The recommended
+# configure is exactly what .github/workflows/fuzz.yml does:
+#
+#   cmake -B build-fuzz -DTRACEON_BUILD_FUZZERS=ON \
+#         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+#         -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+option(TRACEON_BUILD_FUZZERS "Build libFuzzer fuzz targets (requires clang)" OFF)
+
+if(TRACEON_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "TRACEON_BUILD_FUZZERS=ON requires clang (CMAKE_CXX_COMPILER_ID is "
+            "'${CMAKE_CXX_COMPILER_ID}'). Configure with -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+
+    # Instrument the libraries so sanitizers see into SmartStrategy.cpp,
+    # kmerindex_c_api.cpp, and the header-only parsers/encoders.
+    target_compile_options(traceon_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_compile_options(traceon_kmer PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+
+    set(TRACEON_FUZZ_TARGETS
+        fuzz_v4_loader
+        fuzz_gzip_loader
+        fuzz_fastq
+        fuzz_fasta
+        fuzz_kmer_encode
+        fuzz_kmer_api
+        fuzz_trki
+    )
+    foreach(fuzz_target ${TRACEON_FUZZ_TARGETS})
+        add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
+        target_include_directories(${fuzz_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz)
+        target_link_libraries(${fuzz_target} PRIVATE traceon_core traceon_kmer)
+        # libFuzzer does NOT define FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+        # (verified on clang 22: -fsanitize=fuzzer adds no such macro); pass it
+        # explicitly so fuzz_common.h suppresses its file-fed main() and lets
+        # libFuzzer's driver main win (OSS-Fuzz convention). GCC file-fed
+        # builds (outside this configure) still get the guarded main.
+        target_compile_definitions(${fuzz_target} PRIVATE FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+        target_compile_options(${fuzz_target} PRIVATE
+            -fsanitize=fuzzer,address,undefined
+            -fno-omit-frame-pointer)
+        target_link_options(${fuzz_target} PRIVATE -fsanitize=fuzzer,address,undefined)
+        # NOT registered with CTest (see comment above).
+    endforeach()
+endif()

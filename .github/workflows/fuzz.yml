@@ -1,0 +1,123 @@
+# Fuzz workflow — closes the last never-run verification gate (fuzzing).
+#
+# Builds the libFuzzer targets (clang-only, TRACEON_BUILD_FUZZERS=ON) and
+# runs each against its seed corpus with a bounded time budget. A crash,
+# OOB read, leak, or sanitizer finding in ANY target fails the job; crash
+# reproducers are uploaded even on failure (if: always()).
+#
+# Runs on: push to main, PRs to main, and a weekly schedule (Monday 03:00 UTC).
+
+name: Fuzz
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 3 * * 1" # weekly: Monday 03:00 UTC
+
+jobs:
+  fuzz:
+    name: libFuzzer targets (ASan+UBSan)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Fuzzers are clang-only (-fsanitize=fuzzer). CMAKE_EXE_LINKER_FLAGS
+    # links the ASan/UBSan runtime into every executable in this configure
+    # (the fuzz targets get their own -fsanitize flags from the CMake block;
+    # the libs are instrumented via target_compile_options in CMakeLists.txt).
+    - name: Configure (clang, fuzzers ON, whole-program ASan/UBSan)
+      run: |
+        cmake -B build-fuzz \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DTRACEON_BUILD_FUZZERS=ON
+
+    - name: Build fuzz targets
+      run: |
+        cmake --build build-fuzz -j 4 --target \
+          fuzz_v4_loader fuzz_gzip_loader fuzz_fastq fuzz_fasta \
+          fuzz_kmer_encode fuzz_kmer_api fuzz_trki
+
+    # The multithreaded FASTQ/FASTA parsers only engage above the 10MB
+    # threshold (MULTITHREAD_THRESHOLD in parseArena()). Shipping 10MB+ seed
+    # files in git would bloat the repo, so generate them here — one valid
+    # >10MB FASTQ and one >10MB FASTA. libFuzzer executes corpus seeds as-is
+    # (max_len only caps new mutations), so the MT paths become reachable.
+    - name: Generate large corpus seeds (MT-parser paths, >10MB)
+      run: |
+        python3 - <<'EOF'
+        import os
+
+        def gen_fastq(path, records, seq_len=150):
+            seq = "ACGT" * (seq_len // 4)
+            qual = "I" * seq_len
+            with open(path, "w") as f:
+                for i in range(records):
+                    f.write(f"@mt_record_{i}\n{seq}\n+\n{qual}\n")
+
+        def gen_fasta(path, records, seq_len=4000):
+            seq = "ACGT" * (seq_len // 4)
+            with open(path, "w") as f:
+                for i in range(records):
+                    f.write(f">mt_record_{i}\n{seq}\n")
+
+        os.makedirs("fuzz/corpus/fastq", exist_ok=True)
+        os.makedirs("fuzz/corpus/fasta", exist_ok=True)
+        # ~317 B/record -> 36k records ≈ 11.4 MB; >10 MB MT threshold.
+        gen_fastq("fuzz/corpus/fastq/mt_11mb.fastq", 36000)
+        # ~4.0 KB/record -> 3k records ≈ 12 MB; >10 MB MT threshold.
+        gen_fasta("fuzz/corpus/fasta/mt_11mb.fasta", 3000)
+        EOF
+
+    # Run each target with a bounded budget: libFuzzer self-terminates at
+    # -max_total_time=110 (exit 0); `timeout 120s` is a pure backstop.
+    # -ignore_crashes=0 (explicit, matches the default) guarantees a crash
+    # produces a nonzero exit → job failure. Reproducers land in artifacts/.
+    - name: Fuzz each target (bounded)
+      shell: bash
+      run: |
+        set -u
+        declare -A corpus=(
+          [fuzz_v4_loader]="fuzz/corpus/v4_loader"
+          [fuzz_gzip_loader]="fuzz/corpus/gzip_loader"
+          [fuzz_fastq]="fuzz/corpus/fastq"
+          [fuzz_fasta]="fuzz/corpus/fasta"
+          [fuzz_kmer_encode]="fuzz/corpus/kmer_encode"
+          [fuzz_kmer_api]="fuzz/corpus/kmer_api"
+          [fuzz_trki]="fuzz/corpus/trki"
+        )
+        for target in "${!corpus[@]}"; do
+          echo "== fuzzing $target (seed corpus: ${corpus[$target]}) =="
+          mkdir -p "artifacts/$target"
+          timeout 120s ./build-fuzz/$target \
+            -runs=100000 \
+            -max_total_time=110 \
+            -max_len=262144 \
+            -ignore_crashes=0 \
+            -print_final_stats=1 \
+            -artifact_prefix="artifacts/$target/" \
+            "${corpus[$target]}"
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::fuzz target $target exited $rc (crash/timeout/sanitizer finding)"
+            exit $rc
+          fi
+          echo "== $target: no findings =="
+        done
+
+    # Upload crash reproducers (and any other artifacts) even when a target
+    # failed — the repro file is exactly what the maintainers need.
+    - name: Upload fuzz artifacts (crash reproducers)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-artifacts
+        path: artifacts/
+        if-no-files-found: ignore

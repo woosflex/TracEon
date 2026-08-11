@@ -38,6 +38,10 @@
 *.log
 *.txt
 *.json
+
+# But the fuzz seed corpus is committed source (even its *.bin seeds)
+!fuzz/corpus/
+!fuzz/corpus/**
 *.png
 *.csv
 
