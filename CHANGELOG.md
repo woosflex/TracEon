@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+*Post-2.0.0 fixes will be listed here.*
+
+---
+
+## [2.0.0] — v2.0.0 "Durandal" (2026)
+
+*Integrity, v4 binary format, and the lifecycle contract. Verified:
+**128 test cases / 4195 assertions** (was 115 / 4076).*
+
+### 💥 Breaking Changes / Migration
+
+1. **Binary cache:** `.traceon` is **v4 only** (`"TRO\x04"`). v1/v2/v3 caches
+   are rejected with "unsupported cache version; regenerate with v2.0.0" —
+   there are no legacy readers. Regenerate caches after upgrading.
+2. **Input integrity:** truncated/corrupt GZIP and trailing garbage after the
+   last GZIP member now throw `std::runtime_error`; partial data is never
+   published.
+3. **Mutation/lifecycle:** `set()`/`addEntry()` after a load throws
+   `std::logic_error`; call `clearCache()` only after all readers stop using
+   views.
+4. **View/storage:** `getView()` remains zero-copy and non-owning; its result
+   must not be used after `clearCache()`, reload, or destruction (reader
+   quiescence contract — see ADR-001).
+5. **Source/ABI:** `std::string_view`-backed index keys require recompilation;
+   **no ABI stability is promised** across 1.x → 2.x.
+6. **k-mer surface:** the k-mer C API ships as an opt-in separate target (`traceon_kmer`), hardened: noexcept C boundary with status codes + `kmerindex_last_error()`, caller-owned iterators, freeze semantics, validated TRKI loading. Not part of the core umbrella.
+
+### ✨ Added
+
+- **`.traceon` v4 binary format**: `saveBinary()`/`Cache::save()` now write
+  `"TRO\x04"` — a 26-byte header (magic, codec flags, index mode, logical
+  payload length u64-LE, compressed frame length u64-LE, CRC32C u32-LE)
+  followed by a streamed LZ4 Frame. The CRC32C checksum covers the ENTIRE
+  uncompressed logical payload plus the canonical header fields, computed
+  **incrementally** as chunks pass through the LZ4F compressor/decompressor
+  (no second full-payload pass, no extra allocation).
+- **CRC32C with runtime dispatch**: x86 SSE4.2 `crc32` instruction (guarded by
+  `TRACEON_HAS_AVX2`, selected via `__builtin_cpu_supports("sse4.2")`),
+  AArch64 `crc32cx/crc32cw` intrinsics (guarded by `TRACEON_HAS_NEON` /
+  `__ARM_FEATURE_CRC32`), and a portable table fallback — with a tested
+  fallback-vs-hardware equivalence guarantee (new `include/Crc32c.h`).
+- **Lifecycle contract documentation**: reader quiescence is now prominent in
+  `include/Cache.h`, `include/SmartStrategy.h`, `README.md`, and ADR-001;
+  `TRACEON_DEBUG_LIFECYCLE` adds a debug-only reader counter/scope that warns
+  in `clearInternal()` when a `getView()` lookup overlaps a teardown
+  (diagnostic only — not synchronization).
+
+### 🔧 Changed
+
+- **v4 reader hardening (semantics preserved from v2/v3)**: implausible sizes
+  rejected before allocation (undersized logical length, 32-bit `size_t`
+  guard, OOM guard + `std::bad_alloc` catch), subtraction-form bounds checks
+  (`n > end - ptr`), exact-length + exact-frame-termination requirements,
+  count-bounded reserve (`remaining_bytes / min-record-bytes`), and
+  **failure atomicity** — an invalid load never publishes `data_ready_` or
+  partial map state (cache resets to the pristine empty state).
+- **Wrong-field rejection**: unknown magic/version, unsupported codec flags,
+  invalid index mode, wrong logical length, wrong record count, and
+  checksum mismatches each throw a specific `std::runtime_error`.
+
+### 🐛 Fixed
+
+- **FASTQ empty-line handling**: Empty quality lines now parse as `qual=''`
+  (previously they corrupted record pairing and dropped every subsequent
+  record); empty sequence lines no longer break the 4-line cycle. Both parsers
+  consume a strict positional 4-line cycle (header / seq / `+` / qual)
+  advancing **exactly one line terminator per boundary** at all 8 sites.
+- **FASTA header-only / abutting records**: `normalizeFastaArena()` writes the
+  record terminator only when the sequence actually produced bytes.
+  Header-only records (`>a\n>b\n...`) and records whose sequence abuts the
+  next `>` without a newline (`>a\nACGT>b\n...`) are preserved — previously
+  the unconditional terminator clobbered the next record's `>` marker and
+  silently truncated the whole file.
+- **Multithreaded chunk-boundary classifier**: the backward lookbehind was
+  replaced with a **forward** check — a candidate line-start `@` is a genuine
+  header iff the line two lines later begins with `+`. Quality lines that start
+  with `+` (Phred+33 Q10, ASCII 43) no longer cause every worker after chunk 0
+  to drop its whole chunk (repro: 80k reads → 4,468 loaded, 94.4% loss).
+- **GZIP integrity validation**: `loadFile()` / `loadGzipFile()` / `restore()`
+  now throw `std::runtime_error` on truncated GZIP streams, trailing garbage
+  after the last member, and truncated tail members in concatenated GZIP —
+  corrupt/truncated `.gz` files that previously loaded silently now fail.
+- **Binary-cache hardening**: v2 `original_size` / `compressed_size` >
+  `INT_MAX` rejected before allocation; v2 resize carries the v3-style OOM
+  guard + `std::bad_alloc` catch; all pointer bounds checks use the
+  overflow-safe subtraction form; record counts bounded by remaining payload
+  bytes (≥ 12 B/record GENOME, ≥ 20 B NGS) in v1/v2/v3 — crafted caches can
+  no longer force multi-GB allocations.
+- **Duplicate-key `set()` save/restore consistency**: `addEntry()` incremented
+  `serialized_size_estimate_` on a no-op `emplace()`, over-declaring the
+  binary header so `restore()` rejected the cache; now first-wins with a count
+  precheck.
+- **Immutable-after-load enforcement**: `set()`/`addEntry()` after a load
+  throws `std::logic_error` (see ADR-001); `clearCache()` reopens the build
+  phase.
+
+### 🧪 Testing
+
+- **128 test cases / 4195 assertions** — v1/v2/v3 compatibility tests replaced
+  with v4 equivalents: GENOME + NGS round-trips, CRC32C known-answer
+  (`0xE3069283`), single-byte mutations at header/middle/tail → checksum
+  error, truncation at frame boundaries, wrong logical length, wrong record
+  count, wrong magic/codec/mode → rejection, legacy v1/v2/v3 rejection, and
+  fallback-vs-hardware CRC equivalence. The v2 `2^32+N` truncation probe,
+  count-bomb, and implausible-size hardening tests were ported to v4
+  semantics. All parser/GZIP/integrity tests remain green.
+
 ## [1.4.0] — v1.4.0 "Caliburn" (2026-06-30)
 
 *The sword of selection — choosing the right index mode.*

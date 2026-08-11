@@ -2,42 +2,112 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v1.4.0%20%22Caliburn%22-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v2.0.0-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
-[![BinaryCache](https://img.shields.io/badge/BinaryCache-LZ4%20Compressed-green.svg)]()
+[![BinaryCache](https://img.shields.io/badge/BinaryCache-v4%20CRC32C%20Integrity-green.svg)]()
 
-**TracEon** (v1.4.0 "Caliburn") is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, LZ4-compressed binary caches, and **workload-optimized index modes** for genomic and NGS applications.
+**TracEon** (v2.0.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
 
-## 🎯 What's New in v1.4.0 "Caliburn"
+## 🎯 What's New in v2.0.0
 
-### **IndexMode Selection** 🎯
-- `Cache(IndexMode::GENOME)` — Default string-keyed index for reference genomes
-- `Cache(IndexMode::NGS)` — Hash-keyed index optimized for short-read NGS workloads
-- Previously `NGSIndex` was compiled but unreachable — now production-ready
-- **`getIndexMode()`** exposes active mode via public API
+> **Breaking release.** v2.0.0 makes a clean break in the binary format and
+> lifecycle contract (no public adopters were identified; see the
+> [design review](outputs/traceon-v2-design-review.md)). Read the
+> [Migration / Breaking Changes](#migration--breaking-changes) section before
+> upgrading. The experimental k-mer C API is **not** shipped in v2.0.0.
 
-### **Fixed: `Cache::set()` Data Persistence** 🔧
-- Manually-added entries via `set()` now persist through `save()`/`restore()` cycles
-- Previous bug: `m_manual_store` was never serialized, causing silent data loss
-- Now routes through `SmartStrategy::addEntry()` for unified storage
+### **`.traceon` v4 Binary Format** 📦
+- `saveBinary()` / `Cache::save()` now write **v4** (`"TRO\x04"`): a 26-byte
+  header (magic, codec flags, index mode, logical payload length u64-LE,
+  compressed frame length u64-LE, CRC32C u32-LE) followed by a streamed LZ4
+  Frame.
+- **Whole-payload CRC32C**: the checksum covers the entire uncompressed
+  logical payload plus the canonical header fields, computed **incrementally**
+  as chunks pass through the LZ4F compressor/decompressor — no second
+  full-payload pass, no extra allocation.
+- **Hardware-accelerated CRC32C** with runtime dispatch: x86 SSE4.2 `crc32`
+  instruction, AArch64 `crc32cx/crc32cw`, and a portable table fallback
+  (equivalence-tested).
+- **v4 is the ONLY readable format.** v1/v2/v3 caches are rejected with
+  "unsupported cache version; regenerate with v2.0.0". Corrupt, truncated,
+  or modified caches are rejected: wrong magic/version, unsupported
+  codec/mode, wrong logical length, checksum mismatch, implausible sizes,
+  and count-bombs all fail loudly — never silently loading garbage.
+- All v2/v3 hardening semantics are preserved in the v4 reader: implausible
+  sizes rejected before allocation, subtraction-form bounds checks, count-
+  bounded reserve, OOM guard + `bad_alloc` catch, and **failure atomicity**
+  (an invalid load never publishes partial state).
 
-### **Streaming v3 Binary Cache** 📦
-- `saveBinary()` now writes `.traceon` **v3** (`"TRO\x03"`, streaming LZ4 Frame)
-- Payload is streamed through a 1 MB window (`serializePayload()`), so save/restore peak memory stays **constant** regardless of dataset size (the old v2 path materialized full payload + compressed copies)
-- `loadBinary()` remains backward compatible with v2 (LZ4 block) and v1 (uncompressed)
+### **Lifecycle Contract (Reader Quiescence)** 🔒
+- `getView()` returns a **non-owning** `std::string_view` valid only while the
+  same loaded snapshot is installed. It is **dangling** once `clearCache()`,
+  reload, or destruction begins — stop using views before clearing/reloading.
+- Concurrent lock-free reads against a live snapshot remain fully supported;
+  the write-side mutex serializes writers only (it is not reader reclamation).
+- `TRACEON_DEBUG_LIFECYCLE` (opt-in) adds a reader counter diagnostic.
 
-### **Comprehensive Test Coverage** 🧪
-- **+13 new test cases** (57 → 70), **+64 new assertions** (3776 → 3840)
-- NGSIndex correctness (FASTA/FASTQ load/lookup/save/restore)
-- **Real parallel GZIP benchmarking** (fixed false-positive test using gzip store mode)
-- Format detection (RNA/protein FASTA)
-- Binary cache v1 backward compatibility
-- Edge cases (`clearCache()` + reload, zero-copy views)
+### **Integrity Hardening** 🛡️ (carried from fix/p0-integrity)
+- Strict FASTQ 4-line framing (empty seq/qual lines, `'@'`/`'+'` in quality).
+- GZIP truncation / trailing garbage / truncated tail members throw instead
+  of serving partial data.
+- `set()`/`addEntry()` after a load throws `std::logic_error`.
+
+### **Zero-copy + Performance** ⚡
+- `std::string_view` index keys, transparent wyhash-style hashing, and
+  pre-reserved thread-local maps (no allocation on insert/read hot paths).
+
+---
+
+## 🚨 Migration / Breaking Changes (v1.x → v2.0.0)
+
+1. **Binary cache:** `.traceon` files are **v4 only**. v1/v2/v3 caches are
+   rejected at load time with "unsupported cache version; regenerate with
+   v2.0.0". Regenerate caches after upgrading:
+   ```cpp
+   TracEon::Cache old;              // old library
+   // ... load + rebuild from source text/GZIP ...
+   old.save("genome.traceon");      // now writes v4
+   ```
+2. **Input integrity:** truncated/corrupt GZIP and trailing garbage after the
+   last GZIP member now throw `std::runtime_error`; partial data is never
+   published.
+3. **Mutation/lifecycle:** `set()`/`addEntry()` after a load throws
+   `std::logic_error`; call `clearCache()` only after all readers stop using
+   views.
+4. **View/storage:** `getView()` remains zero-copy and non-owning; its result
+   must not be used after `clearCache()`, reload, or destruction (see the
+   [Lifecycle contract](#-lifecycle-contract-reader-quiescence-) below).
+5. **Source/ABI:** `std::string_view`-backed index keys require recompilation;
+   **no ABI stability is promised** across 1.x → 2.x.
+6. **Deferred surface:** the experimental k-mer C API and `TRKI` are **not**
+   shipped in v2.0.0 (planned separately).
+
+---
+
+## 🔒 Lifecycle Contract (Reader Quiescence)
+
+`getView()` returns a `std::string_view` pointing directly into the immutable
+snapshot's arena (`text_arena_` / `manual_store_`). Because the view is
+**non-owning**, it is valid only while the same loaded snapshot stays installed:
+
+- ✅ Concurrent lock-free reads against a **live** snapshot are safe.
+- ❌ Using a view after `clearCache()`, a reload (`loadFile`/`loadGzipFile`/
+  `restore`), or destruction is **undefined behavior** — the backing arena has
+  been destroyed.
+- The write-side mutex serializes writers; it does **not** reclaim memory
+  from readers and is deliberately not taken on the read path.
+- Sequential clear/reload cycles are fully supported and tested.
+- For debugging coordinated misuse, build with `-DTRACEON_DEBUG_LIFECYCLE`:
+  `clearInternal()` warns if a `getView()` lookup overlaps a teardown
+  (diagnostic only — not synchronization).
+
+See [ADR-001](docs/architecture/ADR-001-lock-free-reads.md) for the full
+memory-ordering and quiescence contract.
 
 ### **v1.3.0 "Hrunting" Highlights** (Previous Release)
 
@@ -224,6 +294,13 @@ cache.loadFile("genome.fasta"); // Checks 0x1f 0x8b if ext doesn't match
 - **Geometric growth**: Falls back to 2× capacity doubling if pre-size estimate is too low
 - **shrink_to_fit**: Releases excess capacity after decompression (~183MB steady-state for 100MB file)
 
+> **⚠️ Breaking change (stricter validation):** `loadFile()` / `loadGzipFile()`
+> and `restore()` now **reject** corrupt or truncated inputs instead of loading
+> them silently. Truncated GZIP streams, trailing garbage after the last GZIP
+> member, and implausible binary-cache sizes/counts throw `std::runtime_error`.
+> `.gz` / `.traceon` files that previously loaded partial data as complete must
+> be regenerated.
+
 #### 4. **ankerl::unordered_dense Hashing** (v1.2.0)
 - **Swiss-Table Design**: Better cache locality and ~0.8s faster inserts vs Robin Hood
 - **Pre-allocation**: Reserve 125% of estimated capacity to prevent rehashing
@@ -249,10 +326,16 @@ TracEon/
 │   ├── SmartStrategy.cpp # Lock-free logic, GZIP, SIMD parsers
 │   └── IEncodingStrategy.cpp
 ├── tests/                # Unit & integration tests (Catch2)
+│   ├── TestHelpers.h          # Shared fixtures/helpers
 │   ├── CacheTests.cpp
-│   ├── SmartStrategyTests.cpp
 │   ├── MapDefsTests.cpp
-│   └── FastqTests.cpp
+│   ├── FastqTests.cpp
+│   ├── test_parser_fastq.cpp  # FASTQ parser domain
+│   ├── test_parser_fasta.cpp  # FASTA parser domain
+│   ├── test_gzip.cpp          # GZIP/parallel-decode domain
+│   ├── test_binary_cache.cpp  # `.traceon` v4 binary cache domain
+│   ├── test_lifecycle.cpp     # lifecycle/immutability domain
+│   └── test_api_misc.cpp      # misc API/SIMD/NGS domain
 ├── benchmarks/           # Performance validation
 │   ├── benchmark_runner.py    # Matrix benchmark (sizes × scenarios)
 │   ├── validate_real_data.py  # Real-world datasets (NCBI/SRA)
@@ -484,6 +567,9 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **[ADR-003: SIMD Parsing & Hash Map Optimization](docs/architecture/ADR-003-simd-parsing-hash-map.md)**  
   SIMD-accelerated boundary scanning, ankerl::unordered_dense, pre-reserved thread-local maps
 
+- **[ADR-005: v4 Binary Format & CRC32C](docs/architecture/ADR-005-traceon-v4-binary-format.md)**
+  Wire layout, checksum coverage/streaming order, hardware dispatch, hardening
+
 ### Performance Characteristics
 - **[Performance Profile](docs/performance-profile.md)**  
   Expected throughput ranges, regression thresholds, hardware scaling
@@ -539,19 +625,26 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **`Cache::set()` data persistence**: Manually-added entries via `set()` are now serialized by `save()` and restored by `restore()`
 - **Correctness hardening**: Closed test gaps for parallel GZIP, RNA/protein format detection, v1 binary format, `clearCache()` + reload, and zero-copy `Cache::getView()`
 
-### 🎯 Planned Releases
+### ✅ v2.0.0 (Q4 2026) — Integrity & v4 Format (Current Release)
+*Codename: Durandal*
 
-#### v2.0.0 "Durandal" (Q4 2026)
-*Peerless - Language-agnostic access*
+- **`.traceon` v4 binary format**: CRC32C whole-payload integrity (SSE4.2 /
+  AArch64 / table dispatch), exact-length + exact-frame-termination
+  validation, malformed-cache rejection, failure atomicity
+- **No legacy binary readers**: v1/v2/v3 caches must be regenerated
+- **Lifecycle contract**: documented reader quiescence + debug-only
+  `TRACEON_DEBUG_LIFECYCLE` diagnostic
+- **Integrity hardening**: strict FASTQ framing, GZIP truncation rejection,
+  immutable-after-load enforcement, string_view keys + wyhash reserve perf
+- **C API deferred**: the experimental k-mer C API moved out of the v2.0.0
+  stable surface (exception-boundary, iterator-ownership, and `TRKI` format
+  work pending — see the design review)
 
-- **C API**: Foreign Function Interface for Python/R/Julia
-- **Python Bindings**: Zero-copy access from NumPy/Pandas
-- **R Bindings**: Integration with Bioconductor workflows
-- **Streaming API**: Process datasets larger than RAM
-
-#### v2.1.0 "Rule Breaker" (Q1 2027)
+### 🎯 v2.1.0 "Rule Breaker" (Q1 2027)
 *Noble phantasm that shatters conventional limits*
 
+- **Experimental k-mer C API** (with a defined C error model, caller-owned
+  iteration, and a separate `TRKI` format decision)
 - **Distributed Caching**: Shard datasets across nodes
 - **NUMA-Aware Architecture**: Optimize for >8 core systems
 - **Remote Access**: Network protocol for shared genomic databases
@@ -705,7 +798,7 @@ Bioinformatics tools force a choice:
 ❌ **Not Ideal For:**
 - Write-heavy workloads (TracEon is read-optimized)
 - Distributed systems (single-node only in v1.0.0)
-- Datasets larger than available RAM (future: streaming API in v2.0.0)
+- Datasets larger than available RAM (future: streaming API in a later release)
 
 ---
 

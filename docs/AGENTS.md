@@ -22,6 +22,7 @@ Maintainer creates/updates ADRs when architectural decisions are made. ADRs are 
 - **ADR-002: GZIP Integration** — zlib-ng, pre-allocation heuristics, streaming decompression
 - **ADR-003: SIMD Parsing & Hash Map Optimization** — SIMD boundary scanning, ankerl::unordered_dense, pre-reserved maps
 - **ADR-004: Parallel GZIP & LZ4 Binary Cache** — concatenated-stream parallel decompression, LZ4 binary cache compression (v1.3.0)
+- **ADR-005: `.traceon` v4 Binary Format & CRC32C** — v4 header layout, whole-payload CRC32C coverage and streaming order, hardware dispatch, reader hardening + failure atomicity (v2.0.0)
 
 ### Performance Profile
 - **Location**: `performance-profile.md`

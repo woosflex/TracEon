@@ -25,15 +25,18 @@ TracEon is a zero-copy, lock-free C++20 genomic data caching library. This DOX t
 
 ### Core Invariants (Non-Negotiable)
 1. **Zero-copy**: All `getView()` calls return `std::string_view` directly into arena memory
-2. **Immutable after load**: Data never changes post-parse; this enables lock-free reads
+2. **Immutable after load**: Data never changes post-parse; this enables lock-free reads. `set()`/`addEntry()` after a load throws `std::logic_error` (ADR-001)
 3. **Lock-free reads**: Single `std::atomic<bool> data_ready_` (acquire/release) guards load completion; no mutexes on read path
 4. **Pre-reserved maps**: Multithreaded parsers pre-reserve `ankerl::unordered_dense` maps to avoid mid-parse rehashing
 5. **GZIP: pre-allocate + direct-write**: zlib-ng decompresses directly into `text_arena_` (pre-sized at `compressed_size × 3` with OOM guard)
-6. **Binary cache format versioning**: `.traceon` v3 format (`"TRO\x03"`, LZ4 Frame, streamed) is what `saveBinary()` writes; v2 (`"TRO\x02"`, LZ4 block) and v1 (`"TRO\x01"`, uncompressed) still load for backward compat
+6. **Binary cache format versioning**: `.traceon` v4 format (`"TRO\x04"`, LZ4 Frame + whole-payload CRC32C, streamed) is what `saveBinary()` writes and the ONLY format `loadBinary()` reads — v1/v2/v3 are rejected ('unsupported cache version; regenerate with v2.0.0')
 7. **Parallel GZIP**: Concatenated GZIP streams are independently decompressed using zlib-ng `inflate()` API; single-stream files use unmodified `loadGzipSingleStream()` path
+8. **Strict FASTQ framing**: Parsers consume a strict 4-line positional cycle (header / seq / '+' / qual) advancing EXACTLY ONE line terminator per boundary; empty quality lines parse as `qual=''` and empty sequence lines do not break the cycle. The multithreaded chunk-boundary classifier uses a FORWARD check (genuine header iff line+2 begins with '+'), never backward lookbehind
+9. **GZIP integrity rejection (breaking)**: `loadFile()`/`loadGzipFile()`/`restore()` throw `std::runtime_error` on truncated GZIP streams (gzread 0-with-error), trailing garbage after the last member (gzoffset < file size), and truncated tail members (Z_BUF_ERROR + avail_in==0) — corrupt/truncated `.gz` files that previously loaded silently now fail
+10. **Binary-cache hardening**: implausible logical/frame lengths rejected before allocation (OOM guard + `bad_alloc` catch); pointer bounds checks use the overflow-safe subtraction form; record counts bounded by remaining payload bytes (≥12 B GENOME / ≥20 B NGS per record); exact-length + exact-frame-termination + whole-payload CRC32C verification — crafted/modified caches fail loudly and never publish partial state (failure atomicity)
 
 ### Workflow Standards
-- All unit tests via Catch2 in `tests/` directory
+- All unit tests via Catch2 in `tests/` directory (current suite: 128 test cases / 4195 assertions)
 - Tests must run from `build/` directory (relative path assumption)
 - Performance validation via `benchmarks/benchmark_runner.py` before release
 - Regression check via `benchmarks/check_regression.py` gates merges
