@@ -48,15 +48,17 @@ calling the API.
 
 ```bash
 cmake -B build-fuzz -DTRACEON_BUILD_FUZZERS=ON \
-      -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-fuzz -j 4 --target fuzz_v4_loader fuzz_gzip_loader \
       fuzz_fastq fuzz_fasta fuzz_kmer_encode fuzz_kmer_api fuzz_trki
 ./build-fuzz/fuzz_v4_loader -max_total_time=120 fuzz/corpus/v4_loader/
 ```
 
 - Requires clang (`-fsanitize=fuzzer` is clang-only); CMake enforces this.
-- The core/kmer libraries are instrumented too (whole-program ASan/UBSan).
+- The core/kmer libraries are instrumented with
+  `-fsanitize=fuzzer-no-link,address,undefined` (PRIVATE — instrumentation
+  only, no runtime linked into the static libs; each fuzz target adds its
+  own single `-fsanitize=fuzzer,address,undefined` on compile+link).
 - Fuzzers are NOT registered with CTest; CI runs them with explicit budgets.
 - The normal build (`TRACEON_BUILD_FUZZERS=OFF`, the default) never compiles
   `fuzz/*.cpp`.

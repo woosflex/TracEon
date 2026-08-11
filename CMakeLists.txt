@@ -192,17 +192,21 @@ add_test(NAME KmerCCompileTest COMMAND kmer_c_compile_test)
 # fuzzers are deliberately NOT registered with CTest: CI runs them with an
 # explicit time budget (see .github/workflows/fuzz.yml) instead.
 #
-# Whole-program sanitizer coverage: ASan/UBSan only see bugs in instrumented
-# code, so the core/kmer libraries are instrumented too (PUBLIC — every fuzz
-# executable inherits the flags). Note that this also propagates the flags to
-# any OTHER executable built in this configure (unit_tests, traceon_driver,
-# …); they link the sanitizer runtime because the CI configures with
-# CMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined". The recommended
-# configure is exactly what .github/workflows/fuzz.yml does:
+# Whole-program sanitizer coverage (canonical OSS-Fuzz pattern): the core/
+# kmer libraries are instrumented with -fsanitize=fuzzer-no-link,address,
+# undefined. fuzzer-no-link adds libFuzzer's coverage callbacks and the
+# sanitizer instrumentation but links NO runtime (neither libFuzzer nor
+# ASan/UBSan) into the static libs, so nothing propagates to consumers.
+# Each fuzz target then adds its own single -fsanitize=fuzzer,address,
+# undefined on compile AND link — the only runtime spec on the final link
+# line, so no duplicate sanitizer runtimes. (clang 18/19 rejects two ASan
+# runtime specs with 'incompatible ASan runtimes'; clang 22 tolerated the
+# duplicate, which is why the old CMAKE_EXE_LINKER_FLAGS approach worked
+# locally on Fedora but failed on ubuntu-latest.) The recommended configure
+# is exactly what .github/workflows/fuzz.yml does:
 #
 #   cmake -B build-fuzz -DTRACEON_BUILD_FUZZERS=ON \
-#         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-#         -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+#         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
 option(TRACEON_BUILD_FUZZERS "Build libFuzzer fuzz targets (requires clang)" OFF)
 
 if(TRACEON_BUILD_FUZZERS)
@@ -213,9 +217,13 @@ if(TRACEON_BUILD_FUZZERS)
     endif()
 
     # Instrument the libraries so sanitizers see into SmartStrategy.cpp,
-    # kmerindex_c_api.cpp, and the header-only parsers/encoders.
-    target_compile_options(traceon_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_compile_options(traceon_kmer PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    # kmerindex_c_api.cpp, and the header-only parsers/encoders. PRIVATE +
+    # fuzzer-no-link: coverage/sanitizer instrumentation only — no runtime
+    # is linked into the static libs and nothing propagates to consumers
+    # (the fuzz targets supply the single -fsanitize=fuzzer,address,undefined
+    # spec on their own compile+link lines).
+    target_compile_options(traceon_core PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+    target_compile_options(traceon_kmer PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
 
     set(TRACEON_FUZZ_TARGETS
         fuzz_v4_loader

@@ -27,16 +27,20 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # Fuzzers are clang-only (-fsanitize=fuzzer). CMAKE_EXE_LINKER_FLAGS
-    # links the ASan/UBSan runtime into every executable in this configure
-    # (the fuzz targets get their own -fsanitize flags from the CMake block;
-    # the libs are instrumented via target_compile_options in CMakeLists.txt).
-    - name: Configure (clang, fuzzers ON, whole-program ASan/UBSan)
+    # Fuzzers are clang-only (-fsanitize=fuzzer). Sanitizer coverage follows
+    # the canonical OSS-Fuzz split: the core/kmer libs are instrumented with
+    # -fsanitize=fuzzer-no-link,address,undefined (PRIVATE in CMakeLists.txt
+    # — instrumentation only, no runtime linked, nothing propagates), and
+    # each fuzz target supplies its own single -fsanitize=fuzzer,address,
+    # undefined on compile AND link. No CMAKE_EXE_LINKER_FLAGS: a second
+    # ASan/UBSan runtime spec on the link line is what made clang 18/19 on
+    # ubuntu-latest fail with 'incompatible ASan runtimes' (clang 22 on
+    # Fedora tolerated the duplicate — hence the local/CI divergence).
+    - name: Configure (clang, fuzzers ON, fuzzer-no-link lib instrumentation)
       run: |
         cmake -B build-fuzz \
           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
           -DCMAKE_CXX_COMPILER=clang++ \
-          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
           -DTRACEON_BUILD_FUZZERS=ON
 
     - name: Build fuzz targets
