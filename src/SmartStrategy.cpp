@@ -1,5 +1,6 @@
 #include "SmartStrategy.h"
 #include "SimdUtils.h"
+#include "Crc32c.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -18,6 +19,8 @@
 #include <lz4frame.h>
 #include <new>
 #include <atomic>
+#include <climits>
+#include <limits>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -62,12 +65,63 @@ struct MMapHandle {
     }
 };
 
-static const char MAGIC_BYTES_V3[] = "TRO\x03"; // v1.5 format (LZ4 Frame, streamed)
+// ── `.traceon` v4 binary format ─────────────────────────────────────────────
+// Header layout (all multi-byte fields little-endian):
+//
+//   offset 0  magic          "TRO\x04"           (4 bytes)
+//   offset 4  codec flags    0x01 = LZ4 Frame;   (1 byte)
+//                            bits 1..7 reserved, must be 0
+//   offset 5  index mode     0 = GENOME, 1 = NGS (1 byte)
+//   offset 6  logical length  uncompressed payload length (u64 LE)
+//   offset 14 frame length    LZ4 Frame length    (u64 LE)
+//   offset 22 CRC32C          Castagnoli, u32 LE, over the ENTIRE
+//                            uncompressed logical payload followed by the
+//                            canonical header bytes [0..22) (the checksum
+//                            field itself excluded)
+//   offset 26 LZ4 Frame       (frame length bytes)
+//
+// Total header size: 26 bytes. The checksum is a whole-payload integrity
+// check (accidental-corruption detection, NOT authentication — a deliberate
+// attacker can construct collisions). Truncation is detected by the exact
+// logical-length / exact-frame-termination requirements on load, not by the
+// checksum alone. The payload-first ordering is deliberate: it lets the
+// checksum be computed incrementally on both sides — as serialized chunks
+// pass through the LZ4F compressor on save, and as decompressed chunks are
+// written to text_arena_ on load — with the 22 header bytes fed afterwards
+// (frame_len is only known once the frame is complete). See
+// docs/architecture/ADR-005-traceon-v4-binary-format.md and the design
+// review at outputs/traceon-v2-design-review.md.
+static constexpr char V4_MAGIC[4] = {'T', 'R', 'O', '\x04'};
+static constexpr uint8_t V4_CODEC_LZ4F = 0x01;   // codec flags: LZ4 Frame
+static constexpr uint8_t V4_CODEC_MASK = 0x01;   // only bit 0 is defined
+static constexpr size_t V4_HEADER_LEN = 26;      // 4+1+1+8+8+4
+static constexpr size_t V4_CRC_OFFSET = 22;      // header bytes [0..22) are checksummed
 
-// Streaming (de)compression chunk size for the v3 binary cache format.
+// Streaming (de)compression chunk size for the v4 binary cache format.
 // Bounds peak memory during saveBinary()/loadBinary() to a small constant
 // regardless of dataset size (see ADR-004 follow-up: streaming binary cache).
 static constexpr size_t STREAM_CHUNK_SIZE = 1024 * 1024; // 1MB
+
+// ── Explicit little-endian header field codecs ──────────────────────────────
+// The v4 header fields are little-endian on the wire regardless of host byte
+// order. The payload itself keeps the existing v1-v3 native-endian record
+// layout (serializePayload()) — unchanged by the v4 format.
+static void write_le64(char* dst, uint64_t v) noexcept {
+    for (int i = 0; i < 8; ++i) dst[i] = static_cast<char>((v >> (8 * i)) & 0xFFu);
+}
+static void write_le32(char* dst, uint32_t v) noexcept {
+    for (int i = 0; i < 4; ++i) dst[i] = static_cast<char>((v >> (8 * i)) & 0xFFu);
+}
+static uint64_t read_le64(const char* p) noexcept {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | static_cast<uint8_t>(p[i]);
+    return v;
+}
+static uint32_t read_le32(const char* p) noexcept {
+    uint32_t v = 0;
+    for (int i = 3; i >= 0; --i) v = (v << 8) | static_cast<uint8_t>(p[i]);
+    return v;
+}
 
 SmartStrategy::SmartStrategy(IndexMode mode)
     : detected_format_(FileFormat::UNKNOWN),
@@ -86,6 +140,29 @@ inline uint64_t SmartStrategy::hash_key(std::string_view key) const {
 }
 
 void SmartStrategy::clearInternal() {
+    // ── Reader-quiescence diagnostic (TRACEON_DEBUG_LIFECYCLE, opt-in) ──────
+    // Detects a getView() call whose LOOKUP overlaps this teardown. It cannot
+    // detect a caller that retained the returned std::string_view and
+    // dereferences it AFTER clearCache()/reload/destruction completes — a
+    // debug assertion cannot prove anything about post-return use. It is a
+    // diagnostic for coordinated misuse, NOT a synchronization or reclamation
+    // mechanism (see ADR-001 / README lifecycle contract).
+#ifdef TRACEON_DEBUG_LIFECYCLE
+    const size_t active = active_readers_.load(std::memory_order_relaxed);
+    if (active != 0) {
+        std::cerr << "TracEon lifecycle warning: clearCache()/reload while "
+                  << active << " getView() call(s) are still in flight — "
+                     "retained string_views into the old snapshot are now "
+                     "dangling (reader quiescence contract, see ADR-001)"
+                  << std::endl;
+    }
+#endif
+    // ORDERING CONTRACT (string_view-keyed index): the map is cleared BEFORE
+    // any backing store is released. GenomeIndex keys/values are non-owning
+    // views into text_arena_, the mmap region, or manual_store_; all three
+    // are reset/released below. Clearing the map first guarantees no
+    // string_view ever outlives its backing buffer — a dangling view would
+    // only matter if the map outlived the buffer, which this order forbids.
     data_ready_.store(false, std::memory_order_release);
     data_loaded_.store(false, std::memory_order_release);
     if (std::holds_alternative<GenomeIndex>(file_cache_)) std::get<GenomeIndex>(file_cache_).clear();
@@ -165,6 +242,12 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
 
     // Store copies in manual_store_ (std::deque: push_back never invalidates
     // references to existing elements, so these string_views stay valid).
+    // The GenomeIndex key is emplace()'d as id_view — a string_view into this
+    // deque element — NEVER as the caller's `id` std::string: the caller's
+    // buffer dies when addEntry() returns, and GenomeIndex keys are now
+    // non-owning string_views (zero-copy refactor). manual_store_ is the
+    // stable backing for both the key view and the SequenceView fields; it is
+    // only destroyed by clearInternal(), which clears the map FIRST.
     // The proactive check above uses system-wide available memory, which a
     // ulimit/cgroup-constrained process can still exceed sooner — catch
     // bad_alloc here too so that case throws the same descriptive error
@@ -185,7 +268,7 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
     manual_store_bytes_.fetch_add(entry_bytes, std::memory_order_relaxed);
 
     if (std::holds_alternative<GenomeIndex>(file_cache_)) {
-        std::get<GenomeIndex>(file_cache_).emplace(id, SequenceView{id_view, seq_view, qual_view});
+        std::get<GenomeIndex>(file_cache_).emplace(id_view, SequenceView{id_view, seq_view, qual_view});
         serialized_size_estimate_.fetch_add(
             3 * sizeof(uint32_t) + id.size() + seq.size() + qual.size(), std::memory_order_relaxed);
     } else {
@@ -299,13 +382,14 @@ std::vector<size_t> SmartStrategy::scanGzipStreams(const std::string& filepath) 
     // file size.
     std::vector<char> scratch(64 * 1024);
     size_t offset = 0;
+    bool last_member_complete = true; // false when a member decode failed
     while (offset + 3 <= file_size &&
            compressed[offset] == 0x1f && compressed[offset + 1] == 0x8b &&
            compressed[offset + 2] == 0x08) {
         offsets.push_back(offset);
 
         z_stream strm = {};
-        if (inflateInit2(&strm, 15 + 16) != Z_OK) break;
+        if (inflateInit2(&strm, 15 + 16) != Z_OK) { last_member_complete = false; break; }
         strm.next_in  = const_cast<Bytef*>(compressed + offset);
         strm.avail_in = static_cast<uInt>(file_size - offset);
 
@@ -316,16 +400,39 @@ std::vector<size_t> SmartStrategy::scanGzipStreams(const std::string& filepath) 
             ret = inflate(&strm, Z_NO_FLUSH);
             if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR || ret == Z_BUF_ERROR) {
                 // Not a genuine member boundary (or truncated stream) —
-                // stop scanning; loadGzipParallel/loadGzipSingleStream will
-                // surface the real error when they attempt full decoding.
+                // stop scanning; the trailing-data/truncation check below
+                // rejects the file with an accurate error.
                 break;
             }
         }
 
         size_t consumed = (file_size - offset) - strm.avail_in;
         inflateEnd(&strm);
-        if (ret != Z_STREAM_END || consumed == 0) break;
+        if (ret != Z_STREAM_END || consumed == 0) {
+            last_member_complete = false;
+            break;
+        }
         offset += consumed;
+    }
+
+    // Trailing data after the last member. zlib-ng's gz_look() silently
+    // discards bytes that do not begin a new member, so a file like
+    // 'valid.gz || garbage || valid2.gz' would otherwise decompress only the
+    // first part and serve it as complete (P0 data-integrity bug). Raw
+    // inflate knows the exact member end, so any leftover bytes that do not
+    // begin a valid member are rejected here. A member decode that failed to
+    // reach Z_STREAM_END means the stream is truncated/corrupt — rejected
+    // with an accurate message instead of letting the parallel decoder
+    // balloon memory on repeated Z_BUF_ERROR before failing with a
+    // misleading OOM error.
+    if (!offsets.empty() && offset < file_size) {
+        if (last_member_complete) {
+            throw std::runtime_error(
+                "GZIP file has trailing data after the last gzip stream: " + filepath);
+        }
+        throw std::runtime_error(
+            "GZIP stream truncated or corrupt at offset " +
+            std::to_string(offsets.back()) + ": " + filepath);
     }
 
     // Fallback: if no valid header found (shouldn't happen for valid GZIP), return offset 0
@@ -463,6 +570,20 @@ void SmartStrategy::loadGzipParallel(const std::string& filepath,
             write_pos = out.size() - strm.avail_out;
 
             if (ret == Z_BUF_ERROR) {
+                // Z_BUF_ERROR fires for two distinct conditions: the output
+                // buffer is full, OR the input is exhausted mid-stream
+                // (strm.avail_in == 0). The latter means the deflate stream
+                // can never reach Z_STREAM_END — a truncated/corrupt member.
+                // The old code treated it as output-full and grew the buffer
+                // geometrically forever, so a truncated tail member of a
+                // concatenated gzip ballooned memory (~3.4 GB from a 23-byte
+                // tail) until the aggregate budget guard tripped with a
+                // misleading OOM error naming an innocent earlier stream.
+                if (strm.avail_in == 0) {
+                    inflateEnd(&strm);
+                    thread_errors[stream_idx] = "GZIP stream truncated: unexpected end of input";
+                    return;
+                }
                 // Output full but not done — grow and continue
                 if (!grow()) { inflateEnd(&strm); return; }
                 continue;
@@ -528,28 +649,27 @@ void SmartStrategy::loadGzipSingleStream(const std::string& filepath) {
 
     text_arena_.clear();
 
-    // Pre-size text_arena_ with 3x heuristic and OOM guard
-    {
-        std::error_code ec;
-        const uintmax_t raw_size = std::filesystem::file_size(filepath, ec);
-        if (!ec && raw_size > 0) {
-            const size_t estimated_size = static_cast<size_t>(raw_size * 3);
-            const size_t avail_mem = getAvailableMemory();
-            const size_t reserve_size = (avail_mem > 0)
-                ? std::min(estimated_size, avail_mem / 4)
-                : estimated_size;
-            try {
-                text_arena_.reserve(reserve_size);
-            } catch (const std::bad_alloc&) {
-                std::cerr << "SmartStrategy OOM: failed to reserve "
-                          << reserve_size << " bytes for " << filepath
-                          << " (compressed=" << raw_size << ", estimated="
-                          << estimated_size << ")" << std::endl;
-                throw;
-            }
-        } else {
-            text_arena_.reserve(CHUNK_SIZE * 4);
+    // Pre-size text_arena_ with 3x heuristic and OOM guard. `raw_size` is
+    // kept in scope for the trailing-garbage reconciliation below.
+    std::error_code size_ec;
+    const uintmax_t raw_size = std::filesystem::file_size(filepath, size_ec);
+    if (!size_ec && raw_size > 0) {
+        const size_t estimated_size = static_cast<size_t>(raw_size * 3);
+        const size_t avail_mem = getAvailableMemory();
+        const size_t reserve_size = (avail_mem > 0)
+            ? std::min(estimated_size, avail_mem / 4)
+            : estimated_size;
+        try {
+            text_arena_.reserve(reserve_size);
+        } catch (const std::bad_alloc&) {
+            std::cerr << "SmartStrategy OOM: failed to reserve "
+                      << reserve_size << " bytes for " << filepath
+                      << " (compressed=" << raw_size << ", estimated="
+                      << estimated_size << ")" << std::endl;
+            throw;
         }
+    } else {
+        text_arena_.reserve(CHUNK_SIZE * 4);
     }
 
     gzFile file = gzopen(filepath.c_str(), "rb");
@@ -562,6 +682,21 @@ void SmartStrategy::loadGzipSingleStream(const std::string& filepath) {
         while (true) {
             size_t required = write_pos + CHUNK_SIZE;
             if (required > text_arena_.capacity()) {
+                // Zip-bomb guard: pre-check the new size against available
+                // memory BEFORE reserving. A post-hoc try/catch around
+                // reserve() is not enough — under Linux overcommit the
+                // allocation can succeed and the process gets OOM-killed
+                // during the later memcpy. The initial reserve above caps at
+                // avail_mem/4, but the geometric growth here had no budget
+                // check of its own, so a tiny highly-compressible file could
+                // balloon text_arena_ to the full machine memory.
+                const size_t avail_mem_gz = getAvailableMemory();
+                if (avail_mem_gz > 0 && required > avail_mem_gz / 2) {
+                    throw std::runtime_error(
+                        "SmartStrategy OOM guard: refusing to grow GZIP buffer to " +
+                        std::to_string(required) + " bytes from " + filepath +
+                        " (available memory ~" + std::to_string(avail_mem_gz) + " bytes)");
+                }
                 text_arena_.reserve(std::max(text_arena_.capacity() * 2, required));
             }
             text_arena_.resize(required);
@@ -573,9 +708,52 @@ void SmartStrategy::loadGzipSingleStream(const std::string& filepath) {
                 text_arena_.clear();
                 throw std::runtime_error("GZIP read error: " + std::string(error_msg));
             }
-            if (bytes_read == 0) break;
+            if (bytes_read == 0) {
+                // gzread() returns 0 both at a clean EOF and when the stream
+                // is truncated mid-deflate. zlib-ng's zlib-compat gzread does
+                // NOT return -1 for a truncated stream (verified: gzread
+                // returns partial data, then 0, with gzerror == Z_BUF_ERROR
+                // 'unexpected end of file'), so the old code treated a
+                // truncated stream as clean EOF and silently served the
+                // partial data as complete (P0 data-integrity bug). Consult
+                // gzerror and reject anything that did not end cleanly.
+                int err = Z_OK;
+                const char* error_msg = gzerror(file, &err);
+                if (err != Z_OK) {
+                    text_arena_.clear();
+                    throw std::runtime_error(
+                        "GZIP stream truncated or corrupt: " +
+                        std::string(error_msg ? error_msg : ""));
+                }
+                break;
+            }
             std::memcpy(text_arena_.data() + write_pos, chunk.get(), bytes_read);
             write_pos += static_cast<size_t>(bytes_read);
+        }
+
+        // ── Trailing-garbage check ─────────────────────────────────────────
+        // zlib-ng's gz_look() silently discards bytes after the last valid
+        // member that do not begin the gzip magic, reporting a clean Z_OK
+        // EOF — so gzerror alone cannot catch 'valid.gz || garbage ||
+        // valid2.gz', which would otherwise decompress only up to the garbage
+        // and serve that as the complete file. gzoffset() reports the
+        // compressed-file position of the next byte to be consumed; for a
+        // well-formed file this equals the file size exactly (verified for
+        // single-member and cleanly-concatenated files). Trailing data larger
+        // than zlib-ng's internal 128 KiB read buffer leaves gzoffset short
+        // of the file size and is rejected here. A smaller tail is absorbed
+        // by that buffer during the final read and is indistinguishable from
+        // a clean EOF through the gzread() API; files ≥ 1 MiB additionally
+        // get exact coverage from scanGzipStreams(), which decodes every
+        // member with raw inflate and knows the precise member end.
+        if (!size_ec && raw_size > 0) {
+            const z_off_t consumed = gzoffset(file);
+            if (consumed >= 0 && static_cast<uintmax_t>(consumed) < raw_size) {
+                text_arena_.clear();
+                throw std::runtime_error(
+                    "GZIP file has trailing data after the last gzip stream: " +
+                    filepath);
+            }
         }
     } catch (...) {
         gzclose(file);
@@ -640,6 +818,7 @@ void SmartStrategy::normalizeFastaArena() {
         // Use simd_find_char to jump to the next \n, then bulk-copy the
         // non-newline run with memmove.  Tail bytes (<32 or <16) handled by
         // simd_find_char's scalar fall-through — no special case needed here.
+        const char* const seq_out_start = write; // write position before the sequence
         while (read < rec_end) {
             const char* line_nl  = simd_find_char(read, rec_end, '\n');
             // Strip a trailing \r if it immediately precedes the \n (or rec_end)
@@ -651,7 +830,20 @@ void SmartStrategy::normalizeFastaArena() {
             // Advance past the \n; step to rec_end if no \n was found
             read = (line_nl < rec_end) ? line_nl + 1 : rec_end;
         }
-        *write++ = '\n'; // terminate the now-single-line sequence
+        // Terminate the now-single-line sequence ONLY if the sequence actually
+        // produced output bytes. Writing unconditionally clobbers the next
+        // record's '>' marker when the sequence ends exactly at rec_end —
+        // either because it abuts the next header with no newline
+        // ('>a\nACGT>b\n...') or because the record is header-only
+        // ('>a\n>b\nACGT\n', emitted by seqkit seq -m / bioawk filters) — and
+        // the outer loop then breaks at the destroyed marker, silently dropping
+        // every later record (P0 data-integrity bug). `write == read` here
+        // means the sequence consumed no separator bytes: it ran up to the
+        // next '>' (abutting header — no terminator may be written) or up to
+        // EOF without a trailing newline (write into the +1 resize slot).
+        if (write != seq_out_start && (write != read || read == end)) {
+            *write++ = '\n';
+        }
         // read == rec_end (pointing at '>' of next record, or end)
     }
     text_arena_.resize(static_cast<size_t>(write - text_arena_.data()));
@@ -754,17 +946,71 @@ void SmartStrategy::loadFile(const std::string& filepath) {
     parseArena();
 }
 
+// ── Per-thread reserve estimation ───────────────────────────────────────────
+// ankerl::unordered_dense rehashes (re-inserts every element, O(n)) whenever
+// a map outgrows its reserved capacity. The old fixed heuristics
+// (chunk/500 for FASTA, chunk/600 for FASTQ) undershot badly on short reads:
+// 100 bp WGS records are ~208 B, so a ~166K-record chunk (1 GB decompressed /
+// 18 cores) was reserved at only ~99K slots → every thread mid-parse rehashed.
+//
+// Estimate the average record size from a small sample of the ACTUAL file so
+// the per-thread reserve matches the chunk's real record count:
+//   est_records_in_chunk = chunk_byte_size / avg_bytes_per_record
+//   reserve(est_records_in_chunk * 1.25)
+//
+//   - FASTQ: strict 4-line framing ⇒ records = newlines / 4. LF and CRLF both
+//     carry exactly one '\n' per line; empty seq/qual lines still count, and
+//     no header/quality classification is needed ('@' inside quality lines is
+//     irrelevant to a newline count).
+//   - FASTA: normalizeFastaArena() has already collapsed sequences to a single
+//     line when this runs, and every header starts with '>' at a line start,
+//     so records = count of '>' line-starts in the sample.
+static size_t estimateAvgRecordBytes(std::string_view content, bool isFastq) noexcept {
+    constexpr size_t kSampleBytes = 1u << 20; // 1 MiB sample (~0.1 ms scan)
+    const size_t span = std::min(content.size(), kSampleBytes);
+    if (span == 0) return 1;
+    size_t records = 0;
+    if (isFastq) {
+        size_t newlines = 0;
+        const char* p = content.data();
+        const char* end = p + span;
+        while (true) {
+            const char* nl = simd_find_char(p, end, '\n');
+            if (nl >= end) break;
+            ++newlines;
+            p = nl + 1;
+        }
+        records = newlines / 4; // strict 4-line cycle
+    } else {
+        const char* p = content.data();
+        const char* end = p + span;
+        if (*p == '>') ++records;
+        while (true) {
+            const char* nl = simd_find_char(p, end, '\n');
+            if (nl >= end) break;
+            p = nl + 1;
+            if (p < end && *p == '>') ++records;
+        }
+    }
+    // Degenerate sample (no complete record / no header in the first MiB):
+    // fall back to the internal parsers' long-standing assumptions.
+    if (records == 0) return isFastq ? 200 : 150;
+    return (span + records / 2) / records; // rounded avg bytes/record
+}
+
 // --- Templated Parsers ---
 template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(std::string_view content, MapType& dest_map) {
     const size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
-    // Pre-reserve thread-local maps to avoid mid-parse rehashing
-    // Use conservative heuristic: assume avg record ~500 bytes (header + sequence + newlines)
-    // This avoids over-reservation with large records while still reducing rehashing
+    // Pre-reserve thread-local maps to avoid mid-parse rehashing. The reserve
+    // is derived from the chunk's actual byte span and a measured average
+    // record size (1.25x headroom) instead of a fixed bytes/record constant
+    // that silently undershot on short records (see estimateAvgRecordBytes).
     {
-        const size_t est_per_thread = chunk_size / 500;
+        const size_t avg_record = estimateAvgRecordBytes(content, /*isFastq=*/false);
+        const size_t est_per_thread = chunk_size / avg_record;
         for (auto& cache : thread_caches) {
             cache.reserve(static_cast<size_t>(est_per_thread * 1.25));
         }
@@ -789,7 +1035,7 @@ template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(
             std::string_view id(id_start, id_end - id_start);
             std::string_view seq(seq_start, seq_end - seq_start);
             if (!id.empty() && !seq.empty()) {
-                if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, {}}); }
+                if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(id, SequenceView{id, seq, {}}); }
                 else { thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, {}}); }
             }
         }
@@ -807,11 +1053,13 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
     const size_t chunk_size = content.size() / num_threads;
     std::vector<std::thread> threads;
     std::vector<MapType> thread_caches(num_threads);
-    // Pre-reserve thread-local maps to avoid mid-parse rehashing
-    // Use conservative heuristic: assume avg record ~600 bytes (header + seq + qual + newlines)
-    // This avoids over-reservation with large records while still reducing rehashing
+    // Pre-reserve thread-local maps to avoid mid-parse rehashing. The reserve
+    // is derived from the chunk's actual byte span and a measured average
+    // record size (1.25x headroom) instead of a fixed bytes/record constant
+    // that silently undershot on short records (see estimateAvgRecordBytes).
     {
-        const size_t est_per_thread = chunk_size / 600;
+        const size_t avg_record = estimateAvgRecordBytes(content, /*isFastq=*/true);
+        const size_t est_per_thread = chunk_size / avg_record;
         for (auto& cache : thread_caches) {
             cache.reserve(static_cast<size_t>(est_per_thread * 1.25));
         }
@@ -823,39 +1071,50 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
         if (thread_id > 0) {
             // ── Chunk-boundary scan (Bug 1 fix) ─────────────────────────────
             // Find the first GENUINE FASTQ record header at/after the chunk
-            // start. A genuine header is a line whose first char is '@' AND
-            // whose previous line does NOT start with '+' (the previous line
-            // is the previous record's quality line). A quality line that
-            // happens to start with '@' (Phred Q31+ scores) has the '+'
-            // separator line immediately before it, so it fails this test
-            // and is skipped. The old code tested *every* '@' character —
-            // including mid-line quality '@'s — which made the lookbehind
-            // land on the wrong line and misidentify quality characters as
-            // record starts, shifting/dropping records (repro: 100k reads
-            // with '@' in quality → 16,703 loaded).
+            // start using a FORWARD classification. A genuine header always
+            // has its sequence on the next line and the '+' separator on the
+            // line after that (4-line record: header / seq / '+' / qual), so
+            // a candidate line-start '@' is a genuine header iff the line
+            // TWO lines later begins with '+'. A quality line that happens
+            // to start with '@' (Phred Q31+ scores) is the 4th line of its
+            // record, so its line+1 is the NEXT record's header and its
+            // line+2 is that record's sequence — which never starts with
+            // '+' — so it is correctly skipped.
+            //
+            // The earlier classifier walked BACKWARD and tested the previous
+            // line's first byte; a quality line that itself starts with '+'
+            // (Phred+33 Q10, ASCII 43) made a genuine following header look
+            // like a quality line, so every worker after chunk 0 silently
+            // dropped its whole chunk (repro: 80k reads with '+'-leading
+            // quality → 4,468 loaded, 94.4% loss). The forward test has no
+            // such false negative: for a genuine header, seq / '+' / qual
+            // always follow in a valid FASTQ file.
             //
             // Align to the start of the line containing the chunk boundary.
             while (ptr > content.data() && *(ptr - 1) != '\n') --ptr;
             while (ptr < chunk_end) {
                 if (*ptr == '@') {
-                    // ptr is at a line start. Walk back to the first byte of
-                    // the previous line and check whether it is the '+'
-                    // separator. The `check <= content.data()` guard avoids
-                    // dereferencing before the buffer when the walk crosses
-                    // the file start (this '@' is then on the first line,
-                    // which is a genuine header of a valid FASTQ file).
-                    const char* check = ptr - 1;
-                    while (check > content.data() && (*check == '\n' || *check == '\r')) --check;
-                    while (check > content.data() && *check != '\n' && *check != '\r') --check;
-                    if (check > content.data()) ++check;
-                    if (check <= content.data() || *check != '+') break; // genuine header
-                    // Previous line is the '+' separator → this '@' is a
-                    // quality line, not a header — keep scanning.
+                    // Look two lines ahead (reads stay within the buffer:
+                    // simd_find_char is bounded by global_end; the lookahead
+                    // is never dereferenced past global_end). Exactly ONE line
+                    // terminator is consumed per boundary ('\n', with the
+                    // optional preceding '\r' already part of the previous
+                    // line): collapsing runs of newlines here would skip an
+                    // empty sequence/quality line and misclassify a genuine
+                    // header (or a quality '@') whenever a zero-length read
+                    // is involved.
+                    const char* next = simd_find_char(ptr, global_end, '\n'); // end of '@' line
+                    if (next < global_end) ++next; // consume exactly one terminator → start of line+1
+                    const char* plus = simd_find_char(next, global_end, '\n'); // end of line+1
+                    if (plus < global_end) ++plus; // consume exactly one terminator → start of line+2
+                    if (plus < global_end && *plus == '+') break; // genuine header
+                    // Line+2 is not '+' → this '@' is a quality line, not a
+                    // header — keep scanning for the next candidate.
                 }
                 // Advance to the start of the next line.
                 while (ptr < chunk_end && *ptr != '\n') ++ptr;
                 if (ptr < chunk_end) ++ptr; // consume '\n'
-                while (ptr < chunk_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+                if (ptr < chunk_end && *ptr == '\n') ++ptr; // consume exactly one more terminator
             }
         }
         while (ptr < chunk_end) {
@@ -870,25 +1129,25 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
             while (ptr < global_end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr;
             const char* id_end = ptr;
             ptr = simd_find_char(ptr, global_end, '\n');
-            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            if (ptr < global_end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
             const char* seq_start = ptr;
             ptr = simd_find_char(ptr, global_end, '\n');
             const char* seq_end = ptr;
             while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
-            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            if (ptr < global_end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
             if (ptr >= global_end || *ptr != '+') break; // missing '+' separator
             ptr = simd_find_char(ptr, global_end, '\n');
-            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            if (ptr < global_end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
             const char* qual_start = ptr;
             ptr = simd_find_char(ptr, global_end, '\n');
             const char* qual_end = ptr;
             while (qual_end > qual_start && *(qual_end - 1) == '\r') --qual_end;
-            while (ptr < global_end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            if (ptr < global_end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
             std::string_view id(id_start, id_end - id_start);
             std::string_view seq(seq_start, seq_end - seq_start);
             std::string_view qual(qual_start, qual_end - qual_start);
             if (!id.empty() && !seq.empty()) {
-                if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(std::string(id), SequenceView{id, seq, qual}); }
+                if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(id, SequenceView{id, seq, qual}); }
                 else { thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, qual}); }
             }
         }
@@ -915,7 +1174,7 @@ template <typename MapType> void SmartStrategy::parseFastaInternal(std::string_v
         if (ptr >= end) { seq_end = end; while (seq_end > seq_start && (*(seq_end-1) == '\n' || *(seq_end-1) == '\r' || *(seq_end-1) == ' ')) --seq_end; }
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start);
         if (!id.empty() && !seq.empty()) {
-            if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(std::string(id), SequenceView{id, seq, {}}); }
+            if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(id, SequenceView{id, seq, {}}); }
             else { map.emplace(hash_key(id), SequenceView{id, seq, {}}); }
         }
     }
@@ -935,18 +1194,18 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
         while (ptr < end && (*ptr == '\n' || *ptr == '\r' || *ptr == ' ')) ++ptr;
         if (ptr >= end || *ptr != '@') break;
         ++ptr; const char* id_start = ptr; while (ptr < end && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && *ptr != '\r') ++ptr; const char* id_end = ptr;
-        ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        ptr = simd_find_char(ptr, end, '\n'); if (ptr < end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
         const char* seq_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* seq_end = ptr;
         while (seq_end > seq_start && *(seq_end - 1) == '\r') --seq_end;
-        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        if (ptr < end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
         if (ptr >= end || *ptr != '+') break; // missing '+' separator
-        ptr = simd_find_char(ptr, end, '\n'); while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        ptr = simd_find_char(ptr, end, '\n'); if (ptr < end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
         const char* qual_start = ptr; ptr = simd_find_char(ptr, end, '\n'); const char* qual_end = ptr;
         while (qual_end > qual_start && *(qual_end - 1) == '\r') --qual_end;
-        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+        if (ptr < end && *ptr == '\n') ++ptr; // exactly one terminator per boundary
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start); std::string_view qual(qual_start, qual_end - qual_start);
         if (!id.empty() && !seq.empty()) {
-            if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(std::string(id), SequenceView{id, seq, qual}); }
+            if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(id, SequenceView{id, seq, qual}); }
             else { map.emplace(hash_key(id), SequenceView{id, seq, qual}); }
         }
     }
@@ -1051,20 +1310,36 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
     std::ofstream out(filepath, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot write: " + filepath);
 
-    // v3 format: stream-serialize + stream-compress via LZ4 Frame (LZ4F)
+    // v4 format: stream-serialize + stream-compress via LZ4 Frame (LZ4F)
     // instead of materializing a full serialized "payload" copy plus a full
     // "compressed" copy of the whole dataset (the old v2 path's ~3x peak
     // memory: text_arena_ + payload + compressed, all resident at once).
     // Peak extra memory here is bounded by STREAM_CHUNK_SIZE regardless of
-    // dataset size.
+    // dataset size. The v4 header adds a whole-payload CRC32C: the checksum
+    // accumulator is updated as payload chunks pass through the compressor
+    // (below), so there is no second full-payload pass and no extra
+    // allocation. The frame length and checksum are unknown until streaming
+    // finishes, so the header is written with placeholders and patched in
+    // place afterwards (seekp) — the frame itself is never buffered.
     const size_t estimated_size = estimatePayloadSize();
     const CompressionMode comp_mode = selectCompressionStrategy(estimated_size);
 
-    out.write(MAGIC_BYTES_V3, 4);
-    uint8_t index_mode = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
-    out.write(reinterpret_cast<const char*>(&index_mode), 1);
-    uint64_t original_size = static_cast<uint64_t>(estimated_size);
-    out.write(reinterpret_cast<const char*>(&original_size), sizeof(original_size));
+    char header[V4_HEADER_LEN];
+    std::memcpy(header, V4_MAGIC, 4);
+    header[4] = V4_CODEC_LZ4F;
+    header[5] = std::holds_alternative<NGSIndex>(file_cache_) ? 1 : 0;
+    write_le64(header + 6, static_cast<uint64_t>(estimated_size));
+    write_le64(header + 14, 0); // placeholder: frame length (patched below)
+    write_le32(header + 22, 0); // placeholder: CRC32C (patched below)
+    out.write(header, V4_HEADER_LEN);
+
+    // Streaming CRC-32C: ENTIRE uncompressed payload first (fed here, chunk
+    // by chunk, as it passes through the compressor), then the canonical
+    // header bytes [0..22) once the frame length is known (patched below).
+    // The payload-first ordering is what makes this single-pass possible:
+    // frame_len is only known after the frame is complete, so the header is
+    // fed to the checksum last on BOTH save and load.
+    Crc32c crc;
 
     LZ4F_preferences_t prefs;
     std::memset(&prefs, 0, sizeof(prefs));
@@ -1099,7 +1374,11 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
         if (written > 0) out.write(out_buf.data(), static_cast<std::streamsize>(written));
     };
 
+    // The CRC is updated here, over the UNCOMPRESSED payload bytes, as they
+    // pass through on their way into the LZ4F compressor — the required
+    // "streaming CRC" with no second pass over the payload.
     serializePayload([&](const char* data, size_t len) {
+        crc.update(data, len);
         in_buf.insert(in_buf.end(), data, data + len);
         if (in_buf.size() >= STREAM_CHUNK_SIZE) {
             flush_chunk(in_buf.data(), in_buf.size());
@@ -1115,6 +1394,22 @@ void SmartStrategy::saveBinary(const std::string& filepath) const {
     if (LZ4F_isError(end_size))
         throw std::runtime_error("LZ4F_compressEnd failed: " + filepath);
     out.write(out_buf.data(), static_cast<std::streamsize>(end_size));
+
+    // Patch the placeholder header fields now that the frame is complete.
+    // The checksum is finished with the canonical header bytes [0..22)
+    // exactly as they appear on disk: frame_len is written into the in-memory
+    // header first, then both header regions are fed to the accumulator.
+    const std::streampos frame_end = out.tellp();
+    if (frame_end < static_cast<std::streampos>(V4_HEADER_LEN))
+        throw std::runtime_error("Binary cache write failed: " + filepath);
+    const uint64_t frame_len = static_cast<uint64_t>(frame_end) - V4_HEADER_LEN;
+    write_le64(header + 14, frame_len);
+    crc.update(header, 14);     // magic + codec flags + index mode + logical_len
+    crc.update(header + 14, 8); // frame_len, as stored on disk
+    write_le32(header + 22, crc.finalize());
+    out.seekp(static_cast<std::streampos>(14));
+    out.write(header + 14, 12); // frame_len(8) + CRC32C(4)
+    out.seekp(frame_end); // restore EOF position
 
     if (!out) throw std::runtime_error("Binary cache write failed: " + filepath);
 }
@@ -1154,130 +1449,97 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     const char* ptr = static_cast<const char*>(mmap_handle_->data);
     const char* end = ptr + mmap_handle_->size;
 
-    // Bounds-checked read helper. Uses memcpy to avoid unaligned-access UB on ARM.
-    auto safe_advance = [&](size_t n) -> const char* {
-        if (ptr + n > end)
-            throw std::runtime_error("Binary cache is truncated or corrupt: " + filepath);
-        const char* result = ptr;
-        ptr += n;
-        return result;
-    };
-
-    // Check magic bytes and determine format version
-    if (mmap_handle_->size < 5)
-        throw std::runtime_error("Binary cache too small to contain header: " + filepath);
-
-    const char* magic = safe_advance(4);
-    uint8_t format_version = magic[3];
-
-    if (std::strncmp(magic, "TRO", 3) != 0)
-        throw std::runtime_error("Invalid binary cache magic bytes: " + filepath);
-
-    uint8_t mode;
-    std::memcpy(&mode, safe_advance(1), 1);
-    // Sync index_mode_ with what's stored in the binary so that subsequent
-    // loadFile() / parseArena() calls use the same index type as restored data.
-    index_mode_ = (mode == 1) ? IndexMode::NGS : IndexMode::GENOME;
-
-    // --- V2 Format (LZ4-compressed) ---
-    if (format_version == 0x02) {
-        uint64_t original_size, compressed_size;
-        std::memcpy(&original_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
-        std::memcpy(&compressed_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
-
-        // Bounds check for compressed data
-        if (ptr + compressed_size > end)
-            throw std::runtime_error("Binary cache v2 is truncated: " + filepath);
-
-        const char* compressed_data = safe_advance(compressed_size);
-
-        // Decompress into text_arena_
-        text_arena_.resize(original_size);
-        int decompressed_size = LZ4_decompress_safe(compressed_data, text_arena_.data(),
-                                                     static_cast<int>(compressed_size),
-                                                     static_cast<int>(original_size));
-        if (decompressed_size < 0)
-            throw std::runtime_error("LZ4 decompression failed for binary cache: " + filepath);
-        if (decompressed_size != static_cast<int>(original_size))
-            throw std::runtime_error("LZ4 decompressed size mismatch: " + filepath);
-
-        // Release mmap handle since we now own the data in text_arena_
-        mmap_handle_.reset();
-
-        // Parse from text_arena_
-        const char* arena_ptr = text_arena_.data();
-        const char* arena_end = arena_ptr + text_arena_.size();
-
-        auto arena_safe_advance = [&](size_t n) -> const char* {
-            if (arena_ptr + n > arena_end)
-                throw std::runtime_error("Binary cache v2 payload is corrupt: " + filepath);
-            const char* result = arena_ptr;
-            arena_ptr += n;
+    // ── Failure atomicity ───────────────────────────────────────────────────
+    // Every malformed-cache path below throws. The whole reader body is
+    // wrapped so an invalid load NEVER publishes data_ready_ and NEVER leaves
+    // partial map/arena state behind: on any exception the cache is reset to
+    // the pristine empty state (map cleared, arena released, mmap dropped,
+    // flags cleared). A failed restore therefore looks exactly like a fresh
+    // SmartStrategy, never like a half-loaded cache.
+    try {
+        // Bounds-checked read helper. Uses memcpy to avoid unaligned-access UB
+        // on ARM. `n > end - ptr` instead of `ptr + n > end`: n is
+        // attacker-controlled (up to uint64_t from the count/compressed-size
+        // fields), and the addition could wrap near 2^64 — letting the check
+        // pass and turning the subsequent `ptr += n` into pointer-arithmetic
+        // UB. `end - ptr` is exact and cannot overflow.
+        auto safe_advance = [&](size_t n) -> const char* {
+            if (n > static_cast<size_t>(end - ptr))
+                throw std::runtime_error("Binary cache is truncated or corrupt: " + filepath);
+            const char* result = ptr;
+            ptr += n;
             return result;
         };
 
-        uint64_t count;
-        std::memcpy(&count, arena_safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+        // ── Header (26 bytes, little-endian fields) ─────────────────────────
+        if (mmap_handle_->size < V4_HEADER_LEN)
+            throw std::runtime_error("Binary cache too small to contain header: " + filepath);
 
-        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
-        if (count > MAX_RECORDS)
-            throw std::runtime_error("Binary cache record count implausible: " + filepath);
+        const char* magic = safe_advance(4);
+        if (std::strncmp(magic, "TRO", 3) != 0)
+            throw std::runtime_error("Invalid binary cache magic bytes: " + filepath);
+        // v2.0.0 ships v4 as the ONLY readable format (design review Q1/Q5:
+        // no legacy readers, clean break). v1/v2/v3 caches must be regenerated.
+        if (magic[3] != 0x04)
+            throw std::runtime_error(
+                "unsupported cache version; regenerate with v2.0.0: " + filepath);
 
-        if (mode == 0) {
-            file_cache_ = GenomeIndex{};
-            auto& map = std::get<GenomeIndex>(file_cache_);
-            map.reserve(count);
-            for (uint64_t i = 0; i < count; ++i) {
-                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
-                std::string_view id_view(arena_safe_advance(len), len);
-                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
-                std::string_view seq(arena_safe_advance(seq_len), seq_len);
-                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
-                std::string_view qual;
-                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
-                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
-            }
-        } else {
-            file_cache_ = NGSIndex{};
-            auto& map = std::get<NGSIndex>(file_cache_);
-            map.reserve(count);
-            for (uint64_t i = 0; i < count; ++i) {
-                uint64_t hash; std::memcpy(&hash, arena_safe_advance(8), 8);
-                uint32_t len; std::memcpy(&len, arena_safe_advance(4), 4);
-                std::string_view id_view(arena_safe_advance(len), len);
-                uint32_t seq_len; std::memcpy(&seq_len, arena_safe_advance(4), 4);
-                std::string_view seq(arena_safe_advance(seq_len), seq_len);
-                uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
-                std::string_view qual;
-                if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
-                map.emplace(hash, SequenceView{id_view, seq, qual});
-            }
-        }
-    }
-    // --- V3 Format (LZ4 Frame, streamed) ---
-    else if (format_version == 0x03) {
-        uint64_t original_size;
-        std::memcpy(&original_size, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
+        const uint8_t flags = static_cast<uint8_t>(*safe_advance(1));
+        // Codec flags: only the LZ4 Frame bit is defined; flags == 0 (no
+        // codec) and unknown future bits are both rejected.
+        if ((flags & V4_CODEC_MASK) != V4_CODEC_LZ4F || (flags & ~V4_CODEC_MASK) != 0)
+            throw std::runtime_error("Binary cache declares unsupported codec flags: " + filepath);
 
-        const char* frame_data = ptr; // remaining mmap'd bytes are the LZ4F frame
-        const size_t frame_size = static_cast<size_t>(end - ptr);
+        const uint8_t mode = static_cast<uint8_t>(*safe_advance(1));
+        if (mode > 1)
+            throw std::runtime_error("Binary cache declares invalid index mode: " + filepath);
+        // Sync index_mode_ with what's stored in the binary so that subsequent
+        // loadFile() / parseArena() calls use the same index type as restored data.
+        index_mode_ = (mode == 1) ? IndexMode::NGS : IndexMode::GENOME;
 
-        // OOM guard: mirrors the pattern used by loadFile()/loadGzipSingleStream().
+        const uint64_t logical_len = read_le64(safe_advance(8));
+        const uint64_t frame_len = read_le64(safe_advance(8));
+        const uint32_t stored_crc = read_le32(safe_advance(4));
+        const char* const header_begin = static_cast<const char*>(mmap_handle_->data);
+
+        // ── Hardening: implausible sizes rejected BEFORE any allocation ─────
+        // Every serialized payload begins with the 8-byte record count, so a
+        // smaller logical_len is always malformed. v4 uses the 64-bit-clean
+        // LZ4F streaming API, so the v2 class of INT_MAX int-truncation bugs
+        // (2^32+N -> N silently passing the size check) cannot occur here; the
+        // equivalent protections are this floor check, the 32-bit size_t
+        // guard, and the OOM guard below — all applied before resize().
+        if (logical_len < sizeof(uint64_t))
+            throw std::runtime_error("Binary cache declares implausible decompressed size: " + filepath);
+        if (frame_len == 0)
+            throw std::runtime_error("Binary cache declares empty compressed frame: " + filepath);
+        if (logical_len > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            throw std::runtime_error("Binary cache declares implausible decompressed size: " + filepath);
+
+        // Subtraction-form bounds check for the compressed frame: no pointer
+        // arithmetic overflow possible even for attacker-controlled frame_len
+        // (up to 2^64-1).
+        if (frame_len > static_cast<uint64_t>(end - ptr))
+            throw std::runtime_error("Binary cache is truncated: " + filepath);
+
+        // OOM guard: refuse to allocate a multi-GB arena from a small file
+        // (mirrors loadGzipSingleStream()/loadFile()).
         const size_t avail_mem = getAvailableMemory();
-        if (avail_mem > 0 && original_size > avail_mem / 2) {
+        if (avail_mem > 0 && logical_len > avail_mem / 2) {
             throw std::runtime_error(
                 "SmartStrategy OOM guard: refusing to decompress " +
-                std::to_string(original_size) + " bytes from " + filepath +
+                std::to_string(logical_len) + " bytes from " + filepath +
                 " (available memory ~" + std::to_string(avail_mem) + " bytes)");
         }
         try {
-            text_arena_.resize(original_size);
+            text_arena_.resize(logical_len);
         } catch (const std::bad_alloc&) {
-            std::cerr << "SmartStrategy OOM: failed to allocate " << original_size
+            std::cerr << "SmartStrategy OOM: failed to allocate " << logical_len
                       << " bytes for " << filepath << std::endl;
             throw;
         }
 
+        // ── Streaming LZ4 Frame decompression (bounded memory) ──────────────
         LZ4F_dctx* dctx = nullptr;
         if (LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION)))
             throw std::runtime_error("LZ4F_createDecompressionContext failed: " + filepath);
@@ -1286,11 +1548,18 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
             ~DctxGuard() { if (d) LZ4F_freeDecompressionContext(d); }
         } dguard{dctx};
 
-        const char* src = frame_data;
-        size_t src_remaining = frame_size;
+        const char* src = ptr;
+        size_t src_remaining = static_cast<size_t>(frame_len);
         char* dst = text_arena_.data();
         size_t dst_remaining = text_arena_.size();
         size_t hint = 1;
+
+        // Streaming CRC32C: the ENTIRE decompressed payload first (each chunk
+        // as it is written to text_arena_ — no second full-payload pass, no
+        // extra allocation), then the canonical header bytes [0..22) once the
+        // frame has been fully consumed. Payload-first ordering matches
+        // saveBinary() (see the v4 format comment at the top of this file).
+        Crc32c crc;
 
         while (hint != 0 && src_remaining > 0) {
             size_t dst_size = dst_remaining;
@@ -1298,25 +1567,48 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
             hint = LZ4F_decompress(dctx, dst, &dst_size, src, &src_size, nullptr);
             if (LZ4F_isError(hint))
                 throw std::runtime_error("LZ4F_decompress failed for binary cache: " + filepath);
+            crc.update(dst, dst_size);
             dst += dst_size;
             dst_remaining -= dst_size;
             src += src_size;
             src_remaining -= src_size;
             if (dst_size == 0 && src_size == 0 && hint != 0) break; // no progress; malformed frame
         }
+
+        // Exact-length requirement: the declared logical length must equal the
+        // actual decompressed size. A truncated file that loses its tail (or a
+        // wrong logical length) fails here, not on the checksum — a digest
+        // cannot know that a missing tail was supposed to exist.
         if (dst_remaining != 0)
-            throw std::runtime_error("Binary cache v3 decompressed size mismatch: " + filepath);
+            throw std::runtime_error("Binary cache decompressed size mismatch: " + filepath);
+        // Complete-frame requirement: the LZ4 Frame must end EXACTLY at the
+        // declared frame boundary. hint == 0 means the frame end was reached;
+        // leftover src bytes mean the frame ended before the declared
+        // boundary (trailing garbage inside the declared frame length).
+        if (src_remaining != 0 || hint != 0)
+            throw std::runtime_error(
+                "Binary cache frame not terminated at declared boundary: " + filepath);
+
+        // ── Whole-payload integrity check ───────────────────────────────────
+        // CRC32C over the ENTIRE uncompressed logical payload + the canonical
+        // header fields (checksum field excluded). A mismatch means the file
+        // was modified/corrupted after writing (accidental-corruption
+        // detection, NOT authentication).
+        crc.update(header_begin, V4_CRC_OFFSET);
+        if (crc.finalize() != stored_crc)
+            throw std::runtime_error(
+                "Binary cache checksum mismatch (corrupt or modified file): " + filepath);
 
         // Release mmap handle since we now own the data in text_arena_
         mmap_handle_.reset();
 
-        // Parse from text_arena_
+        // ── Parse from text_arena_ (payload layout unchanged from v1–v3) ───
         const char* arena_ptr = text_arena_.data();
         const char* arena_end = arena_ptr + text_arena_.size();
 
         auto arena_safe_advance = [&](size_t n) -> const char* {
-            if (arena_ptr + n > arena_end)
-                throw std::runtime_error("Binary cache v3 payload is corrupt: " + filepath);
+            if (n > static_cast<size_t>(arena_end - arena_ptr))
+                throw std::runtime_error("Binary cache v4 payload is corrupt: " + filepath);
             const char* result = arena_ptr;
             arena_ptr += n;
             return result;
@@ -1325,8 +1617,14 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
         uint64_t count;
         std::memcpy(&count, arena_safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
 
-        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
-        if (count > MAX_RECORDS)
+        // Count-bounded reserve: every serialized record needs at least
+        // MIN_RECORD_BYTES (GENOME: 3×u32 length fields; NGS: u64 hash +
+        // 3×u32 — see serializePayload()), so a count exceeding remaining_bytes
+        // / MIN_RECORD_BYTES is impossible in a genuine cache. Subsumes the
+        // old 1e9 cap, which still allowed a ~80 GB reserve().
+        const uint64_t remaining_bytes = static_cast<uint64_t>(arena_end - arena_ptr);
+        const uint64_t min_record_bytes = (mode == 0) ? 12 : 20;
+        if (count > remaining_bytes / min_record_bytes)
             throw std::runtime_error("Binary cache record count implausible: " + filepath);
 
         if (mode == 0) {
@@ -1341,7 +1639,7 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
                 uint32_t qual_len; std::memcpy(&qual_len, arena_safe_advance(4), 4);
                 std::string_view qual;
                 if (qual_len > 0) qual = std::string_view(arena_safe_advance(qual_len), qual_len);
-                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
+                map.emplace(id_view, SequenceView{id_view, seq, qual});
             }
         } else {
             file_cache_ = NGSIndex{};
@@ -1359,48 +1657,11 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
                 map.emplace(hash, SequenceView{id_view, seq, qual});
             }
         }
-    }
-    // --- V1 Format (uncompressed, mmap'd) ---
-    else if (format_version == 0x01) {
-        uint64_t count;
-        std::memcpy(&count, safe_advance(sizeof(uint64_t)), sizeof(uint64_t));
-
-        constexpr uint64_t MAX_RECORDS = 1'000'000'000ULL;
-        if (count > MAX_RECORDS)
-            throw std::runtime_error("Binary cache record count implausible: " + filepath);
-
-        if (mode == 0) {
-            file_cache_ = GenomeIndex{};
-            auto& map = std::get<GenomeIndex>(file_cache_);
-            map.reserve(count);
-            for (uint64_t i = 0; i < count; ++i) {
-                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-                std::string_view id_view(safe_advance(len), len);
-                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-                std::string_view seq(safe_advance(seq_len), seq_len);
-                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-                std::string_view qual;
-                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-                map.emplace(std::string(id_view), SequenceView{id_view, seq, qual});
-            }
-        } else {
-            file_cache_ = NGSIndex{};
-            auto& map = std::get<NGSIndex>(file_cache_);
-            map.reserve(count);
-            for (uint64_t i = 0; i < count; ++i) {
-                uint64_t hash; std::memcpy(&hash, safe_advance(8), 8);
-                uint32_t len; std::memcpy(&len, safe_advance(4), 4);
-                std::string_view id_view(safe_advance(len), len);
-                uint32_t seq_len; std::memcpy(&seq_len, safe_advance(4), 4);
-                std::string_view seq(safe_advance(seq_len), seq_len);
-                uint32_t qual_len; std::memcpy(&qual_len, safe_advance(4), 4);
-                std::string_view qual;
-                if (qual_len > 0) qual = std::string_view(safe_advance(qual_len), qual_len);
-                map.emplace(hash, SequenceView{id_view, seq, qual});
-            }
-        }
-    } else {
-        throw std::runtime_error("Unknown binary cache format version: " + filepath);
+    } catch (...) {
+        // Failure atomicity: an invalid load must NOT publish data_ready_ or
+        // leave partial map state behind (design review P0 sprint item 4).
+        clearInternal();
+        throw;
     }
 
     determine_format_from_cache();
@@ -1412,9 +1673,25 @@ void SmartStrategy::loadBinary(const std::string& filepath) {
     data_ready_.store(true, std::memory_order_release);
 }
 
+
 // --- ACCESS ---
 
 std::string_view SmartStrategy::getView(const std::string_view& sequence_id) const {
+#ifdef TRACEON_DEBUG_LIFECYCLE
+    // Reader-quiescence diagnostic (opt-in, debug builds). Tracks whether any
+    // getView() lookup is in flight when a clear/reload tears the snapshot
+    // down. LIMITATION: this catches a reader whose LOOKUP overlaps the clear;
+    // it cannot detect a caller that retained the returned std::string_view
+    // and dereferences it after clearCache()/reload/destruction completes.
+    // Diagnostic only — NOT synchronization (see ADR-001 / README).
+    struct ReaderScope {
+        std::atomic<size_t>& c;
+        explicit ReaderScope(std::atomic<size_t>& c_) : c(c_) {
+            c.fetch_add(1, std::memory_order_relaxed);
+        }
+        ~ReaderScope() { c.fetch_sub(1, std::memory_order_relaxed); }
+    } scope(active_readers_);
+#endif
     if (data_ready_.load(std::memory_order_acquire)) {
         if (std::holds_alternative<GenomeIndex>(file_cache_)) {
             const auto& map = std::get<GenomeIndex>(file_cache_);

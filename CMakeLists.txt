@@ -44,7 +44,14 @@ set(TEST_SOURCES
         tests/CacheTests.cpp
         tests/FastqTests.cpp
         tests/MapDefsTests.cpp
-        tests/SmartStrategyTests.cpp
+        # SmartStrategyTests.cpp split into per-domain TUs (128 cases / 4195
+        # assertions preserved across the combined unit_tests target).
+        tests/test_parser_fastq.cpp
+        tests/test_parser_fasta.cpp
+        tests/test_gzip.cpp
+        tests/test_binary_cache.cpp
+        tests/test_lifecycle.cpp
+        tests/test_api_misc.cpp
 )
 
 # --- Library Target ---
@@ -114,3 +121,61 @@ target_link_libraries(unit_tests PRIVATE traceon_core Catch2::Catch2WithMain)
 
 include(CTest)
 add_test(NAME TracEonTests COMMAND unit_tests)
+
+# ── Per-domain split test executables ────────────────────────────────────────
+# SmartStrategyTests.cpp was split into per-domain translation units so each
+# test executable is small enough to start under AddressSanitizer on hosts
+# where the ~42 MB combined unit_tests binary fails at ASan init
+# (InternalMmapVector ENOMEM — binary-size/ASLR interaction). Each domain exe
+# links Catch2::Catch2WithMain (the single TU providing CATCH_CONFIG_MAIN).
+#
+# The [oom] test (setrlimit RLIMIT_AS) aborts under ASan shadow-mapping; run
+# these under ASan with the [oom] tag filtered:  <exe> "~[oom]"
+set(SPLIT_TEST_TARGETS
+        test_parser_fastq
+        test_parser_fasta
+        test_gzip
+        test_binary_cache
+        test_lifecycle
+        test_api_misc
+)
+foreach(t ${SPLIT_TEST_TARGETS})
+    add_executable(${t} tests/${t}.cpp)
+    target_link_libraries(${t} PRIVATE traceon_core Catch2::Catch2WithMain)
+    add_test(NAME ${t} COMMAND ${t})
+endforeach()
+
+# ── K-mer experimental targets (OUT of the core umbrella) ──────────────────
+# traceon_kmer is deliberately NOT part of CORE_SOURCES, does not appear in
+# the public umbrella header (TracEon.h), and is not linked into
+# traceon_core. It is an opt-in, separately built static library covering
+# the C shim for the minimap2-style minimizer table
+# (src/kmerindex_c_api.cpp) plus the header-only k-mer encoders/indexes
+# (KmerEncoding.h, KmerReferenceIndex.h).
+add_library(traceon_kmer STATIC src/kmerindex_c_api.cpp)
+# Consumers need include/ for kmerindex_c_api.h + the header-only k-mer
+# headers; ankerl is an implementation detail of the shim only.
+target_include_directories(traceon_kmer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
+)
+target_include_directories(traceon_kmer PRIVATE
+    ${ankerl_unordered_dense_SOURCE_DIR}/include # ankerl::unordered_dense
+)
+
+# ── K-mer unit tests (Catch2) ───────────────────────────────────────────────
+add_executable(kmer_tests tests/kmer_tests.cpp)
+target_link_libraries(kmer_tests PRIVATE traceon_kmer Catch2::Catch2WithMain)
+add_test(NAME KmerTests COMMAND kmer_tests)
+
+# ── C compilation/linkage proof (the .c file is compiled as C99, proving
+# the kmerindex_c_api.h boundary is real C, not C++ masquerading) ──────────
+add_executable(kmer_c_compile_test tests/kmer_c_api_compile_test.c)
+set_source_files_properties(tests/kmer_c_api_compile_test.c PROPERTIES LANGUAGE C)
+set_property(TARGET kmer_c_compile_test PROPERTY C_STANDARD 99)
+set_property(TARGET kmer_c_compile_test PROPERTY C_STANDARD_REQUIRED ON)
+target_link_libraries(kmer_c_compile_test PRIVATE traceon_kmer)
+# The executable has only a C source, but links a C++ static library, so
+# drive the link with the C++ driver to pull in libstdc++.
+set_target_properties(kmer_c_compile_test PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME KmerCCompileTest COMMAND kmer_c_compile_test)

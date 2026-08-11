@@ -7,6 +7,20 @@
 # CMake build files
 /cmake-build-*/
 /build/
+/build-asan/
+/build-ubsan/
+
+# Sanitizer/runtime scratch
+/asan-runtime/
+
+# Pi agent runtime
+/.pi-subagents/
+
+# Static analysis runs
+/strix_runs/
+
+# Generated benchmark fixtures (regenerable via benchmarks/benchmark_runner.py)
+/benchmarks/bench_*
 
 # IDE-specific files (CLion, VSCode, etc.)
 /.idea/
@@ -62,13 +76,6 @@ graphify-out/
 experiments/
 progress.md
 CLAUDE.md
-
-# Kmer index WIP (experimental, not wired into build yet)
-include/KmerEncoding.h
-include/KmerIndex.h
-include/KmerReferenceIndex.h
-include/kmerindex_c_api.h
-src/kmerindex_c_api.cpp
 
 # Experimental benchmark scripts/vendored tools (not part of core)
 benchmarks/aligner_lookup_benchmark.py

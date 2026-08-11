@@ -32,6 +32,45 @@ Immutability is not just a convention — it is **enforced by the API**:
   Using `data_ready_` alone would wrongly reject the second `set()` of a manual
   build.
 
+## Reader Quiescence (v2.0.0 — explicit external contract)
+
+**Date:** v2.0.0 (2026)
+**Decision:** Retain the documented **external-quiescence contract** for the
+naked `std::string_view` API. Reads are safe concurrently with other reads
+**only while the same loaded snapshot is installed**; a returned view is
+**invalid once `clearCache()`, reload, or destruction begins**.
+
+### Why not an in-library reclamation mechanism
+
+- `getView()` acquire-loads `data_ready_` and reads `file_cache_` without
+  taking `cache_mutex_`; `clearInternal()` clears the map and then releases
+  `text_arena_`, `manual_store_`, and the mmap. The release/acquire flag
+  publishes initialization; it does **not** wait for a reader that already
+  observed `true` and is not a reclamation mechanism.
+- `std::string_view` is non-owning: even a reader-side generation check
+  during lookup cannot extend the lifetime of the bytes **after** the call
+  returns. A real epoch/RCU design requires a grace period and would need
+  the whole immutable snapshot (map + arena/mmap ownership) as the
+  protected object — a separate API design (`Snapshot`/`SnapshotView`).
+- An atomic `shared_ptr<const Snapshot>` would require changing the return
+  type to an owner-bearing handle; C++ also does not promise
+  `atomic<shared_ptr>` is lock-free.
+
+### What IS guaranteed
+
+1. Concurrent `getView()`/`hasSequence()`/`getQuality()` against a *loaded*
+   snapshot are safe and lock-free (no mutex on the read path).
+2. Writers (`loadFile`, `loadGzipFile`, `loadBinary`, `clearCache`,
+   `addEntry`) are serialized by `cache_mutex_`. The mutex does **not**
+   protect readers — do not market it as reader reclamation.
+3. The application must achieve quiescence (stop using views from a
+   snapshot) before `clearCache()`, reload, or destruction. Sequential
+   clear/reload is supported and tested.
+4. `TRACEON_DEBUG_LIFECYCLE` (opt-in) adds a reader counter/scope that
+   warns in `clearInternal()` when a `getView()` lookup overlaps a teardown.
+   It is a diagnostic for coordinated misuse, **not** synchronization, and
+   cannot detect post-return use of a retained view.
+
 **Contract:** `set()`/`addEntry()` is allowed only **before** any load (build
 phase) or **after** `clearCache()`. A loaded cache is truly immutable, which is
 what makes the lock-free read guarantee sound. Build-phase `set()` calls are
@@ -65,7 +104,19 @@ if (data_ready_.load(std::memory_order_acquire)) { // [B]
 ### Mitigation
 - Comprehensive documentation of memory ordering guarantees
 - Unit tests validating concurrent access patterns
-- Static assertion that `file_cache_` is never modified after `data_ready_` becomes true
+- **Enforced immutable-after-load contract**: there is **no** static assertion
+  that `file_cache_` is never modified after `data_ready_` becomes true — such
+  an assertion cannot exist, because `addEntry()` deliberately sets
+  `data_ready_` during the build phase so lock-free readers can see
+  manually-built entries (that is precisely why the distinct `data_loaded_`
+  flag exists). Enforcement is runtime: the separate `data_loaded_` flag, set
+  only by the load paths and cleared by `clearCache()`, gates
+  `addEntry()`/`set()` — once a load has happened, mutation throws
+  `std::logic_error` (see "Enforcing Immutability" above).
+- **Write-side exclusivity**: `clearCache()` and reload must not overlap
+  lock-free readers — they tear down `text_arena_` / the map while readers hold
+  views into them. Write operations are exclusive by contract (write-side
+  only); only reads of a *loaded* cache are lock-free and safe concurrently.
 
 ## Alternatives Considered
 

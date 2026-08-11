@@ -32,17 +32,23 @@ enum class CompressionMode {
 
 struct SequenceView {
     // NOTE:
-    // - The Map Key (std::string) owns the normalized identifier used for hashing/lookups.
+    // - The Map Key (std::string_view) is NON-OWNING: it points into either
+    //   the text_arena_ buffer (parse and binary v4 restore) or manual_store_
+    //   (addEntry()). Both backing stores are stable for the map's lifetime
+    //   (arena is immutable-after-load; deque push_back never invalidates).
+    //   No std::string is constructed on any insert path.
     // - SequenceView.id, sequence, and quality are NON-OWNING views pointing
-    //   into either the mmap buffer (binary mode) or the text_arena_ buffer (load mode).
-    //   For entries added via addEntry(), they point into manual_store_.
+    //   into the same stable buffers. For entries added via addEntry(), they
+    //   point into manual_store_.
     std::string_view id;       
     std::string_view sequence; 
     std::string_view quality;  
 };
 
-// GenomeIndex: string keys with transparent lookup (find by string_view, no allocation).
-using GenomeIndex = StringHashMap<SequenceView>;
+// GenomeIndex: string_view keys (zero-copy, arena-backed — no std::string
+// allocation on the insert path) with transparent lookup (find by
+// string_view / const char* / std::string, no allocation on the read path).
+using GenomeIndex = StringViewHashMap<SequenceView>;
 using NGSIndex = HashMap<uint64_t, SequenceView>;
 
 enum class IndexMode { GENOME, NGS };
@@ -58,21 +64,77 @@ public:
     /**
      * @brief Load file with automatic format detection.
      * Detects .gz extension and GZIP magic bytes.
+     * @throws std::runtime_error on corrupt/truncated input — truncated GZIP
+     *         streams, trailing garbage after the last GZIP member, truncated
+     *         tail members in concatenated GZIP, and OOM-guard rejections.
      */
     void loadFile(const std::string& filepath);
     
     /**
      * @brief Explicitly load a GZIP-compressed file.
      * Throws if file is not valid GZIP.
+     * @throws std::runtime_error if the file is not valid GZIP, or if the
+     *         stream is truncated / has trailing data after the last member
+     *         (data-integrity rejection — partial data is never served).
      */
     void loadGzipFile(const std::string& filepath);
 
+    /**
+     * @brief Load a binary cache file (.traceon v4 only).
+     *
+     * v2.0.0 removed the v1/v2/v3 readers — the v4 format ("TRO\x04", LZ4
+     * Frame + whole-payload CRC32C) is the ONLY readable binary format. Old
+     * caches are rejected with a clear "regenerate" error.
+     * @throws std::runtime_error on malformed/implausible cache files: wrong
+     *         magic or version, unsupported codec/mode, truncated payloads or
+     *         frames, wrong logical length, checksum mismatch, record counts
+     *         exceeding the payload bytes, or OOM-guard rejections. A failed
+     *         load never publishes partial state (failure atomicity).
+     */
     void loadBinary(const std::string& filepath);
+    /**
+     * @brief Write the current cache as a v4 binary cache file.
+     *
+     * v4 = "TRO\x04" header (codec flags, index mode, logical length, frame
+     * length, CRC32C) + a streamed LZ4 Frame. The CRC32C checksum is computed
+     * incrementally over the uncompressed payload as it passes through the
+     * compressor — no second full-payload pass.
+     * @throws std::runtime_error if the file cannot be written or LZ4 Frame
+     *         compression fails.
+     */
     void saveBinary(const std::string& filepath) const;
 
     // --- Manual Entry Support ---
+    /**
+     * @brief Add a record during the build phase.
+     * @throws std::logic_error if called after a load (immutable-after-load
+     *         contract, ADR-001): once data_loaded_ is set the index is frozen.
+     *         Legal only before any loadFile()/loadBinary() or after
+     *         clearCache().
+     */
     void addEntry(const std::string& id, const std::string& seq, const std::string& qual);
 
+    /**
+     * @brief Zero-copy view of a sequence's data.
+     *
+     * @return A std::string_view pointing directly into the immutable arena
+     *         (text_arena_/manual_store_/mmap), or an empty view if not found.
+     *
+     * @warning LIFECYCLE CONTRACT (reader quiescence — see ADR-001 and the
+     *          README "Lifecycle contract" section): the returned view is
+     *          NON-OWNING and is valid only while the same loaded snapshot
+     *          stays installed. It becomes DANGLING the moment clearCache(),
+     *          a reload (loadFile/loadGzipFile/loadBinary), or destruction
+     *          begins. Reads are safe concurrently with other reads, but the
+     *          application MUST stop using all views from a snapshot before
+     *          clearing/reloading/destroying the cache. The write-side mutex
+     *          serializes writers only; it does NOT reclaim memory from
+     *          readers and is deliberately NOT taken on this read path.
+     *
+     * @note TRACEON_DEBUG_LIFECYCLE (opt-in) adds a reader counter that warns
+     *       in clearInternal() if a getView() lookup overlaps a teardown — a
+     *       diagnostic for coordinated misuse, not a synchronization mechanism.
+     */
     std::string_view getView(const std::string_view& sequence_id) const;
     std::string getSequence(const std::string& sequence_id) const;
     std::string getQuality(const std::string& sequence_id) const;
@@ -120,6 +182,21 @@ private:
      * True only when all data is loaded and immutable.
      */
     std::atomic<bool> data_ready_{false};
+
+#ifdef TRACEON_DEBUG_LIFECYCLE
+    /**
+     * Reader-quiescence diagnostic (opt-in via -DTRACEON_DEBUG_LIFECYCLE).
+     *
+     * Incremented for the duration of each getView() call; clearInternal()
+     * warns (std::cerr) if any readers are still inside getView() when the
+     * snapshot is torn down. LIMITATION: catches a reader whose LOOKUP
+     * overlaps a clear; it CANNOT detect a caller that retained the returned
+     * std::string_view and dereferences it after clearCache()/reload/
+     * destruction completes. Diagnostic only — NOT synchronization (see
+     * ADR-001 reader-quiescence section).
+     */
+    mutable std::atomic<size_t> active_readers_{0};
+#endif
 
     /**
      * Immutable-after-load signal (Bug 3 fix, ADR-001).
