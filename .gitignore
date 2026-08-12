@@ -114,3 +114,11 @@ node_modules/
 # Feynman research workdir + fuzz build dir
 .feynman/
 /build-fuzz/
+
+# Agent instructions/configs — local workflow only, not part of the repo
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.github/agents/
+.github/skills/
+.github/copilot-instructions.md
