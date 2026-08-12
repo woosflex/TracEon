@@ -111,3 +111,6 @@ __pycache__/
 
 # Node (if any tooling)
 node_modules/
+# Feynman research workdir + fuzz build dir
+.feynman/
+/build-fuzz/

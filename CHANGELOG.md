@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Research
 
+- Surveyed khash/khashl and structurally similar minimizer indexes across Winnowmap,
+  minigraph/minigraph-cactus, mm2-fast, BLEND, StrobeMap, strobealign,
+  HiFiMapper, LRA, and meryl. The canonical report is
+  `outputs/aligner-khash-traceon-survey.md`; it contains no benchmark results.
+
 - Investigated a TracEon `traceon_kmer` C API drop-in for minimap2's per-bucket
   `khash_t(idx)` table. Evidence and benchmark recommendations are recorded in
   `outputs/minimap2-traceon-integration-research.md`; no source files were
@@ -20,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error-status handling fixes.
 
 ---
+
+## [2.1.0] — v2.1.0 "Excalibur" (2026-08-12)
+
+### Added
+- **Fuzzing gate**: 7 libFuzzer targets (v4 loader, gzip loader, FASTQ/FASTA parsers, kmer encode, kmer C API, TRKI mmap loader), 83-file seed corpus, `fuzz.yml` CI workflow (per-push + weekly, crash artifacts). Closes the last never-run verification layer.
+- **Aligner validation**: `woosflex/minimap2` and `woosflex/Winnowmap` `traceon-backend` forks — `TRACEON=1` table backend + `tcache v2` mmap'd open-addressing prebuilt index. Recurring load+map: minimap2 −13.6% (full chr1), Winnowmap −80% (chr1-50Mb); PAF byte-identical to stock in every mode. See `RELEASE_v2.1.0.md` and `outputs/*-integration-*.md`.
+
+### Changed
+- kmer C API: `frozen` flag is now `std::atomic<bool>` (release/acquire) — thread-safe concurrent lookup (the minimap2-family integration requirement). Error path is allocation-free (fixed-size thread-local buffer) — the no-throw C boundary is total under OOM.
+
+### Fixed
+- `assert(inserted)` audit in kmer tests/examples — explicit `== 1` checks (the `-1` exception status was a silent trap).
+- CI fuzz integration: `extern "C"` linkage on all fuzz targets (libFuzzer link), OSS-Fuzz `fuzzer-no-link` pattern (duplicate ASan runtime on ubuntu clang), 64MiB declared-length harness cap + `allocator_may_return_null` (4GB alloc abort under ASan).
 
 ## [2.0.0] — v2.0.0 "Durandal" (2026)
 

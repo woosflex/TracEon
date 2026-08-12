@@ -2,16 +2,22 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v2.0.0-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v2.1.0-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
 [![BinaryCache](https://img.shields.io/badge/BinaryCache-v4%20CRC32C%20Integrity-green.svg)]()
 
-**TracEon** (v2.0.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
+**TracEon** (v2.1.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
+
+## 🎯 What's New in v2.1.0
+
+- **Fuzzing gate**: 7 libFuzzer targets (v4 loader, gzip, FASTQ/FASTA, kmer encode, kmer C API, TRKI) + CI workflow — the last verification layer is now closed
+- **kmer C API hardened**: atomic freeze flag (thread-safe concurrent lookup) + allocation-free error path (total no-throw boundary)
+- **Real-world aligner validation**: `woosflex/minimap2` + `woosflex/Winnowmap` forks — `tcache v2` mmap'd prebuilt index. Recurring load+map: minimap2 −13.6% (full chr1), Winnowmap −80% (chr1-50Mb); PAF byte-identical to stock everywhere
 
 ## 🎯 What's New in v2.0.0
 
@@ -19,7 +25,8 @@
 > lifecycle contract (no public adopters were identified; see the
 > [design review](outputs/traceon-v2-design-review.md)). Read the
 > [Migration / Breaking Changes](#migration--breaking-changes) section before
-> upgrading. The experimental k-mer C API is **not** shipped in v2.0.0.
+> upgrading. The experimental k-mer C API ships in v2.0.0+ and is used by the
+> aligner forks (minimap2/Winnowmap `traceon-backend`).
 
 ### **`.traceon` v4 Binary Format** 📦
 - `saveBinary()` / `Cache::save()` now write **v4** (`"TRO\x04"`): a 26-byte
@@ -625,7 +632,14 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **`Cache::set()` data persistence**: Manually-added entries via `set()` are now serialized by `save()` and restored by `restore()`
 - **Correctness hardening**: Closed test gaps for parallel GZIP, RNA/protein format detection, v1 binary format, `clearCache()` + reload, and zero-copy `Cache::getView()`
 
-### ✅ v2.0.0 (Q4 2026) — Integrity & v4 Format (Current Release)
+### ✅ v2.1.0 "Excalibur" (Q4 2026) — Fuzz Gate & Aligner Validation (Current Release)
+*The golden sword — verification and real-world proof*
+
+- **Fuzzing gate**: 7 libFuzzer targets + 83-file seed corpus + CI workflow (per-push + weekly)
+- **kmer C API hardened**: atomic freeze flag (thread-safe) + allocation-free error path (total no-throw)
+- **Aligner validation**: `woosflex/minimap2` + `woosflex/Winnowmap` forks with `TRACEON=1` table backend + `tcache v2` mmap'd prebuilt index — PAF byte-identical, recurring load+map −13.6% (minimap2, full chr1) / −80% (Winnowmap, chr1-50Mb)
+
+### ✅ v2.0.0 (Q4 2026) — Integrity & v4 Format (Released)
 *Codename: Durandal*
 
 - **`.traceon` v4 binary format**: CRC32C whole-payload integrity (SSE4.2 /
