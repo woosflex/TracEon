@@ -88,6 +88,14 @@ jobs:
       shell: bash
       run: |
         set -u
+        # allocator_may_return_null=1: a failed huge malloc returns NULL instead
+        # of aborting under ASan, so the loader's bad_alloc catch / OOM guard
+        # (the designed defense for absurd declared sizes) actually runs —
+        # without it ASan hard-aborts on the alloc and kills the fuzz run with
+        # 'libFuzzer: out-of-memory'. UBSAN_OPTIONS=print_stacktrace=1 gives a
+        # symbolized trace for any UB finding.
+        export ASAN_OPTIONS=allocator_may_return_null=1
+        export UBSAN_OPTIONS=print_stacktrace=1
         declare -A corpus=(
           [fuzz_v4_loader]="fuzz/corpus/v4_loader"
           [fuzz_gzip_loader]="fuzz/corpus/gzip_loader"

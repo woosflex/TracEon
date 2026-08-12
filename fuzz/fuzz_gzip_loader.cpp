@@ -34,6 +34,16 @@ void exercise_reads(TracEon::SmartStrategy& s) {
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    // Harness-level amplification guard (return 0, NOT a finding): never feed
+    // more than 8 MiB of compressed input. A gzip member can amplify up to
+    // ISIZE (~4 GiB) from a tiny input; the loader pre-sizes its arena from
+    // the input (compressed_size x 3, OOM-guarded) and has its own bad_alloc
+    // catch, but under ASan a failed huge malloc aborts the process BEFORE
+    // bad_alloc propagates (same limitation as the [oom] test). The CI budget
+    // is max_len=262144, so this 8 MiB cap is already effectively true — it is
+    // explicit here so any local run without max_len stays bounded. Nothing is
+    // decompressed in the harness; the loader remains the authoritative path.
+    if (size > 8ull * 1024 * 1024) return 0;
     const std::string path = traceon_fuzz::write_input_to_tmp(data, size, ".gz");
     // Alternate entry points: the explicit loadGzipFile() and the
     // auto-detecting loadFile() (routes by extension, then by magic bytes).
