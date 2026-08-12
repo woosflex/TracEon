@@ -41,6 +41,14 @@
  * empty string when the last call succeeded). Each C thread has its own
  * error slot, so concurrent callers never race on it.
  *
+ * The diagnostic is a fixed-size (256-byte) NON-ALLOCATING per-thread
+ * buffer: recording an error never allocates, so the noexcept boundary
+ * stays total even under memory exhaustion (an allocating std::string
+ * assignment inside a noexcept function could throw std::bad_alloc and
+ * std::terminate instead). The returned pointer stays valid until the
+ * next error (or success, which clears it) on the SAME thread; activity
+ * on other threads never invalidates it.
+ *
  * ---------------------------------------------------------------------------
  * FREEZE / POINTER-STABILITY CONTRACT
  * ---------------------------------------------------------------------------
@@ -53,6 +61,18 @@
  * After freezing, kmerindex_insert() and kmerindex_reserve() fail with
  * return 0 and last_error "index is frozen". Read operations (get, size,
  * iteration) remain valid and safe after freezing.
+ *
+ * THREAD SAFETY: the freeze flag is an atomic<bool> with release/acquire
+ * ordering. get()/iter_begin()/freeze() publish the freeze with a RELEASE
+ * store; insert()/reserve() check it with an ACQUIRE load before mutating.
+ * Concurrent lookups from multiple threads (minimap2 mapping workers) may
+ * therefore race with insert/reserve attempts on the flag itself without
+ * UB, and any insert that observes the freeze is guaranteed to see every
+ * map write published before it. Concurrent get()/size()/iteration on a
+ * frozen index are safe (no mutation, no shared mutable state). The build
+ * phase (insert/reserve) must itself be single-threaded or otherwise
+ * externally serialized -- the freeze only guards the read/write
+ * transition, not concurrent mutators.
  *
  * ---------------------------------------------------------------------------
  * ITERATION (caller-owned, reentrant)
@@ -141,7 +161,9 @@ int kmerindex_iter_begin(const kmerindex_t* h, kmerindex_iter_t* out) TRACEON_CA
 int kmerindex_iter_next(kmerindex_iter_t* it, uint64_t* key_out, uint64_t* val_out) TRACEON_CAPI_NOEXCEPT;
 
 /* Thread-local diagnostic for the last failed call in the calling thread.
- * Never NULL; empty string if the last call succeeded. Passing a NULL
+ * Never NULL; empty string if the last call succeeded. Backed by a fixed,
+ * non-allocating per-thread buffer: valid until the next error (or clear)
+ * on the SAME thread, never invalidated by other threads. Passing a NULL
  * handle is safe and still returns the diagnostic. */
 const char* kmerindex_last_error(const kmerindex_t* h) TRACEON_CAPI_NOEXCEPT;
 

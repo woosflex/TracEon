@@ -2,10 +2,10 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <new>
-#include <string>
 #include <type_traits>
 
 // Custom hash/equality replicating minimap2's exact khash instantiation
@@ -30,11 +30,19 @@ using MinimizerMap = ankerl::unordered_dense::map<uint64_t, uint64_t, MinimizerK
 
 struct kmerindex_t {
     MinimizerMap map;
-    // Set once the read phase begins (get/iter_begin/freeze). Blocks
-    // insert/reserve so interior pointers returned by get() can never be
-    // invalidated by a later rehash. `mutable` because get()/iter_begin()
-    // take a const handle (reads) but still transition the index phase.
-    mutable bool frozen = false;
+    // Phase-transition flag: set once the read phase begins
+    // (get/iter_begin/freeze), blocking insert/reserve so interior
+    // pointers returned by get() can never be invalidated by a later
+    // rehash. ATOMIC (not a plain bool): minimap2 performs concurrent
+    // lookups from mapping worker threads, and every get() WRITES the
+    // flag while a straggler insert()/reserve() READS it -- concurrent
+    // read/write on a plain bool is UB. The freeze paths use a RELEASE
+    // store (publishing all map writes done before the freeze) and the
+    // check paths an ACQUIRE load, so an insert that observes frozen==true
+    // happens-after every write published by the freeze. `mutable` because
+    // get()/iter_begin() take a const handle (reads) but still transition
+    // the index phase.
+    mutable std::atomic<bool> frozen{false};
 };
 
 // Internal state stored inside the caller-owned opaque kmerindex_iter_t.
@@ -54,13 +62,34 @@ static_assert(sizeof(KmerIndexIterState) <= sizeof(kmerindex_iter_t),
 
 namespace {
 
-// Thread-local diagnostic slot: each C thread sees its own last-error
-// string, so concurrent callers never race on it. Never left dangling:
-// set on every failure, cleared on every success.
-thread_local std::string g_last_error;
+// Fixed-size, NON-ALLOCATING thread-local diagnostic slot. Each C thread
+// sees its own last-error message, so concurrent callers never race on it.
+// The whole point of the fixed buffer is the noexcept boundary: assigning
+// a std::string here (as before) can allocate, and an allocation that
+// throws std::bad_alloc from within a noexcept function calls
+// std::terminate -- so the advertised no-throw boundary was not total.
+// Every error write goes through set_error(), which copies into this
+// buffer with bounds checks and never allocates, and is therefore safe
+// to call from catch blocks even under OOM. kmerindex_last_error()
+// returns a pointer into this buffer; the content is valid until the
+// next error (or success, which clears it) on the SAME thread.
+static thread_local char g_last_error[256];
 
-void set_error(const char* msg) noexcept { g_last_error = msg ? msg : ""; }
-void clear_error() noexcept { g_last_error.clear(); }
+// Bounded non-allocating copy: never allocates, never leaves the buffer
+// unterminated, truncates (with NUL) if the message does not fit.
+void set_error(const char* msg) noexcept {
+    size_t i = 0;
+    const size_t cap = sizeof(g_last_error) - 1;
+    if (msg) {
+        while (i < cap && msg[i] != '\0') {
+            g_last_error[i] = msg[i];
+            ++i;
+        }
+    }
+    g_last_error[i] = '\0';
+}
+
+void clear_error() noexcept { g_last_error[0] = '\0'; }
 
 } // namespace
 
@@ -89,7 +118,10 @@ int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
         set_error("kmerindex_reserve: null handle");
         return 0;
     }
-    if (h->frozen) {
+    // ACQUIRE: observe a freeze published by get()/iter_begin()/freeze()
+    // (their RELEASE stores). If the index is frozen, fail BEFORE touching
+    // the map -- no mutation may race with the concurrent readers.
+    if (h->frozen.load(std::memory_order_acquire)) {
         set_error("kmerindex_reserve: index is frozen");
         return 0;
     }
@@ -123,13 +155,20 @@ int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) noexcep
         set_error("kmerindex_insert: null handle");
         return 0;
     }
-    if (h->frozen) {
+    // ACQUIRE: observe a freeze published by get()/iter_begin()/freeze()
+    // (their RELEASE stores). If the index is frozen, fail BEFORE touching
+    // the map -- no mutation may race with the concurrent readers.
+    if (h->frozen.load(std::memory_order_acquire)) {
         set_error("kmerindex_insert: index is frozen");
         return 0;
     }
     try {
         auto [it, inserted] = h->map.try_emplace(final_key, value);
         if (!inserted) {
+            // `inserted` here is the map's own try_emplace bool (0/1 only,
+            // never -1), NOT the C API status code -- this branch is a
+            // base-key collision, not an error. Only the RETURN below is
+            // the public contract (1 inserted / 0 not / -1 exception).
             // Base-key collision: a defined (should-never-happen) outcome,
             // not an error -- clear last_error so callers can tell it
             // apart from frozen/error returns (empty = plain collision).
@@ -160,7 +199,10 @@ const uint64_t* kmerindex_get(const kmerindex_t* h, uint64_t query_key,
     try {
         // Freeze BEFORE lookup: the returned pointer is an interior pointer
         // that must remain stable; no inserts may happen from this point on.
-        h->frozen = true;
+        // RELEASE store: any insert that later ACQUIRE-loads the flag and
+        // fails has happened-after this point, so the interior pointer it
+        // might otherwise have invalidated can never dangle.
+        h->frozen.store(true, std::memory_order_release);
         auto it = h->map.find(query_key);
         if (it == h->map.end()) {
             clear_error();
@@ -180,7 +222,9 @@ int kmerindex_freeze(kmerindex_t* h) noexcept {
         set_error("kmerindex_freeze: null handle");
         return 0;
     }
-    h->frozen = true;
+    // RELEASE store (see kmerindex_get): publishes the freeze so any
+    // concurrent/future insert/reserve ACQUIRE-load sees it.
+    h->frozen.store(true, std::memory_order_release);
     clear_error();
     return 1;
 }
@@ -199,7 +243,9 @@ int kmerindex_iter_begin(const kmerindex_t* h, kmerindex_iter_t* out) noexcept {
         st->magic = KmerIndexIterState::kMagic;
         st->map = &h->map;
         st->it = h->map.begin();
-        h->frozen = true; // iteration is part of the read phase
+        // Iteration is part of the read phase; RELEASE store (see
+        // kmerindex_get) so inserts/reserves observe the freeze.
+        h->frozen.store(true, std::memory_order_release);
         clear_error();
         return 1;
     } catch (...) {
@@ -235,7 +281,7 @@ int kmerindex_iter_next(kmerindex_iter_t* it, uint64_t* key_out, uint64_t* val_o
 
 const char* kmerindex_last_error(const kmerindex_t* h) noexcept {
     (void)h; // diagnostic is thread-local; handle presence is irrelevant
-    return g_last_error.c_str();
+    return g_last_error;
 }
 
 } // extern "C"

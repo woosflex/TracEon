@@ -20,6 +20,8 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <atomic>
 #include <vector>
 #include <stdexcept>
 #ifndef _WIN32
@@ -398,6 +400,91 @@ TEST_CASE("C API: caller-owned iterators are independent and reentrant",
     REQUIRE(kmerindex_iter_next(&uninit, &k1, &v1) == 0);
     REQUIRE(std::string(kmerindex_last_error(h)).find("not initialized") != std::string::npos);
 
+    kmerindex_destroy(h);
+}
+
+// ── Concurrent freeze/get (minimap2-style multithreaded lookups) ───────────
+
+TEST_CASE("C API: concurrent get after freeze is race-free; inserts fail",
+          "[kmer][capi][thread][freeze]") {
+    // Minimap2 runs lookups from mapping worker threads while every get()
+    // WRITES the shim's freeze flag and a straggler insert() READS it --
+    // before the fix that flag was a plain bool, so concurrent read/write
+    // was UB (the design-review defect). After an explicit freeze the gets
+    // only re-store the (already-true) flag and every insert must fail
+    // before touching the map, so the only shared state touched
+    // concurrently is the atomic flag itself. This test pins that contract:
+    // no crash, no hang, no data race (see the TSan harness run).
+    constexpr uint64_t kNumKeys = 100'000;
+    kmerindex_t* h = kmerindex_create();
+    REQUIRE(h != nullptr);
+    REQUIRE(kmerindex_reserve(h, kNumKeys) == 1);
+    for (uint64_t i = 0; i < kNumKeys; ++i) {
+        REQUIRE(kmerindex_insert(h, (i << 1) | 1u, i * 3) == 1);
+    }
+    REQUIRE(kmerindex_size(h) == kNumKeys);
+    REQUIRE(kmerindex_freeze(h) == 1);
+
+    constexpr int kNumReaders = 8;
+    constexpr uint64_t kReadsPerThread = 25'000;
+    constexpr uint64_t kInsertAttempts = 50'000;
+
+    std::atomic<bool> read_violation{false};
+    std::atomic<uint64_t> hits{0}, misses{0};
+
+    std::vector<std::thread> readers;
+    readers.reserve(kNumReaders);
+    for (int t = 0; t < kNumReaders; ++t) {
+        readers.emplace_back([&, t] {
+            const uint64_t stride = 2'654'435'761ull; // odd => wide base spread
+            for (uint64_t r = 0;
+                 r < kReadsPerThread && !read_violation.load(std::memory_order_relaxed);
+                 ++r) {
+                const uint64_t base = (r * 7 + (uint64_t)t * stride) % (2 * kNumKeys);
+                uint64_t matched = 0;
+                const uint64_t* v = kmerindex_get(h, base << 1, &matched);
+                if (base < kNumKeys) {
+                    // Guaranteed hit: stored as (base<<1)|1, value base*3;
+                    // lookups use bit0=0 (minimap2 ignore-bit0 equality).
+                    if (v == nullptr || *v != base * 3 || matched != ((base << 1) | 1u)) {
+                        read_violation.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    ++hits;
+                } else {
+                    if (v != nullptr) {
+                        read_violation.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    ++misses;
+                }
+            }
+        });
+    }
+
+    // Main thread: every insert attempt must fail (return 0) -- never
+    // succeed (1) and never hit the exception path (-1). Keys are unique
+    // and absent, so the only legal 0 is the frozen rejection; the
+    // thread-local diagnostic must read "frozen" on THIS thread.
+    for (uint64_t i = 0; i < kInsertAttempts; ++i) {
+        REQUIRE(kmerindex_insert(h, (kNumKeys + i) << 1, i) == 0);
+    }
+    REQUIRE(std::string(kmerindex_last_error(h)).find("frozen") != std::string::npos);
+
+    for (auto& th : readers) th.join();
+    REQUIRE_FALSE(read_violation.load());
+    REQUIRE(hits.load() + misses.load() == kNumReaders * kReadsPerThread);
+    REQUIRE(hits.load() > 0);  // mixed workload: guaranteed hits happened
+    REQUIRE(misses.load() > 0); // ...and guaranteed misses happened
+
+    // Reads still valid after the storm: interior pointers stable.
+    for (uint64_t i = 0; i < kNumKeys; i += 9973) {
+        uint64_t matched = 0;
+        const uint64_t* v = kmerindex_get(h, i << 1, &matched);
+        REQUIRE(v != nullptr);
+        REQUIRE(*v == i * 3);
+        REQUIRE(matched == ((i << 1) | 1u));
+    }
     kmerindex_destroy(h);
 }
 

@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *Post-2.0.0 fixes will be listed here.*
 
+### Research
+
+- Investigated a TracEon `traceon_kmer` C API drop-in for minimap2's per-bucket
+  `khash_t(idx)` table. Evidence and benchmark recommendations are recorded in
+  `outputs/minimap2-traceon-integration-research.md`; no source files were
+  modified. Current experimental patch remains blocked on iterator ABI and
+  error-status handling fixes.
+
 ---
 
 ## [2.0.0] — v2.0.0 "Durandal" (2026)
