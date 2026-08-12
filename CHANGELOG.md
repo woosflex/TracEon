@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *Post-2.0.0 fixes will be listed here.*
 
+### Added
+
+- **Public `Cache` facade completed to match the documented API surface**: the
+  README documents `cache.loadGzipFile(...)` and the lifecycle contract names
+  `clearCache()` as a reload path, but the high-level `Cache` class did not
+  expose them (only `SmartStrategy` did) — the documented examples did not
+  compile. `Cache` now forwards `loadGzipFile()`, `clearCache()`, `getAllKeys()`,
+  `getQuality()`, and `getDetectedFormat()` to the strategy, with unit tests
+  (gzip round-trip, non-gzip rejection + failure atomicity, clear/reload cycle,
+  key enumeration, quality round-trip, format detection).
+
 ### Research
 
 - Surveyed khash/khashl and structurally similar minimizer indexes across Winnowmap,

@@ -207,3 +207,135 @@ TEST_CASE("Cache IndexMode selection", "[cache]") {
         std::filesystem::remove(fasta_path);
     }
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache facade completeness — the README documents cache.loadGzipFile(...)
+// and the lifecycle contract names clearCache() as a reload path, but the
+// public Cache facade previously did not expose them (only SmartStrategy did),
+// so the documented examples did not compile. Regression coverage for the
+// facade-completion PR: loadGzipFile, clearCache, getAllKeys, getQuality,
+// getDetectedFormat.
+// ─────────────────────────────────────────────────────────────────────────────
+#include <zlib.h>
+
+TEST_CASE("Cache facade: README-documented loadGzipFile", "[cache][gzip]") {
+    const std::string gz_path = "facade_loadgzip.fastq.gz";
+
+    SECTION("loadGzipFile loads a .gz FASTQ with quality intact") {
+        const std::string record =
+            "@read1\nACGTACGT\n+\nIIIIIIII\n"
+            "@read2\nTTTT\n+\nJJJJ\n";
+        {
+            gzFile f = gzopen(gz_path.c_str(), "wb");
+            REQUIRE(f != nullptr);
+            int n = gzwrite(f, record.data(), static_cast<unsigned>(record.size()));
+            REQUIRE(n == static_cast<int>(record.size()));
+            gzclose(f);
+        }
+
+        TracEon::Cache cache;
+        cache.loadGzipFile(gz_path);
+
+        REQUIRE(cache.size() == 2);
+        REQUIRE(cache.getView("read1") == "ACGTACGT");
+        REQUIRE(cache.getView("read2") == "TTTT");
+        REQUIRE(cache.getQuality("read1") == "IIIIIIII");
+        REQUIRE(cache.getQuality("read2") == "JJJJ");
+
+        auto rec = cache.getFastqRecord("read1");
+        REQUIRE(rec.has_value());
+        REQUIRE(rec->sequence == "ACGTACGT");
+        REQUIRE(rec->quality == "IIIIIIII");
+    }
+
+    SECTION("loadGzipFile rejects a non-gzip file") {
+        const std::string plain_path = "facade_notgzip.txt";
+        {
+            std::ofstream out(plain_path);
+            out << ">seq1\nACGT\n";
+        }
+        TracEon::Cache cache;
+        REQUIRE_THROWS_AS(cache.loadGzipFile(plain_path), std::runtime_error);
+        // Failure atomicity: a failed gzip load leaves the cache empty.
+        REQUIRE(cache.size() == 0);
+        std::filesystem::remove(plain_path);
+    }
+
+    std::filesystem::remove(gz_path);
+}
+
+TEST_CASE("Cache facade: clearCache / getAllKeys / getQuality / getDetectedFormat", "[cache]") {
+    SECTION("clearCache resets state and allows reuse") {
+        TracEon::Cache cache;
+        cache.set("k1", "ACGT");
+        cache.set("k2", "TGCA");
+        REQUIRE(cache.size() == 2);
+
+        cache.clearCache();
+        REQUIRE(cache.size() == 0);
+        REQUIRE(cache.hasSequence("k1") == false);
+
+        // After clearCache() the cache is reusable (build phase again).
+        cache.set("k3", "GGGG");
+        REQUIRE(cache.size() == 1);
+        REQUIRE(cache.get("k3") == "GGGG");
+
+        // And a full load→clear→load cycle works (lifecycle contract).
+        const std::string fasta_path = "facade_clear.fasta";
+        {
+            std::ofstream out(fasta_path);
+            out << ">seq1\nGATTACA\n";
+        }
+        cache.loadFile(fasta_path);
+        REQUIRE(cache.size() == 1);
+        REQUIRE(cache.getView("seq1") == "GATTACA");
+        cache.clearCache();
+        REQUIRE(cache.size() == 0);
+        cache.loadFile(fasta_path);
+        REQUIRE(cache.size() == 1);
+        REQUIRE(cache.get("seq1") == "GATTACA");
+
+        std::filesystem::remove(fasta_path);
+    }
+
+    SECTION("getAllKeys enumerates all keys") {
+        TracEon::Cache cache;
+        cache.set("alpha", "AAAA");
+        cache.set("beta", "CCCC");
+        cache.set("gamma", "GGGG");
+        auto keys = cache.getAllKeys();
+        REQUIRE(keys.size() == 3);
+        REQUIRE(std::find(keys.begin(), keys.end(), "alpha") != keys.end());
+        REQUIRE(std::find(keys.begin(), keys.end(), "beta") != keys.end());
+        REQUIRE(std::find(keys.begin(), keys.end(), "gamma") != keys.end());
+    }
+
+    SECTION("getQuality returns empty for FASTA and stored quality for FASTQ") {
+        const std::string fasta_path = "facade_qual.fasta";
+        const std::string fastq_path = "facade_qual.fastq";
+        {
+            std::ofstream out(fasta_path);
+            out << ">chr1\nACGTACGT\n";
+            out.close();
+            std::ofstream out2(fastq_path);
+            out2 << "@r1\nACGT\n+\nIIII\n";
+        }
+
+        TracEon::Cache fasta_cache;
+        fasta_cache.loadFile(fasta_path);
+        REQUIRE(fasta_cache.getQuality("chr1").empty());
+        REQUIRE(fasta_cache.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
+
+        TracEon::Cache fastq_cache;
+        fastq_cache.loadFile(fastq_path);
+        REQUIRE(fastq_cache.getQuality("r1") == "IIII");
+        REQUIRE(fastq_cache.getDetectedFormat() == TracEon::FileFormat::DNA_FASTQ);
+
+        std::filesystem::remove(fasta_path);
+        std::filesystem::remove(fastq_path);
+    }
+
+    SECTION("getDetectedFormat is UNKNOWN on an empty cache") {
+        TracEon::Cache cache;
+        REQUIRE(cache.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
+    }
+}
