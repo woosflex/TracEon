@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.0] — v2.2.0 "Gáe Bolg" (2026-08-14)
+
+### Added
+- **Aligner validation matrix COMPLETE** — 5 real tools with byte-identical outputs:
+  `woosflex/minimap2` (−13.6% full chr1), `woosflex/Winnowmap` (−80% chr1-50Mb),
+  `woosflex/mm2-fast` (−39%/−33% RSS), `woosflex/minigraph` (first khashl adapter),
+  `woosflex/BLEND` (fuzzy-seed mapper, 7-config identity). Every fork: stock
+  byte-identical + opt-in `TRACEON=1` table backend + `tcache` mmap'd prebuilt index.
+  See `RELEASE_v2.2.0.md` and `TracEon - Aligner Integration Results.md` (vault).
+- Documented upstream bugs found during integration: Winnowmap applyWeight crash +
+  uninitialized rep_len; minigraph GCC-16 crash on its own test data (memcpy-load
+  fix in port) + gi->g_own leak; mm2-fast safestringlib GCC-16 CFLAGS patch.
+
+### Changed
+- (none — no core/API changes in v2.2.0; additive release)
+
 ## [2.1.0] — v2.1.0 "Excalibur" (2026-08-12)
 
 ### Added

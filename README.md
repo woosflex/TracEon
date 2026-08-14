@@ -2,16 +2,20 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v2.1.0-blueviolet.svg)]()
+[![Version](https://img.shields.io/badge/Release-v2.2.0-blueviolet.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
 [![BinaryCache](https://img.shields.io/badge/BinaryCache-v4%20CRC32C%20Integrity-green.svg)]()
 
-**TracEon** (v2.1.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
+**TracEon** (v2.2.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
+
+## 🎯 What's New in v2.2.0
+
+- **Aligner validation matrix COMPLETE** — 5 real tools, all PAF byte-identical: minimap2, Winnowmap, mm2-fast, minigraph (first khashl adapter), BLEND. Every fork: opt-in `TRACEON=1` table backend + `tcache` mmap'd prebuilt index (zero-rebuild load). Recurring wins −13.6% to −80%; full numbers in `RELEASE_v2.2.0.md`
 
 ## 🎯 What's New in v2.1.0
 
@@ -632,7 +636,7 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 - **`Cache::set()` data persistence**: Manually-added entries via `set()` are now serialized by `save()` and restored by `restore()`
 - **Correctness hardening**: Closed test gaps for parallel GZIP, RNA/protein format detection, v1 binary format, `clearCache()` + reload, and zero-copy `Cache::getView()`
 
-### ✅ v2.1.0 "Excalibur" (Q4 2026) — Fuzz Gate & Aligner Validation (Current Release)
+### ✅ v2.1.0 "Excalibur" (Q4 2026) — Fuzz Gate & Aligner Validation (Released)
 *The golden sword — verification and real-world proof*
 
 - **Fuzzing gate**: 7 libFuzzer targets + 83-file seed corpus + CI workflow (per-push + weekly)
@@ -654,11 +658,15 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
   stable surface (exception-boundary, iterator-ownership, and `TRKI` format
   work pending — see the design review)
 
-### 🎯 v2.1.0 "Rule Breaker" (Q1 2027)
-*Noble phantasm that shatters conventional limits*
+### ✅ v2.2.0 "Gáe Bolg" (Q4 2026) — Aligner Validation Matrix Complete (Current Release)
+*The cursed spear — piercing through every target*
 
-- **Experimental k-mer C API** (with a defined C error model, caller-owned
-  iteration, and a separate `TRKI` format decision)
+- **5-tool validation matrix complete**: minimap2 (−13.6% full chr1), Winnowmap (−80%), mm2-fast (−39%/−33% RSS), minigraph (first khashl adapter), BLEND (7-config identity) — all PAF byte-identical, all forks live under `woosflex/*`
+- **Upstream bugs found + documented**: Winnowmap applyWeight crash + uninitialized rep_len; minigraph GCC-16 crash on own test data + gi->g_own leak; mm2-fast safestringlib GCC-16 patch
+
+### 🎯 v2.3.0 "Harpe" (Planned)
+*The divine sword that strikes regardless of distance*
+
 - **Distributed Caching**: Shard datasets across nodes
 - **NUMA-Aware Architecture**: Optimize for >8 core systems
 - **Remote Access**: Network protocol for shared genomic databases

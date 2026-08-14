@@ -77,10 +77,10 @@ namespace TracEon {
     /**
      * @brief Library version string
      * Format: MAJOR.MINOR.PATCH
-     * Codename: Excalibur (v2.1.0) — the v2.0.0 "Durandal" codename is retired.
+     * Codename: Gáe Bolg (v2.2.0) — the v2.1.0 "Excalibur" codename is retired.
      */
-    constexpr const char* VERSION = "2.1.0";
-    constexpr const char* CODENAME = "Excalibur";
+    constexpr const char* VERSION = "2.2.0";
+    constexpr const char* CODENAME = "Gáe Bolg";
     
     /**
      * @brief Check if lock-free optimization is active
