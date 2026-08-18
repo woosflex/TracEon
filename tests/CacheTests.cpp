@@ -260,6 +260,88 @@ TEST_CASE("Cache facade: README-documented loadGzipFile", "[cache][gzip]") {
         std::filesystem::remove(plain_path);
     }
 
+    SECTION("pre-flight rejection preserves a loaded snapshot") {
+        // Failure-atomicity contract (see SmartStrategy::loadGzipFile()): a
+        // pre-flight validation failure (file unreadable / not GZIP magic)
+        // throws BEFORE teardown, so the previously loaded snapshot stays
+        // fully intact and usable — the failed load is a no-op on state.
+        const std::string fasta_path = "facade_preserve.fasta";
+        const std::string plain_path = "facade_preserve_notgzip.txt";
+        {
+            std::ofstream out(fasta_path);
+            out << ">chr1\nACGTACGT\n>chr2\nTTTTTTTT\n";
+            out.close();
+            std::ofstream out2(plain_path);
+            out2 << "this is not gzip\n";
+        }
+
+        TracEon::Cache cache;
+        cache.loadFile(fasta_path);
+        REQUIRE(cache.size() == 2);
+
+        REQUIRE_THROWS_AS(cache.loadGzipFile(plain_path), std::runtime_error);
+
+        // Snapshot preserved: size, lookups, and zero-copy views all work.
+        REQUIRE(cache.size() == 2);
+        REQUIRE(cache.hasSequence("chr1"));
+        REQUIRE(cache.getView("chr1") == "ACGTACGT");
+        REQUIRE(cache.get("chr2") == "TTTTTTTT");
+
+        std::filesystem::remove(fasta_path);
+        std::filesystem::remove(plain_path);
+    }
+
+    SECTION("mid-stream truncation leaves the cache empty, never partial") {
+        // Failure-atomicity contract: a truncation/corruption detected during
+        // decompression throws AFTER the reload teardown has begun (ADR-001:
+        // a reload invalidates the previous snapshot), so the cache is left
+        // EMPTY — never partial — and remains reusable.
+        const std::string valid_gz = "facade_valid.fastq.gz";
+        const std::string truncated_gz = "facade_truncated.fastq.gz";
+        const std::string fasta_path = "facade_trunc_old.fasta";
+        const std::string record = "@read1\nACGTACGT\n+\nIIIIIIII\n";
+        {
+            gzFile f = gzopen(valid_gz.c_str(), "wb");
+            REQUIRE(f != nullptr);
+            int n = gzwrite(f, record.data(), static_cast<unsigned>(record.size()));
+            REQUIRE(n == static_cast<int>(record.size()));
+            gzclose(f);
+
+            // Truncate: drop the second half of the compressed bytes (the
+            // deflate stream and/or the 8-byte CRC+ISIZE trailer).
+            std::ifstream in(valid_gz, std::ios::binary);
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+            REQUIRE(bytes.size() > 16);
+            std::ofstream out(truncated_gz, std::ios::binary);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size() / 2));
+
+            std::ofstream out2(fasta_path);
+            out2 << ">old\nGGGGGGGG\n";
+        }
+
+        TracEon::Cache cache;
+        cache.loadFile(fasta_path);          // load a working snapshot first
+        REQUIRE(cache.size() == 1);
+        REQUIRE(cache.get("old") == "GGGGGGGG");
+
+        REQUIRE_THROWS_AS(cache.loadGzipFile(truncated_gz), std::runtime_error);
+
+        // Teardown already began: cache is EMPTY, never partial.
+        REQUIRE(cache.size() == 0);
+        REQUIRE(cache.hasSequence("old") == false);
+        REQUIRE(cache.getView("old").empty());
+
+        // And it remains fully reusable after the failure.
+        cache.loadFile(fasta_path);
+        REQUIRE(cache.size() == 1);
+        REQUIRE(cache.get("old") == "GGGGGGGG");
+
+        std::filesystem::remove(valid_gz);
+        std::filesystem::remove(truncated_gz);
+        std::filesystem::remove(fasta_path);
+    }
+
     std::filesystem::remove(gz_path);
 }
 

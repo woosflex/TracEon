@@ -76,6 +76,24 @@ public:
      * @throws std::runtime_error if the file is not valid GZIP, or if the
      *         stream is truncated / has trailing data after the last member
      *         (data-integrity rejection — partial data is never served).
+     *
+     * Failure atomicity (explicit contract): the cache is NEVER left in a
+     * partial state, but the two failure classes differ in what survives:
+     *   - Pre-flight validation failures — file unreadable, or the first two
+     *     bytes are not the GZIP magic (0x1f 0x8b) — throw BEFORE the reload
+     *     teardown (clearInternal()) begins, so a previously loaded snapshot
+     *     stays fully intact and usable (getView()/get() still return old
+     *     data; the failed load is a no-op on the cache state).
+     *   - Mid-stream failures — truncated/corrupt GZIP streams, trailing
+     *     garbage after the last member, OOM-guard rejections — are only
+     *     detectable during decompression, which streams into the arena
+     *     AFTER the reload teardown has begun (per the ADR-001 lifecycle
+     *     contract, a reload invalidates the previous snapshot's views).
+     *     These throw with the cache left EMPTY (never partial); reload from
+     *     a valid source. Pre-flight checks are free, so they may preserve
+     *     the old snapshot; preserving it through mid-stream failure would
+     *     require a full second decompression or a full snapshot backup,
+     *     contradicting the streaming/low-memory design.
      */
     void loadGzipFile(const std::string& filepath);
 

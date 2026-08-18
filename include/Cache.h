@@ -82,6 +82,12 @@ namespace TracEon {
          * @throws std::runtime_error if the file is not valid GZIP, or if the
          *         stream is truncated / has trailing data after the last member
          *         (data-integrity rejection — partial data is never served).
+         * @note Failure atomicity: a pre-flight rejection (unreadable file or
+         *       non-GZIP magic bytes) throws before teardown and PRESERVES the
+         *       previously loaded snapshot; a mid-stream failure (truncated /
+         *       corrupt GZIP stream, trailing garbage, OOM guard) throws after
+         *       teardown has begun and leaves the cache EMPTY — never partial.
+         *       See SmartStrategy::loadGzipFile() for the full contract.
          */
         void loadGzipFile(const std::string& filepath);
         
