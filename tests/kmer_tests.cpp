@@ -212,20 +212,25 @@ constexpr bool kUnderAsan = false;
 #ifndef _WIN32
 TEST_CASE("C API: absurd reserve size returns 0 (length_error caught), never aborts",
           "[kmer][capi][vuln-0003][oom]") {
-    // reserve(2^62) exceeds any allocatable size -> ankerl throws (bad_alloc
-    // or length_error) before any allocation; the C boundary must translate
-    // it to return 0 + diagnostic, never an exception crossing into C.
-    // Skipped under ASan: ASan's allocator aborts on failed huge
-    // allocations before the C++ exception can be thrown, so the boundary
-    // path cannot be exercised there (verified under Release + UBSan).
-    if (kUnderAsan) {
-        WARN("skipping absurd-size reserve under AddressSanitizer (allocator aborts on OOM before bad_alloc)");
-        return;
-    }
+    // reserve(2^62) is far above the container's max_size() (~2^32 entries
+    // for this uint32 value_idx map). ankerl::unordered_dense 4.4.0
+    // reserve() CLAMPS to max_size() instead of throwing (bad_alloc or
+    // length_error), so without a pre-check this would SILENTLY SUCCEED
+    // (return 1) on machines where the huge allocation lands -- the bug
+    // fixed in GitHub issue #9. The C boundary now pre-checks
+    // n > map.max_size() and rejects such requests deterministically,
+    // returning 0 with the "requested size too large" diagnostic BEFORE
+    // any allocation; the result is platform-independent.
+    // No ASan skip is needed for this test: the pre-check fires BEFORE any
+    // allocation, so no huge allocation is ever attempted and the boundary
+    // path works identically under AddressSanitizer.
     kmerindex_t* h = kmerindex_create();
     REQUIRE(h != nullptr);
     REQUIRE(kmerindex_reserve(h, 1ull << 62) == 0);
-    REQUIRE(std::string(kmerindex_last_error(h)).find("allocation") != std::string::npos);
+    // The C boundary's pre-check rejects the size BEFORE any allocation,
+    // so the diagnostic is "requested size too large" -- asserting
+    // "allocation" would encode the old container-throwing behavior.
+    REQUIRE(std::string(kmerindex_last_error(h)).find("requested size too large") != std::string::npos);
     // Handle still usable after the failed reserve.
     REQUIRE(kmerindex_size(h) == 0);
     REQUIRE(kmerindex_insert(h, 42, 1) == 1);
@@ -239,11 +244,17 @@ TEST_CASE("C API: absurd reserve size returns 0 (length_error caught), never abo
 TEST_CASE("C API: huge reserve under memory pressure returns 0, never aborts",
           "[kmer][capi][vuln-0003][oom]") {
     // Real memory-pressure path: lower RLIMIT_AS to 256 MiB, then reserve
-    // 2^34 entries (~64 GiB of buckets) -> std::bad_alloc inside reserve().
-    // If the exception leaked across the C boundary the process would abort
+    // 2^30 entries (~24-32 GB of buckets). The size stays BELOW the
+    // container's max_size() (~2^32), so it passes the deterministic
+    // pre-check and genuinely exercises reserve()'s allocation failure:
+    // the ~24-32 GB it requests is far above the 256 MiB rlimit, forcing
+    // std::bad_alloc. (A size ABOVE max_size() would be rejected by the
+    // pre-check instead -- that is the other [oom] test's path.) If the
+    // exception leaked across the C boundary the process would abort
     // (SIGABRT) and this test would fail loudly; expected is a clean 0
     // return with a diagnostic. Skipped under ASan (rlimit breaks ASan's
-    // shadow mmaps) -- the length_error path above covers the boundary.
+    // shadow mmaps) -- the absurd-size pre-check path above covers the
+    // boundary.
     if (kUnderAsan) {
         WARN("skipping RLIMIT_AS trigger under AddressSanitizer (shadow mmap conflict)");
         return;
@@ -254,7 +265,7 @@ TEST_CASE("C API: huge reserve under memory pressure returns 0, never aborts",
 
     RlimitAsGuard guard(256ull * 1024 * 1024);
     if (guard.applied) {
-        REQUIRE(kmerindex_reserve(h, 1ull << 34) == 0);
+        REQUIRE(kmerindex_reserve(h, 1ull << 30) == 0);
         REQUIRE(std::string(kmerindex_last_error(h)).find("allocation") != std::string::npos);
         // Handle still usable after the failed reserve.
         REQUIRE(kmerindex_size(h) == 0);

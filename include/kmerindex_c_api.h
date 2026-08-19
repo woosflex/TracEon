@@ -116,7 +116,18 @@ void kmerindex_destroy(kmerindex_t* h) TRACEON_CAPI_NOEXCEPT;
 
 /* Pre-reserves capacity for `n` entries (avoids mid-build rehash). Returns
  * 1 on success, 0 on failure (allocation failure, frozen index, or NULL
- * handle). */
+ * handle).
+ *
+ * Absurd sizes ABOVE the container's max_size() (~2^32 entries for this
+ * index) are rejected deterministically BEFORE any allocation: ankerl
+ * reserve() clamps to max_size() rather than throwing, so without this
+ * pre-check the outcome would be platform-dependent (silent success on
+ * machines where the huge allocation lands). Such requests return 0 with
+ * the diagnostic "requested size too large". Genuine allocation failures
+ * under memory pressure (sizes at or below max_size()) are also
+ * translated to 0 with the diagnostic "allocation failed". The no-throw
+ * guarantee across the C boundary is unconditional: a C caller can never
+ * observe an exception from this function. */
 int kmerindex_reserve(kmerindex_t* h, size_t n) TRACEON_CAPI_NOEXCEPT;
 
 /* Number of stored entries. Returns 0 on a NULL handle. */
