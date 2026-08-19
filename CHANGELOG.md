@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *Post-2.0.0 fixes will be listed here.*
 
+- **kmer C API `kmerindex_reserve()` now rejects absurd sizes deterministically**: ankerl
+  `unordered_dense` 4.4.0 `reserve()` clamps to `max_size()` instead of throwing, so
+  `reserve(2^62)` silently succeeded (returned 1) on machines where the huge allocation
+  landed. The C boundary now pre-checks `n > map.max_size()` (~2^32 entries) and rejects
+  such requests with return 0 + diagnostic before any allocation; the no-throw/return-0
+  contract is now platform-independent.
+
 ### Added
 
 - **Public `Cache` facade completed to match the documented API surface**: the

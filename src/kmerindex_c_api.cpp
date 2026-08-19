@@ -125,6 +125,19 @@ int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
         set_error("kmerindex_reserve: index is frozen");
         return 0;
     }
+    // Deterministic pre-check (GitHub issue #9): ankerl::unordered_dense
+    // 4.4.0 reserve() CLAMPS to max_size() instead of throwing, so a
+    // request above max_size() (~2^32 entries for this uint32 value_idx)
+    // silently succeeds on machines where the huge allocation lands -- the
+    // C boundary would return 1 instead of the documented 0. Reject such
+    // sizes here, BEFORE any allocation, so the contract is
+    // platform-independent. The try/catch below still handles GENUINE
+    // allocation failures (bad_alloc / length_error) for sizes at or
+    // below max_size() under real memory pressure.
+    if (n > h->map.max_size()) {
+        set_error("kmerindex_reserve: requested size too large");
+        return 0;
+    }
     try {
         h->map.reserve(n);
         clear_error();
