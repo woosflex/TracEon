@@ -898,6 +898,28 @@ void SmartStrategy::parseArena() {
 }
 
 void SmartStrategy::loadGzipFile(const std::string& filepath) {
+    // Enforce the documented contract ("Throws if file is not valid GZIP").
+    // zlib's gzread() transparently reads non-gzip files as raw data
+    // (verified: gzread on a plain FASTA returns the bytes with Z_OK), so
+    // without an explicit magic-byte check an invalid file silently loads
+    // as plain text — contradicting both the header contract and the
+    // data-integrity model (partial/garbage data is never served).
+    // Matches loadFile()'s own magic-byte detection (0x1f 0x8b).
+    //
+    // Deliberately BEFORE clearInternal(): a pre-flight validation failure
+    // (unreadable file / not GZIP) must PRESERVE the currently loaded
+    // snapshot — the failed load is a no-op on cache state. Mid-stream
+    // failures (truncation, trailing garbage, OOM) happen after teardown
+    // and leave the cache empty; see the failure-atomicity contract in
+    // SmartStrategy.h and the pre-loaded-cache tests in CacheTests.cpp.
+    {
+        std::ifstream check(filepath, std::ios::binary);
+        if (!check) throw std::runtime_error("Cannot open file: " + filepath);
+        unsigned char magic[2];
+        check.read(reinterpret_cast<char*>(magic), 2);
+        if (check.gcount() != 2 || magic[0] != 0x1f || magic[1] != 0x8b)
+            throw std::runtime_error("File is not valid GZIP: " + filepath);
+    }
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
     clearInternal();
     loadGzipInternal(filepath);

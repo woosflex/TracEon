@@ -3,6 +3,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 #include <memory>
 #include <optional>
 
@@ -69,6 +70,26 @@ namespace TracEon {
          *         last GZIP member, and OOM-guard rejections.
          */
         void loadFile(const std::string& filepath);
+
+        /**
+         * @brief Explicitly load a GZIP-compressed FASTA/FASTQ file.
+         *
+         * Mirrors the README-documented example (`cache.loadGzipFile(...)`)
+         * and the lifecycle contract above, which already name loadGzipFile()
+         * as a reload path — this method completes the public Cache facade
+         * (previously only SmartStrategy exposed it, so the documented example
+         * did not compile).
+         * @throws std::runtime_error if the file is not valid GZIP, or if the
+         *         stream is truncated / has trailing data after the last member
+         *         (data-integrity rejection — partial data is never served).
+         * @note Failure atomicity: a pre-flight rejection (unreadable file or
+         *       non-GZIP magic bytes) throws before teardown and PRESERVES the
+         *       previously loaded snapshot; a mid-stream failure (truncated /
+         *       corrupt GZIP stream, trailing garbage, OOM guard) throws after
+         *       teardown has begun and leaves the cache EMPTY — never partial.
+         *       See SmartStrategy::loadGzipFile() for the full contract.
+         */
+        void loadGzipFile(const std::string& filepath);
         
         /**
          * @brief Save the current index to a binary cache file (v4 format).
@@ -102,10 +123,40 @@ namespace TracEon {
          *         or after clearCache().
          */
         void set(const std::string& key, const std::string& value);
+
+        /**
+         * @brief Release the current snapshot and reset the cache to empty.
+         *
+         * Exposes the documented lifecycle operation on the public facade
+         * (see the README "Lifecycle contract" section and ADR-001). After
+         * clearCache(), the cache is empty and set()/loadFile()/restore()
+         * may be used again.
+         * @warning Every std::string_view obtained from getView() before this
+         *          call becomes DANGLING the moment clearCache() begins — stop
+         *          using all views from the snapshot first (reader quiescence).
+         */
+        void clearCache();
         
         size_t size() const;
 
         IndexMode getIndexMode() const;
+
+        /**
+         * @brief Retrieve the quality string for a key (FASTQ only).
+         * @return A copy of the quality line, or empty string if not found /
+         *         FASTA (no quality stored).
+         */
+        std::string getQuality(const std::string& key) const;
+
+        /**
+         * @brief Enumerate all keys currently in the cache (copies).
+         */
+        std::vector<std::string> getAllKeys() const;
+
+        /**
+         * @brief Detected format of the loaded data (UNKNOWN when empty).
+         */
+        FileFormat getDetectedFormat() const;
 
         // --- Internal / Diagnostics ---
         IEncodingStrategy* getStrategy() const;

@@ -34,6 +34,10 @@ namespace TracEon {
         m_strategy->loadFile(filepath);
     }
 
+    void Cache::loadGzipFile(const std::string& filepath) {
+        m_strategy->loadGzipFile(filepath);
+    }
+
     void Cache::save(const std::string& filepath) {
         m_strategy->saveBinary(filepath);
     }
@@ -46,12 +50,28 @@ namespace TracEon {
         m_strategy->addEntry(key, value, "");
     }
 
+    void Cache::clearCache() {
+        m_strategy->clearCache();
+    }
+
     size_t Cache::size() const {
         return m_strategy->getFileCacheSize();
     }
 
     IndexMode Cache::getIndexMode() const {
         return m_strategy->getIndexMode();
+    }
+
+    std::string Cache::getQuality(const std::string& key) const {
+        return m_strategy->getQuality(key);
+    }
+
+    std::vector<std::string> Cache::getAllKeys() const {
+        return m_strategy->getAllKeys();
+    }
+
+    FileFormat Cache::getDetectedFormat() const {
+        return m_strategy->getDetectedFormat();
     }
 
     IEncodingStrategy* Cache::getStrategy() const {

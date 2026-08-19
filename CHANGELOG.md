@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *Post-2.0.0 fixes will be listed here.*
 
+### Added
+
+- **Public `Cache` facade completed to match the documented API surface**: the
+  README documents `cache.loadGzipFile(...)` and the lifecycle contract names
+  `clearCache()` as a reload path, but the high-level `Cache` class did not
+  expose them (only `SmartStrategy` did) — the documented examples did not
+  compile. `Cache` now forwards `loadGzipFile()`, `clearCache()`, `getAllKeys()`,
+  `getQuality()`, and `getDetectedFormat()` to the strategy, with unit tests
+  (gzip round-trip, non-gzip rejection + failure atomicity, clear/reload cycle,
+  key enumeration, quality round-trip, format detection).
+
+### Fixed
+
+- **`SmartStrategy::loadGzipFile()` now enforces its documented "Throws if file
+  is not valid GZIP" contract.** zlib's `gzread()` transparently reads non-gzip
+  files as raw data (no error), so an invalid file previously loaded as plain
+  text. The loader now validates the gzip magic bytes (`0x1f 0x8b`) up front —
+  the same check `loadFile()` already performs — and throws
+  `std::runtime_error` otherwise. Failure atomicity is now an explicit,
+  tested contract (see `SmartStrategy::loadGzipFile()` docs): pre-flight
+  rejections (unreadable / not GZIP) throw BEFORE teardown and preserve the
+  loaded snapshot; mid-stream failures (truncated/corrupt stream, trailing
+  garbage, OOM guard) throw after teardown has begun and leave the cache
+  empty — never partial (pre-loaded-cache tests added for both paths).
+
 ### Research
 
 - Surveyed khash/khashl and structurally similar minimizer indexes across Winnowmap,
