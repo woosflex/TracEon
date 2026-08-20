@@ -13,6 +13,25 @@
 
 ---
 
+## 🎯 Multi-core read scaling (v2.3.0 "Harpe")
+
+TracEon's read path is lock-free and zero-copy: once a snapshot is installed, `getView()` consists of one acquire `load` of `data_ready_` plus a hash-map probe — **no mutex and no read-modify-write on the default read path**, so concurrent readers never invalidate each other's cache lines. v2.3.0 adds `benchmarks/read_scaling.cpp` (a standalone benchmark target, run manually: `./build/read_scaling`) that measures `getView()` aggregate throughput vs thread count on one in-memory immutable cache, plus a **false-sharing audit** (`alignas(64)` on the hot read-path atomics `data_ready_`, `data_loaded_` and the opt-in `active_readers_`, separated from `cache_mutex_`).
+
+Measured on an **Intel Core Ultra 5 125H (14 cores / 18 threads, single NUMA node, L3 18 MiB)**, Release build, 100,000-record in-memory cache, read set = 100,000 distinct keys, per-thread shuffled traversal, nothing pinned (OS scheduler placement). Working set (~11 MiB) is L3-resident after warmup, so this measures the lock-free read path, not DRAM bandwidth.
+
+| Threads | ops/s (median) | ops/s (min) | Scaling vs 1 thread | Median per-thread latency |
+|---------|---------------:|------------:|--------------------:|--------------------------:|
+| 1       |       9.81 M   |     9.65 M  |         1.00×        |       0.10 µs/op           |
+| 2       |      21.4  M   |    21.1  M  |         2.18×        |       0.09 µs/op           |
+| 4       |      37.3  M   |    31.7  M  |         3.80×        |       0.09 µs/op           |
+| 8       |      68.5  M   |    68.1  M  |         6.99×        |       0.11 µs/op           |
+| 14      |      93.5  M   |    75.5  M  |         9.53×        |       0.14 µs/op           |
+| 18      |      ~84 M     |     ~77 M   |        ~13×**        |       0.17 µs/op           |
+
+**18-thread scaling is anchored to a separate low single-thread baseline rep and is noisy (plateaus/ties with 14); the honest headline is the 1→14 thread set above.
+
+**Honest verdict:** scaling is **near-linear through 8 threads** (~7× at 8) then **plateaus to ~9.5× at 14 threads** — it does **not** reach 14×. The plateau is the expected consequence of this host's **hybrid P-core/E-core topology** (extra threads land on E-cores / HT siblings), the **shared 18 MiB L3**, and the **all-core frequency drop** vs single-core turbo under a 14-thread load (median per-thread latency rises 0.10 → 0.14 µs). It is **not** a false-sharing defect: the default read path performs no RMW, so there is no coherence traffic among concurrent readers to fix. The `alignas(64)` change is **preventive** for the default build and a **real fix** for the opt-in `TRACEON_DEBUG_LIFECYCLE` diagnostic, where every lookup RMWs `active_readers_` — pre-fix that RMW shared a line with `data_ready_` (measured ~1.2–1.36× cost at 4/8/14 threads in a layout microbench); post-fix it is contained to its own line. The default Release read path remains the fast, RMW-free path this benchmark measures.
+
 ## 🎯 What's New in v2.2.0
 
 - **Aligner validation matrix COMPLETE** — 5 real tools, all PAF byte-identical: minimap2, Winnowmap, mm2-fast, minigraph (first khashl adapter), BLEND. Every fork: opt-in `TRACEON=1` table backend + `tcache` mmap'd prebuilt index (zero-rebuild load). Recurring wins −13.6% to −80%; full numbers in `RELEASE_v2.2.0.md`

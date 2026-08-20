@@ -78,6 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `serve`), one connection per thread, median/p95/p99 latency + ops/s.
   - Protocol/architecture decision record:
     `docs/architecture/ADR-006-traceon-remote-access.md`.
+- **Multi-core read scaling (slice 2)**:
+  - `benchmarks/read_scaling.cpp` — lock-free `getView()` read throughput vs
+    thread count (1/2/4/8/14/18) against one in-memory immutable cache built
+    via the `addEntry()` path; standalone benchmark target (not in the default
+    ctest suite), per-thread shuffled key traversal + start barrier, aggregate
+    ops/s + scaling factor + median per-thread latency + hit-rate/checksum
+    verification. Honest single-socket framing: near-linear to 8 threads
+    (~7×), plateau to ~9.5× at 14 threads on the Ultra 5 125H (P/E-core hybrid,
+    shared 18 MiB L3, all-core frequency drop) — no 64-core story.
+  - **False-sharing audit** (`include/SmartStrategy.h`): pinned the hot
+    read-path atomics (`data_ready_`, `data_loaded_`, and opt-in
+    `active_readers_` under `TRACEON_DEBUG_LIFECYCLE`) to distinct cache lines
+    with `alignas(64)` and separated them from `cache_mutex_`. The default read
+    path was already RMW-free (pure acquire loads), so this is preventive there
+    and a real fix for the writer-flip/teardown and the debug diagnostic (whose
+    per-lookup `active_readers_` RMW previously shared a line with
+    `data_ready_`, measured ~1.2–1.36× cost at 4/8/14 threads).
 - **Docker testbed** (`docker/`): multi-stage image building the server +
   tools (Release, `TRACEON_BUILD_SERVER=ON`), compose services
   (make-cache → server → client) on a bridge network, and `run.sh` for

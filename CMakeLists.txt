@@ -149,6 +149,19 @@ endif()
 add_executable(traceon_driver traceon_driver.cpp)
 target_link_libraries(traceon_driver PRIVATE traceon_core)
 
+# ── Read-scaling benchmark (v2.3.0 "Harpe", slice 2) ────────────────────────
+# Standalone benchmark target: lock-free getView() read throughput vs thread
+# count (1/2/4/8/14) against one in-memory immutable cache built via the
+# addEntry() path. Core-only (no sockets), so it is NOT guarded by
+# TRACEON_BUILD_SERVER. Deliberately NOT registered with CTest and NOT part
+# of unit_tests (same policy as remote_bench) so the default suite stays
+# fast; it is a benchmark target run manually/CI-on-demand:
+#
+#   ./build/read_scaling [--records=N --keys=N --count=N --warmup=N
+#                         --threads=1,2,4,8,14 --reps=R --seed=S]
+add_executable(read_scaling benchmarks/read_scaling.cpp)
+target_link_libraries(read_scaling PRIVATE traceon_core Threads::Threads)
+
 # --- Example Usage (NEW) ---
 add_executable(example_usage examples/simple_usage.cpp)
 target_link_libraries(example_usage PRIVATE traceon_core)

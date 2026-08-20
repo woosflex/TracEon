@@ -201,13 +201,41 @@ private:
 
     FileFormat detected_format_;
     IndexMode index_mode_;
+    // Write-side serialization ONLY (ADR-001): never taken on the getView()
+    // read path. Declared BEFORE the cache-line-padded hot-atomic block so
+    // rwlock state churn (getFileCacheSize()/getAllKeys()/writers) can never
+    // land on a line a reader is loading — alignas(64) on data_ready_ below
+    // forces the compiler to pad past this member before the hot block.
     mutable std::shared_mutex cache_mutex_;
+
+    // ── Hot read-path atomics: cache-line separation (v2.3.0 audit) ─────────
+    // Each of the read-path atomics below is alignas(64)-pinned to its own
+    // cache line. Honest audit summary of the v2.3.0 read path:
+    //   * DEFAULT (non-debug) builds: once the snapshot is installed, the
+    //     getView() fast path is a pure acquire LOAD of data_ready_ — no RMW
+    //     of any of these on the read path. Pure loads on a shared line cost
+    //     no coherence traffic, so there is NO measurable false sharing
+    //     among concurrent immutable-phase readers. The separation is
+    //     PREVENTIVE here, not a steady-state throughput fix.
+    //   * The separation IS a real fix for the two paths that DO write these
+    //     lines while readers may be loading them: (a) the load→read
+    //     transition and clearCache()/reload teardown, which flip
+    //     data_ready_/data_loaded_ (store/release) and take cache_mutex_
+    //     while other threads hold no lock; and (b) TRACEON_DEBUG_LIFECYCLE
+    //     builds, where EVERY getView() RMWs active_readers_
+    //     (fetch_add/fetch_sub). Pre-fix, data_ready_, active_readers_ and
+    //     data_loaded_ sat within ~10 bytes of each other (same cache line),
+    //     so a debug-build lookup bounced that line across all reader cores
+    //     and serialized every thread's data_ready_ load behind the RMW.
+    //     Pinning each atomic to its own line contains that traffic.
+    //   * alignas(64) on data_ready_ also guarantees the block shares no
+    //     line with cache_mutex_ / the enums above.
 
     /**
      * Lock-Free Read Signal
      * True only when all data is loaded and immutable.
      */
-    std::atomic<bool> data_ready_{false};
+    alignas(64) std::atomic<bool> data_ready_{false};
 
 #ifdef TRACEON_DEBUG_LIFECYCLE
     /**
@@ -220,8 +248,12 @@ private:
      * std::string_view and dereferences it after clearCache()/reload/
      * destruction completes. Diagnostic only — NOT synchronization (see
      * ADR-001 reader-quiescence section).
+     *
+     * alignas(64): every getView() RMWs this counter; keeping it off the
+     * data_ready_/data_loaded_ lines stops debug-build lookups from bouncing
+     * the read signal across cores (see audit note above).
      */
-    mutable std::atomic<size_t> active_readers_{0};
+    alignas(64) mutable std::atomic<size_t> active_readers_{0};
 #endif
 
     /**
@@ -236,7 +268,7 @@ private:
      * throws std::logic_error instead of mutating the map under concurrent
      * lock-free readers.
      */
-    std::atomic<bool> data_loaded_{false};
+    alignas(64) std::atomic<bool> data_loaded_{false};
 
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
