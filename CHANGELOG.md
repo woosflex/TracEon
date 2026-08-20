@@ -7,10 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.3.0] - 2026-08-20
 
-*Post-2.0.0 fixes will be listed here.*
+**Codename: Harpe** — remote read access + multi-core read scaling.
 
+### Added
+
+- **Remote read access over a minimal TCP protocol** (Slice 1): the v4 in-memory
+  cache can now be served over the network and queried by key with zero-copy,
+  lock-free reads preserved on the server. New POSIX-only components:
+  - `TraceonProto`: length-prefixed framing (64 MiB cap), `HELLO`/`GET`/`HAS`/`STATS`/`BYE`
+    messages, and CRC32C-verified `OK`/`OK_STATS` responses (the same Castagnoli
+    checksum family as the v4 cache format).
+  - `TraceonServer`: thread-per-connection server on an immutable cache
+    (graceful shutdown, ephemeral port, `alignas(64)`-isolated read atomics).
+  - `TraceonClient`: CRC-verified `getView()`/`has()`/`stats()`, thread-safe.
+  - `remote_bench`: `local` / `serve` / `remote` modes; a `docker/` testbed
+    (Dockerfile + compose + run.sh) demonstrates a server/client pair over a
+    Docker bridge network.
+  - ADR-006 documents the protocol and design; the protocol is trusted-network-only
+    (no authentication — do not expose to untrusted networks).
+- **Multi-core read-scaling benchmark** (Slice 2): `benchmarks/read_scaling.cpp`
+  measures lock-free `getView()` throughput at 1/2/4/8/14 threads. On the
+  14-core Ultra 5 125H this scales near-linearly through ~8 threads then plateaus
+  (~6–7× at 8T, ~7.6–9.4× at 14T, NOT 14×) due to the P/E-core hybrid and shared
+  L3 — reported honestly, no manufactured 64-core claim.
+- **False-sharing audit**: the hot read-path atomics (`data_ready_`,
+  `data_loaded_`, and the `TRACEON_DEBUG_LIFECYCLE` `active_readers_`) are now
+  `alignas(64)`-pinned to their own cache lines, separated from `cache_mutex_`.
+  Preventive on the default immutable path (RMW-free reads); fixes real
+  contention (1.2–1.36× at 4/8/14T) in the opt-in debug diagnostics.
 - **kmer C API `kmerindex_reserve()` now rejects absurd sizes deterministically**: ankerl
   `unordered_dense` 4.4.0 `reserve()` clamps to `max_size()` instead of throwing, so
   `reserve(2^62)` silently succeeded (returned 1) on machines where the huge allocation
