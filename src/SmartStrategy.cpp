@@ -1766,6 +1766,11 @@ size_t SmartStrategy::getFileCacheSize() const {
     return std::get<NGSIndex>(file_cache_).size();
 }
 
+size_t SmartStrategy::getArenaBytes() const {
+    return text_arena_.size() +
+           manual_store_bytes_.load(std::memory_order_relaxed);
+}
+
 std::vector<std::string> SmartStrategy::getAllKeys() const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex_);
     std::vector<std::string> keys;

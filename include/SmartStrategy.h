@@ -161,6 +161,14 @@ public:
     size_t getFileCacheSize() const;
     std::vector<std::string> getAllKeys() const;
     void clearCache();
+
+    /**
+     * @brief Bytes held by the installed snapshot's arena-style stores
+     * (text arena + manual addEntry() bytes). Informational; reported by the
+     * remote STATS message as "arena bytes" (v2.3.0 remote access).
+     */
+    size_t getArenaBytes() const;
+    
     
     FileFormat getDetectedFormat() const { return detected_format_; }
     IndexMode getIndexMode() const; 

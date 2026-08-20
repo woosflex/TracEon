@@ -566,6 +566,64 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 
 ---
 
+## 🌐 Remote Access (v2.3.0)
+
+TracEon can serve a **loaded, immutable cache snapshot** over TCP so many
+processes/containers read the same data without each re-loading it. The remote
+slice is POSIX-only, dependency-free (plain sockets), and **trusted-network-only**
+(no auth — do not expose to the internet).
+
+### Build with the server enabled
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DTRACEON_BUILD_SERVER=ON
+cmake --build build -j --target remote_bench traceon_make_cache
+```
+`TRACEON_BUILD_SERVER` is **ON by default** on non-Windows; the server/client live
+in the separate `traceon_remote` library (core stays socket-free).
+
+### Serve a v4 cache
+```bash
+# 1. Turn a FASTA/FASTQ into a v4 .traceon cache (once)
+./build/traceon_make_cache input.fasta cache.traceon
+
+# 2. Serve it (blocking; Ctrl-C to stop)
+./build/remote_bench --mode=serve --host=127.0.0.1 --port=9876 --file=cache.traceon
+```
+
+### Connect with the benchmark (loopback example)
+```bash
+# In-process zero-copy baseline
+./build/remote_bench --mode=local --file=cache.traceon --count=20000
+
+# Remote client, one connection per thread (8 threads x 5000)
+./build/remote_bench --mode=remote --host=127.0.0.1 --port=9876 \
+    --file=cache.traceon --threads=8 --count=5000 --warmup=1000
+```
+Every response is **CRC32C-verified** on the client; missing keys return
+NOT_FOUND (never garbage); a corrupt/crafted payload fails loudly.
+See `docs/architecture/ADR-006-traceon-remote-access.md` for the full protocol.
+
+### In code
+```cpp
+#include "TraceonServer.h"
+#include "TraceonClient.h"
+
+TracEon::TraceonServer server(cache, 0, "127.0.0.1"); // port 0 = ephemeral
+server.start();
+uint16_t port = server.port();                       // actual bound port
+
+TracEon::TraceonClient client("127.0.0.1", port);
+auto seq = client.getView("seq1");   // std::optional<std::string>
+bool has = client.has("seq1");
+```
+
+### Docker testbed
+```bash
+docker/run.sh   # builds images, generates a cache, serves + benchmarks it
+```
+
+---
+
 ## 🎓 Architecture Documentation
 
 ### Architecture Decision Records (ADRs)
@@ -580,6 +638,9 @@ Expected output: `All heap blocks were freed -- no leaks are possible`
 
 - **[ADR-005: v4 Binary Format & CRC32C](docs/architecture/ADR-005-traceon-v4-binary-format.md)**
   Wire layout, checksum coverage/streaming order, hardware dispatch, hardening
+
+- **[ADR-006: Remote Read Access over TCP](docs/architecture/ADR-006-traceon-remote-access.md)**
+  Length-prefixed RPC, CRC32C integrity, thread-per-connection, trusted-network scope
 
 ### Performance Characteristics
 - **[Performance Profile](docs/performance-profile.md)**  

@@ -58,6 +58,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.3.0] — v2.3.0 "Harpe" (unreleased)
+
+*Harpe slice 1 — remote read access.* Release stamp/date land at release.
+
+### Added
+
+- **Remote read access over TCP** (protocol, server, client):
+  - `include/TraceonProto.h` — a minimal length-prefixed wire protocol
+    (8-byte LE payload_len prefix, 64 MiB cap, message-type bytes) with pure,
+    testable encode/decode codecs and CRC32C-verified OK responses.
+  - `TraceonServer` (`include/TraceonServer.h` + `src/TraceonServer.cpp`) —
+    thread-per-connection server over an immutable loaded cache, ephemeral
+    port support, idempotent `stop()`/restart lifecycle.
+  - `TraceonClient` (`include/TraceonClient.h` + `src/TraceonClient.cpp`) —
+    CRC32C-verified, thread-safe client (`getView`/`has`/`stats`/`close`),
+    hostname resolution, fast-failing connect.
+  - `benchmarks/remote_bench.cpp` — three-mode benchmark (`local`/`remote`/
+    `serve`), one connection per thread, median/p95/p99 latency + ops/s.
+  - Protocol/architecture decision record:
+    `docs/architecture/ADR-006-traceon-remote-access.md`.
+- **Docker testbed** (`docker/`): multi-stage image building the server +
+  tools (Release, `TRACEON_BUILD_SERVER=ON`), compose services
+  (make-cache → server → client) on a bridge network, and `run.sh` for
+  one-shot verification. Added `docker/data/sample.fasta` +
+  `.dockerignore`.
+- **`tools/traceon_make_cache`**: converts FASTA/FASTQ into a v4 `.traceon`
+  cache for server deployment.
+
+### Fixed
+
+- **`TraceonServer::stop()` deadlock**: closing the wake-pipe/listen fds while
+  the accept thread is blocked in `poll()` is undefined behaviour on Linux and
+  did not reliably wake `poll()`, so `stop()` could join-hang forever. The
+  server now wakes the accept loop via the pipe write, joins it first, then
+  closes the fds; the accept loop also drops (rather than spawns) a
+  connection accepted mid-shutdown.
+- **`TraceonClient` hostname support**: only IPv4 literals were accepted
+  (`inet_pton`), which broke containerized deployments reaching a peer by
+  service name. The client now resolves hosts via `getaddrinfo`.
+- **`remote_bench` CLI**: documented `--opt=value` form was rejected by the
+  exact-string parser; the parser now accepts both `--opt value` and
+  `--opt=value`.
+
+
+
 ## [2.2.0] — v2.2.0 "Gáe Bolg" (2026-08-14)
 
 ### Added

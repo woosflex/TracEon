@@ -139,6 +139,13 @@ namespace TracEon {
         
         size_t size() const;
 
+        /**
+         * @brief Bytes held by the loaded snapshot's arena stores (text
+         * arena + manual-entry bytes). Forwarded to SmartStrategy::getArenaBytes().
+         * Used by the remote STATS message (v2.3.0 remote access).
+         */
+        size_t getArenaBytes() const;
+
         IndexMode getIndexMode() const;
 
         /**

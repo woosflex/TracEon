@@ -1,0 +1,68 @@
+# TracEon remote-access testbed (v2.3.0 "Harpe").
+#
+#   docker compose build
+#   docker compose run --rm make-cache     # build the v4 cache once
+#   docker compose up -d server            # serve it over the bridge network
+#   docker compose run --rm client         # benchmark remote reads
+#   docker compose down
+#
+# or just run ./run.sh which does all of the above.
+#
+# Services live on a default bridge network; the server is reachable from
+# client containers at hostname "server:9876". A named volume carries the
+# generated v4 cache from make-cache to both the server and the client
+# (the client loads the file locally only to enumerate the real key set).
+
+services:
+  make-cache:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["/opt/traceon/traceon_make_cache", "/opt/traceon/sample.fasta", "/data/cache.traceon"]
+    volumes:
+      - traceon-data:/data
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["/opt/traceon/remote_bench", "--mode=serve", "--host=0.0.0.0", "--port=9876", "--file=/data/cache.traceon"]
+    depends_on:
+      make-cache:
+        condition: service_completed_successfully
+    volumes:
+      - traceon-data:/data
+    ports:
+      - "9876:9876"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9876"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  # Remote client: hits "server" over the bridge network, one connection per
+  # thread (the documented deployment pattern). Loads the cache file locally
+  # only to enumerate the real key set (not timed).
+  client:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["/opt/traceon/remote_bench", "--mode=remote", "--host=server", "--port=9876", "--file=/data/cache.traceon", "--keys=3000", "--count=5000", "--threads=8", "--warmup=1000"]
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - traceon-data:/data
+
+  # In-process baseline for comparison (no network).
+  client-local:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["/opt/traceon/remote_bench", "--mode=local", "--file=/data/cache.traceon", "--keys=3000", "--count=20000", "--warmup=2000"]
+    volumes:
+      - traceon-data:/data
+
+volumes:
+  traceon-data:

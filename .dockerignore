@@ -1,0 +1,25 @@
+# Keep the Docker build context small — only what CMake needs to build
+# remote_bench + traceon_make_cache is copied (see docker/Dockerfile).
+
+.git
+build/
+outputs/
+
+# Large benchmark datasets / generated artifacts (not needed to build).
+benchmarks/*.fastq
+benchmarks/*.fastq.gz
+benchmarks/*.fasta
+benchmarks/*.fasta.gz
+benchmarks/*.gz
+benchmarks/*.png
+benchmarks/*.log
+benchmarks/*.txt
+benchmarks/*.json
+benchmarks/*.yml
+benchmarks/*.md
+benchmarks/*.py
+benchmarks/__pycache__/
+benchmarks/minimap2_src/
+benchmarks/third_party/
+
+**/*.pyc

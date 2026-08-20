@@ -8,6 +8,9 @@ project(TracEon)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Threads are used by the remote server (traceon_remote) and the benchmarks.
+find_package(Threads REQUIRED)
+
 # --- ZLIB Support (zlib-ng via FetchContent, zlib-compat mode) ---
 include(FetchContent)
 FetchContent_Declare(
@@ -39,6 +42,30 @@ set(CORE_SOURCES
         # but kept if you want IDEs to index it easily via add_library
 )
 
+# ── Remote read access (v2.3.0 "Harpe") ──────────────────────────────────────
+# POSIX-only by design: the server/client use sockets and are never linked
+# into traceon_core (core stays free of socket code — the remote lib links
+# the core, not vice versa).
+option(TRACEON_BUILD_SERVER "Build TracEon remote read access (POSIX sockets)" ON)
+if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    set(REMOTE_SOURCES
+            src/TraceonServer.cpp
+            src/TraceonClient.cpp
+    )
+    add_library(traceon_remote STATIC ${REMOTE_SOURCES})
+    target_include_directories(traceon_remote PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
+    )
+    target_link_libraries(traceon_remote PUBLIC traceon_core Threads::Threads)
+    # The socket helpers in TraceonProto.h need the POSIX feature-test macros
+    # at compile time (GCC 16's -include cstdint pulls libc headers in before
+    # any in-file #define would take effect).
+    target_compile_definitions(traceon_remote PRIVATE _GNU_SOURCE)
+else()
+    message(STATUS "TracEon: remote server/client disabled (TRACEON_BUILD_SERVER=OFF or WIN32)")
+endif()
+
 set(TEST_SOURCES
         tests/main.cpp
         tests/CacheTests.cpp
@@ -53,6 +80,12 @@ set(TEST_SOURCES
         tests/test_lifecycle.cpp
         tests/test_api_misc.cpp
 )
+
+# Remote access tests join the combined suite and get their own executable
+# (POSIX-only, matching the server/client).
+if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    list(APPEND TEST_SOURCES tests/test_remote.cpp)
+endif()
 
 # --- Library Target ---
 add_library(traceon_core STATIC ${CORE_SOURCES})
@@ -97,6 +130,21 @@ endif()
 
 # --- Executable Targets ---
 
+# ── Remote access tools (v2.3.0) ────────────────────────────────────────────
+if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    # Benchmark: --mode=local (in-process getView baseline) | --mode=remote
+    # (TCP client-server) | --mode=serve (embedded server; used by the Docker
+    # testbed and manual verification).
+    add_executable(remote_bench benchmarks/remote_bench.cpp)
+    target_link_libraries(remote_bench PRIVATE traceon_remote Threads::Threads)
+    target_compile_definitions(remote_bench PRIVATE _GNU_SOURCE)
+
+    # Cache builder: turns a FASTA/FASTQ into a v4 .traceon cache (Docker
+    # testbed + manual flows).
+    add_executable(traceon_make_cache tools/traceon_make_cache.cpp)
+    target_link_libraries(traceon_make_cache PRIVATE traceon_core)
+endif()
+
 # --- Benchmark Driver ---
 add_executable(traceon_driver traceon_driver.cpp)
 target_link_libraries(traceon_driver PRIVATE traceon_core)
@@ -118,6 +166,9 @@ enable_testing()
 
 add_executable(unit_tests ${TEST_SOURCES})
 target_link_libraries(unit_tests PRIVATE traceon_core Catch2::Catch2WithMain)
+if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    target_link_libraries(unit_tests PRIVATE traceon_remote)
+endif()
 
 include(CTest)
 add_test(NAME TracEonTests COMMAND unit_tests)
@@ -144,6 +195,14 @@ foreach(t ${SPLIT_TEST_TARGETS})
     target_link_libraries(${t} PRIVATE traceon_core Catch2::Catch2WithMain)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# Remote domain tests need the remote lib (server/client classes).
+if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    add_executable(test_remote tests/test_remote.cpp)
+    target_link_libraries(test_remote PRIVATE traceon_remote traceon_core Catch2::Catch2WithMain)
+    target_compile_definitions(test_remote PRIVATE _GNU_SOURCE)
+    add_test(NAME test_remote COMMAND test_remote)
+endif()
 
 # ── K-mer experimental targets (OUT of the core umbrella) ──────────────────
 # traceon_kmer is deliberately NOT part of CORE_SOURCES, does not appear in

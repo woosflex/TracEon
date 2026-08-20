@@ -58,6 +58,10 @@ namespace TracEon {
         return m_strategy->getFileCacheSize();
     }
 
+    size_t Cache::getArenaBytes() const {
+        return m_strategy->getArenaBytes();
+    }
+
     IndexMode Cache::getIndexMode() const {
         return m_strategy->getIndexMode();
     }
