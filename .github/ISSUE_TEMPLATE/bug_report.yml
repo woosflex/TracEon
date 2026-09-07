@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible problem with TracEon
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Commands, code snippet, and input file shape needed to reproduce.
+      placeholder: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+        cd build && ./unit_tests "[tag]"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `git describe --tags` or the release tag (e.g. v2.3.0).
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU, compiler + version, CMake version, build type.
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security
+      options:
+        - label: I have read SECURITY.md and this is not a security vulnerability (vulnerabilities go to the private contact there, not a public issue).
+          required: true

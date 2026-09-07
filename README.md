@@ -2,18 +2,34 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-[![Version](https://img.shields.io/badge/Release-v2.2.0-blueviolet.svg)]()
-[![Performance](https://img.shields.io/badge/Performance-81M%20OPS%2Fs-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/Release-v2.3.0-blueviolet.svg)]()
+[![Performance](https://img.shields.io/badge/Read_Scaling-9.6x%20at%2014T-brightgreen.svg)]()
 [![GZIP](https://img.shields.io/badge/GZIP-Native%20Support-orange.svg)]()
 [![BinaryCache](https://img.shields.io/badge/BinaryCache-v4%20CRC32C%20Integrity-green.svg)]()
 
-**TracEon** (v2.2.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, and **workload-optimized index modes** for genomic and NGS applications.
+**TracEon** (v2.3.0) is a **zero-copy, lock-free** genomic data caching library written in modern C++20. It accelerates bioinformatics pipelines by providing microsecond-latency random access to FASTA/FASTQ datasets, including native `.gz` support, CRC32C-protected LZ4 binary caches, **workload-optimized index modes**, and trusted-network remote reads.
 
 *"Trace On" - A nod to Fate/stay night, re-contextualized for tracing biological data across eons.*
 
 ---
 
-## 🎯 Multi-core read scaling (v2.3.0 "Harpe")
+## 🎯 What's New in v2.3.0 "Harpe"
+
+See the [v2.3.0 release notes](RELEASE_v2.3.0.md) for the concise release
+summary, the [reproduced benchmark report](benchmarks/v2.3.0_benchmark_report.md)
+for current local measurements, and [CHANGELOG.md](CHANGELOG.md) for the full
+history.
+
+- **Remote read access**: optional POSIX server/client library with a bounded,
+  CRC32C-verified TCP protocol for trusted networks.
+- **Deployment tooling**: `traceon_make_cache`, `remote_bench`, and a Docker
+  testbed for cache creation, serving, and client benchmarking.
+- **Cache facade completion**: `loadGzipFile()`, `clearCache()`,
+  `getAllKeys()`, `getQuality()`, and `getDetectedFormat()` are exposed by
+  `Cache`.
+- **Hardening**: explicit non-GZIP rejection, documented failure atomicity,
+  safe k-mer reserve bounds, and remote lifecycle/protocol fixes.
+**Multi-core read scaling and false-sharing audit:**
 
 TracEon's read path is lock-free and zero-copy: once a snapshot is installed, `getView()` consists of one acquire `load` of `data_ready_` plus a hash-map probe — **no mutex and no read-modify-write on the default read path**, so concurrent readers never invalidate each other's cache lines. v2.3.0 adds `benchmarks/read_scaling.cpp` (a standalone benchmark target, run manually: `./build/read_scaling`) that measures `getView()` aggregate throughput vs thread count on one in-memory immutable cache, plus a **false-sharing audit** (`alignas(64)` on the hot read-path atomics `data_ready_`, `data_loaded_` and the opt-in `active_readers_`, separated from `cache_mutex_`).
 
@@ -21,16 +37,13 @@ Measured on an **Intel Core Ultra 5 125H (14 cores / 18 threads, single NUMA nod
 
 | Threads | ops/s (median) | ops/s (min) | Scaling vs 1 thread | Median per-thread latency |
 |---------|---------------:|------------:|--------------------:|--------------------------:|
-| 1       |       9.81 M   |     9.65 M  |         1.00×        |       0.10 µs/op           |
-| 2       |      21.4  M   |    21.1  M  |         2.18×        |       0.09 µs/op           |
-| 4       |      37.3  M   |    31.7  M  |         3.80×        |       0.09 µs/op           |
-| 8       |      68.5  M   |    68.1  M  |         6.99×        |       0.11 µs/op           |
-| 14      |      93.5  M   |    75.5  M  |         9.53×        |       0.14 µs/op           |
-| 18      |      ~84 M     |     ~77 M   |        ~13×**        |       0.17 µs/op           |
+| 1       |      10.33 M   |     7.79 M  |         1.00×        |       0.097 µs/op          |
+| 2       |      19.43 M   |    16.57 M  |         1.88×        |       0.103 µs/op          |
+| 4       |      52.46 M   |    44.86 M  |         5.08×        |       0.074 µs/op          |
+| 8       |      75.14 M   |    64.24 M  |         7.28×        |       0.099 µs/op          |
+| 14      |      99.22 M   |    81.24 M  |         9.61×        |       0.128 µs/op          |
 
-**18-thread scaling is anchored to a separate low single-thread baseline rep and is noisy (plateaus/ties with 14); the honest headline is the 1→14 thread set above.
-
-**Honest verdict:** scaling is **near-linear through 8 threads** (~7× at 8) then **plateaus to ~9.5× at 14 threads** — it does **not** reach 14×. The plateau is the expected consequence of this host's **hybrid P-core/E-core topology** (extra threads land on E-cores / HT siblings), the **shared 18 MiB L3**, and the **all-core frequency drop** vs single-core turbo under a 14-thread load (median per-thread latency rises 0.10 → 0.14 µs). It is **not** a false-sharing defect: the default read path performs no RMW, so there is no coherence traffic among concurrent readers to fix. The `alignas(64)` change is **preventive** for the default build and a **real fix** for the opt-in `TRACEON_DEBUG_LIFECYCLE` diagnostic, where every lookup RMWs `active_readers_` — pre-fix that RMW shared a line with `data_ready_` (measured ~1.2–1.36× cost at 4/8/14 threads in a layout microbench); post-fix it is contained to its own line. The default Release read path remains the fast, RMW-free path this benchmark measures.
+**Honest verdict:** scaling is **near-linear through 8 threads** (~7.3× at 8) then **plateaus to ~9.6× at 14 threads** — it does **not** reach 14×. The plateau is the expected consequence of this host's **hybrid P-core/E-core topology** (extra threads land on E-cores / HT siblings), the **shared 18 MiB L3**, and the **all-core frequency drop** vs single-core turbo under a 14-thread load. It is **not** a false-sharing defect: the default read path performs no RMW, so there is no coherence traffic among concurrent readers to fix. The `alignas(64)` change is **preventive** for the default build and a **real fix** for the opt-in `TRACEON_DEBUG_LIFECYCLE` diagnostic, where every lookup RMWs `active_readers_` — pre-fix that RMW shared a line with `data_ready_` (measured ~1.2–1.36× cost at 4/8/14 threads in a layout microbench); post-fix it is contained to its own line. The default Release read path remains the fast, RMW-free path this benchmark measures.
 
 ## 🎯 What's New in v2.2.0
 
@@ -48,7 +61,7 @@ Measured on an **Intel Core Ultra 5 125H (14 cores / 18 threads, single NUMA nod
 > lifecycle contract (no public adopters were identified; see the
 > [design review](outputs/traceon-v2-design-review.md)). Read the
 > [Migration / Breaking Changes](#migration--breaking-changes) section before
-> upgrading. The experimental k-mer C API ships in v2.0.0+ and is used by the
+> upgrading. The opt-in k-mer C API ships as a separate target and is used by the
 > aligner forks (minimap2/Winnowmap `traceon-backend`).
 
 ### **`.traceon` v4 Binary Format** 📦
@@ -114,8 +127,9 @@ Measured on an **Intel Core Ultra 5 125H (14 cores / 18 threads, single NUMA nod
    [Lifecycle contract](#-lifecycle-contract-reader-quiescence-) below).
 5. **Source/ABI:** `std::string_view`-backed index keys require recompilation;
    **no ABI stability is promised** across 1.x → 2.x.
-6. **Deferred surface:** the experimental k-mer C API and `TRKI` are **not**
-   shipped in v2.0.0 (planned separately).
+6. **Optional k-mer surface:** the k-mer C API and `TRKI` ship through the
+   separate `traceon_kmer` target; they are not part of `traceon_core` or the
+   `TracEon.h` umbrella.
 
 ---
 
@@ -139,12 +153,12 @@ snapshot's arena (`text_arena_` / `manual_store_`). Because the view is
 See [ADR-001](docs/architecture/ADR-001-lock-free-reads.md) for the full
 memory-ordering and quiescence contract.
 
-### **v1.3.0 "Hrunting" Highlights** (Previous Release)
+### **v1.3.0 "Hrunting" Highlights** (Historical)
 
 ### **LZ4 Binary Cache Compression** 📦
-- **Format v2** with LZ4 compression for `.traceon` binary cache files
+- Introduced **format v2** with LZ4 compression for `.traceon` files
 - **3x size reduction** (~105MB → ~35MB for 100MB FASTA)
-- **Backward compatible**: Auto-detection of v1 (uncompressed) and v2 (LZ4) formats
+- At that release, readers auto-detected v1 (uncompressed) and v2 (LZ4)
 - **Minimal overhead**: +0.02s decompression (LZ4 @ 1-2 GB/s)
 - Binary cache sizes now practical for large datasets and network transfer
 
@@ -230,7 +244,7 @@ memory-ordering and quiescence contract.
 
 **Key Insight:** Performance scales with dataset size relative to CPU cache hierarchy. 3-4x degradation when exceeding L3 cache (~16-32MB) is **hardware physics** (100ns RAM vs 10ns cache), not a software limitation.
 
-### Binary Cache Performance
+### Historical Binary Cache Performance
 | Operation | 100MB Dataset | 1GB Dataset | Compression |
 |-----------|---------------|-------------|------------|
 | **Save Time (v2 LZ4)** | 0.10s | 0.30s | With LZ4 compression |
@@ -239,7 +253,9 @@ memory-ordering and quiescence contract.
 | **File Size (v1)** | ~105 MB | ~1.05 GB | Uncompressed |
 | **File Size (v2)** | **~35 MB** | **~350 MB** | **3x smaller (LZ4)** |
 
-**Note:** v1 (uncompressed) caches restore instantly via mmap. v2 (LZ4) adds ~0.02s decompression overhead but saves ~3x disk space. Binary cache format automatically detected at load time.
+**Historical note:** these measurements compare the retired v1 and v2
+formats. TracEon v2.3.0 writes and reads only the CRC32C-protected v4 format;
+v1/v2/v3 caches must be regenerated.
 
 ---
 
@@ -376,13 +392,17 @@ TracEon/
 ├── docs/                 # Architecture documentation
 │   ├── architecture/
 │   │   ├── ADR-001-lock-free-reads.md
-│   │   └── ADR-002-gzip-integration.md
+│   │   ├── ADR-002-gzip-integration.md
+│   │   ├── ADR-003-simd-parsing-hash-map.md
+│   │   ├── ADR-004-parallel-gzip-lz4-cache.md
+│   │   ├── ADR-005-traceon-v4-binary-format.md
+│   │   └── ADR-006-traceon-remote-access.md
 │   └── performance-profile.md
 ├── test_data/            # Sample files
 │   ├── simple.fasta
 │   └── simple.fastq
 └── third_party/          # Vendored dependencies
-    ├── lz4/              # BSD license (future: binary cache compression)
+    ├── lz4/              # BSD license (v4 `.traceon` LZ4 Frame compression)
     # ankerl::unordered_dense and zlib-ng are fetched via CMake FetchContent at build time
     # robin_hood.h was removed in v1.2.0
 ```
@@ -413,7 +433,7 @@ cmake --build build -j
 
 **Expected output:**
 ```
-All tests passed (330+ assertions in 52 test cases)
+All tests passed (4318 assertions in 132 test cases)
 ```
 
 #### CMake Integration
@@ -451,12 +471,12 @@ int main() {
 int main() {
     TracEon::Cache cache;
     
-    // First run: Parse and save
-    cache.loadFile("large_genome.fasta.gz");  // ~0.245s for 100MB (v1.2.0)
-    cache.save("genome.bin");                  // One-time cost
+    // First run: Parse and save (v4 `.traceon`: LZ4 Frame + CRC32C)
+    cache.loadFile("large_genome.fasta.gz");
+    cache.save("genome.traceon");              // One-time cost
     
-    // Subsequent runs: Instant restore via mmap
-    cache.restore("genome.bin");               // ~0.00s for 100MB
+    // Subsequent runs: fast restore via streamed LZ4 Frame decode + verify
+    cache.restore("genome.traceon");
     
     // Same zero-copy access
     auto seq = cache.getView("chr1");
@@ -531,14 +551,14 @@ python benchmark_runner.py 2>&1 | tee benchmark_results_$(date +%Y%m%d).txt
 | PacBio (long reads) | 100MB | 35-45M OPS/s | 25-35M OPS/s | 20-30M OPS/s |
 | Reference genome | 100MB | N/A | 15-25M OPS/s | 12-20M OPS/s |
 
-**Regression Thresholds** (See `docs/performance-profile.md`):
+**Review bands** (see `docs/performance-profile.md`):
 - 🟢 Green: Within 10% of expected range
 - 🟡 Yellow: 10-20% degradation (investigate)
 - 🔴 Red: >20% degradation (block release)
 
 ### Continuous Integration
 ```bash
-# Automated regression check (exits non-zero on failure)
+# Automated regression check; the input must contain a "Throughput:" line
 python check_regression.py benchmark_results_{date_stamp}.txt
 ```
 
@@ -652,8 +672,11 @@ docker/run.sh   # builds images, generates a cache, serves + benchmarks it
 - **[ADR-002: GZIP Integration](docs/architecture/ADR-002-gzip-integration.md)**  
   Design decisions, rejected alternatives, performance trade-offs
 
-- **[ADR-003: SIMD Parsing & Hash Map Optimization](docs/architecture/ADR-003-simd-parsing-hash-map.md)**  
+- **[ADR-003: SIMD Parsing & Hash Map Optimization](docs/architecture/ADR-003-simd-parsing-hash-map.md)**
   SIMD-accelerated boundary scanning, ankerl::unordered_dense, pre-reserved thread-local maps
+
+- **[ADR-004: Parallel GZIP and LZ4 Cache](docs/architecture/ADR-004-parallel-gzip-lz4-cache.md)**
+  Concatenated-stream decompression and compressed binary-cache design
 
 - **[ADR-005: v4 Binary Format & CRC32C](docs/architecture/ADR-005-traceon-v4-binary-format.md)**
   Wire layout, checksum coverage/streaming order, hardware dispatch, hardening
@@ -709,21 +732,15 @@ docker/run.sh   # builds images, generates a cache, serves + benchmarks it
 - **Transparent Decompression**: On-the-fly decompression for reference genomes
 - **Smart Compression**: `saveBinary()` auto-selects LZ4_HC for large DNA/RNA payloads (> 10 MiB), LZ4_default otherwise — no new dependencies, no format bump
 
-### ✅ v1.4.0 "Caliburn" (Q3 2026) — Completed
+### v1.4.0 "Caliburn" development line — Folded into v2.0.0
 *The sword of selection — choosing the right index mode*
 
 - **IndexMode Selection**: `SmartStrategy(IndexMode::NGS)` / `Cache(IndexMode::NGS)` activates the hash-keyed `NGSIndex` for short-read workloads; `IndexMode::GENOME` (default) retains string-keyed `GenomeIndex`
 - **`Cache::set()` data persistence**: Manually-added entries via `set()` are now serialized by `save()` and restored by `restore()`
 - **Correctness hardening**: Closed test gaps for parallel GZIP, RNA/protein format detection, v1 binary format, `clearCache()` + reload, and zero-copy `Cache::getView()`
+- This work was not tagged as v1.4.0; it shipped as part of the v2.0.0 release.
 
-### ✅ v2.1.0 "Excalibur" (Q4 2026) — Fuzz Gate & Aligner Validation (Released)
-*The golden sword — verification and real-world proof*
-
-- **Fuzzing gate**: 7 libFuzzer targets + 83-file seed corpus + CI workflow (per-push + weekly)
-- **kmer C API hardened**: atomic freeze flag (thread-safe) + allocation-free error path (total no-throw)
-- **Aligner validation**: `woosflex/minimap2` + `woosflex/Winnowmap` forks with `TRACEON=1` table backend + `tcache v2` mmap'd prebuilt index — PAF byte-identical, recurring load+map −13.6% (minimap2, full chr1) / −80% (Winnowmap, chr1-50Mb)
-
-### ✅ v2.0.0 (Q4 2026) — Integrity & v4 Format (Released)
+### ✅ v2.0.0 "Durandal" (2026-08-11) — Integrity & v4 Format
 *Codename: Durandal*
 
 - **`.traceon` v4 binary format**: CRC32C whole-payload integrity (SSE4.2 /
@@ -734,23 +751,33 @@ docker/run.sh   # builds images, generates a cache, serves + benchmarks it
   `TRACEON_DEBUG_LIFECYCLE` diagnostic
 - **Integrity hardening**: strict FASTQ framing, GZIP truncation rejection,
   immutable-after-load enforcement, string_view keys + wyhash reserve perf
-- **C API deferred**: the experimental k-mer C API moved out of the v2.0.0
-  stable surface (exception-boundary, iterator-ownership, and `TRKI` format
-  work pending — see the design review)
+- **Optional k-mer surface**: the separately linked `traceon_kmer` target
+  includes the noexcept C boundary, caller-owned iterators, freeze semantics,
+  and validated `TRKI` loading; it is not part of the core umbrella
 
-### ✅ v2.2.0 "Gáe Bolg" (Q4 2026) — Aligner Validation Matrix Complete (Current Release)
+### ✅ v2.1.0 "Excalibur" (2026-08-12) — Fuzz Gate & Aligner Validation
+*The golden sword — verification and real-world proof*
+
+- **Fuzzing gate**: 7 libFuzzer targets + 83-file seed corpus + CI workflow (per-push + weekly)
+- **kmer C API hardened**: atomic freeze flag (thread-safe) + allocation-free error path (total no-throw)
+- **Aligner validation**: `woosflex/minimap2` + `woosflex/Winnowmap` forks with `TRACEON=1` table backend + `tcache v2` mmap'd prebuilt index — PAF byte-identical, recurring load+map −13.6% (minimap2, full chr1) / −80% (Winnowmap, chr1-50Mb)
+
+### ✅ v2.2.0 "Gáe Bolg" (2026-08-14) — Aligner Validation Matrix Complete
 *The cursed spear — piercing through every target*
 
 - **5-tool validation matrix complete**: minimap2 (−13.6% full chr1), Winnowmap (−80%), mm2-fast (−39%/−33% RSS), minigraph (first khashl adapter), BLEND (7-config identity) — all PAF byte-identical, all forks live under `woosflex/*`
 - **Upstream bugs found + documented**: Winnowmap applyWeight crash + uninitialized rep_len; minigraph GCC-16 crash on own test data + gi->g_own leak; mm2-fast safestringlib GCC-16 patch
 
-### 🎯 v2.3.0 "Harpe" (Planned)
+### ✅ v2.3.0 "Harpe" (2026-08-20) — Current Release
 *The divine sword that strikes regardless of distance*
 
-- **Distributed Caching**: Shard datasets across nodes
-- **NUMA-Aware Architecture**: Optimize for >8 core systems
-- **Remote Access**: Network protocol for shared genomic databases
-- **Performance Goal**: Linear scaling to 64+ cores
+- **Remote access**: trusted-network TCP protocol, server/client library,
+  cache-building tool, benchmark, and Docker testbed
+- **Read scaling**: near-linear through 8 threads and approximately 9.5× at
+  14 threads on the documented hybrid-core host
+- **False-sharing audit**: hot read-path atomics isolated on cache lines
+- **API and integrity cleanup**: completed `Cache` facade, strict explicit
+  GZIP validation, remote lifecycle fixes, and deterministic k-mer reserve limits
 
 ### 🔬 Research Directions (v3.0+)
 
@@ -771,7 +798,7 @@ We welcome contributions! Whether it's bug reports, feature requests, or pull re
 2. **Tests Required**: All new features must include unit tests
 3. **Performance Validation**: Run regression benchmark before submitting
    ```bash
-   python benchmarks/check_regression.py --baseline main
+   python benchmarks/check_regression.py build/result.txt
    ```
 4. **Documentation**: Update relevant ADRs/docs for architectural changes
 
@@ -849,7 +876,7 @@ This project emerged from frustrations during MSc Bioinformatics research:
 
 ## ⚖️ Known Limitations
 
-### v1.0.0 Constraints
+### Design Constraints
 
 1. **RAM Latency Wall**: 3-4x degradation when dataset exceeds L3 cache (~16-32MB)
    - This is **hardware physics** (100ns RAM vs 10ns cache), not a software bug
@@ -858,7 +885,10 @@ This project emerged from frustrations during MSc Bioinformatics research:
 2. **Immutable After Load**: Cannot incrementally update cache (by design for lock-free reads)
    - Alternative: Reload entire cache (fast with mmap)
 
-3. **Single-Node Only**: No distributed caching (planned for v2.1.0)
+3. **Trusted-Network Remote Access Only**: v2.3.0 remote reads have no
+   authentication or encryption and do not provide sharding or replication
+   - Bind to loopback or deploy on a protected network
+   - Do not expose the server directly to the internet
    - Target: Local workstation/server workloads
 
 4. **Test Path Dependency**: Tests must be run from build directory
@@ -899,7 +929,8 @@ Bioinformatics tools force a choice:
 
 ❌ **Not Ideal For:**
 - Write-heavy workloads (TracEon is read-optimized)
-- Distributed systems (single-node only in v1.0.0)
+- Internet-facing or multi-node sharded deployments without an external
+  security and orchestration layer
 - Datasets larger than available RAM (future: streaming API in a later release)
 
 ---

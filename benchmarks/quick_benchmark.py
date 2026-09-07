@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick benchmark for TracEon v1.4.0 — generates synthetic data and measures core operations.
+Quick benchmark for TracEon v2.3.0 — generates synthetic data and measures core operations.
 Designed to complete in <5 minutes with meaningful performance metrics.
 """
 
@@ -12,7 +12,8 @@ import random
 import gzip
 from pathlib import Path
 
-TRACEON_BINARY = "../build/traceon_driver"
+SCRIPT_DIR = Path(__file__).resolve().parent
+TRACEON_BINARY = SCRIPT_DIR.parent / "build" / "traceon_driver"
 SIZES_MB = [10, 100]  # Quick benchmark: just 10MB and 100MB
 SCENARIOS = [
     ("WGS", "fastq", 150, False),
@@ -63,7 +64,7 @@ def run_benchmark(label, fmt, size_mb, avg_len, compress):
     else:
         fname = f"bench_{label}_{size_mb}MB.{fmt}"
 
-    bin_file = fname.replace(".gz", "").replace(".fastq", ".bin").replace(".fasta", ".bin")
+    bin_file = fname.replace(".gz", "").replace(".fastq", ".traceon").replace(".fasta", ".traceon")
 
     n_seqs = generate_dataset(fname, fmt, size_mb, avg_len, compress)
     file_size = os.path.getsize(fname) / (1024 * 1024)
@@ -73,9 +74,11 @@ def run_benchmark(label, fmt, size_mb, avg_len, compress):
     # Load
     print(f"  Loading {fname}...", end=" ", flush=True)
     t0 = time.time()
-    ret = subprocess.run(
-        [TRACEON_BINARY, "load", fname],
-        capture_output=True, text=True
+    subprocess.run(
+        [str(TRACEON_BINARY), "load", fname],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     load_time = time.time() - t0
     print(f"✓ ({load_time:.3f}s)")
@@ -86,9 +89,11 @@ def run_benchmark(label, fmt, size_mb, avg_len, compress):
     # Save
     print(f"  Saving binary cache...", end=" ", flush=True)
     t0 = time.time()
-    ret = subprocess.run(
-        [TRACEON_BINARY, "save", fname, bin_file],
-        capture_output=True, text=True
+    subprocess.run(
+        [str(TRACEON_BINARY), "save", fname, bin_file],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     save_time = time.time() - t0
     print(f"✓ ({save_time:.3f}s)")
@@ -103,9 +108,11 @@ def run_benchmark(label, fmt, size_mb, avg_len, compress):
         # Restore
         print(f"  Restoring from cache...", end=" ", flush=True)
         t0 = time.time()
-        ret = subprocess.run(
-            [TRACEON_BINARY, "restore", bin_file],
-            capture_output=True, text=True
+        subprocess.run(
+            [str(TRACEON_BINARY), "restore", bin_file],
+            capture_output=True,
+            text=True,
+            check=True,
         )
         restore_time = time.time() - t0
         print(f"✓ ({restore_time:.3f}s)")
@@ -129,7 +136,9 @@ def main():
         sys.exit(1)
 
     print("\n" + "="*80)
-    print("TracEon v1.4.0 Quick Benchmark")
+    random.seed(42)
+
+    print("TracEon v2.3.0 Quick Benchmark")
     print("="*80 + "\n")
 
     all_results = []

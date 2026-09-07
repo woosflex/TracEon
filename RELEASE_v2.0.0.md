@@ -1,6 +1,6 @@
 # TracEon v2.0.0 — "Durandal"
 
-**Release date:** 2026-08-11 (target)
+**Release date:** 2026-08-11
 **Codename:** Durandal — per the naming convention (alphabetical order of Emiya Shirou's Noble Phantasms: Caladbolg → Caliburn → Durandal → ...)
 
 **Tag:** `v2.0.0`

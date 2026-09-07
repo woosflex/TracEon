@@ -63,6 +63,7 @@ namespace TracEon {
 
 // Scalar fallback using libc's memchr (typically auto-vectorised)
 [[nodiscard]] inline const char* simd_find_char_scalar(const char* ptr, const char* end, char c) noexcept {
+    if (ptr >= end) return end;
     const void* found = std::memchr(ptr, static_cast<unsigned char>(c), static_cast<size_t>(end - ptr));
     return found ? static_cast<const char*>(found) : end;
 }

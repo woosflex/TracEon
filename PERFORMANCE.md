@@ -1,4 +1,8 @@
-# TracEon v1.4.0 Performance Summary
+# Historical TracEon v1.4.0 Performance Summary
+
+> This report preserves the v1.4.0 development-line measurements. That work
+> was folded into v2.0.0 rather than published under a v1.4.0 tag. For current
+> v2.3.0 behavior and read scaling, see [README.md](README.md).
 
 **Version:** v1.4.0 "Caliburn"  
 **Date:** 2026-07-01  
@@ -111,7 +115,10 @@ TracEon v1.4.0 maintains **zero performance regressions** vs v1.3.0 while adding
 
 ---
 
-## 3. Binary Cache Performance (v2 LZ4 Format)
+## 3. Binary Cache Performance (Historical v2 LZ4 Format)
+
+Current releases use the v4 LZ4 Frame format with whole-payload CRC32C. The
+measurements below predate v4 and are retained as historical baselines.
 
 ### Save Performance
 
@@ -220,7 +227,8 @@ TracEon v1.4.0 maintains **zero performance regressions** vs v1.3.0 while adding
 ### Design Constraints
 - **Immutable After Load**: Cannot incremental update cache (by design for lock-free reads)
   - Workaround: Reload entire file
-- **Single-Node Only**: No distributed caching (planned for v2.1.0)
+- **No transparent sharding or replication**: v2.3.0 provides trusted-network
+  remote reads, but deployment topology and failover remain external concerns
 - **IndexMode is Fixed**: Cannot switch GenomeIndex ↔ NGSIndex without re-parsing
 
 ---
@@ -257,4 +265,3 @@ TracEon v1.4.0 maintains **zero performance regressions** vs v1.3.0 while adding
 
 **Last Updated**: 2026-07-01  
 **Report Generated**: TracEon Benchmarking Suite v1.4.0
-

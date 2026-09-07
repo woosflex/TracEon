@@ -1,7 +1,11 @@
 # TracEon Performance Profile
 
-**Version:** 1.2.0 "Caladbolg"  
-**Last Updated:** June 9, 2026  
+> Historical baseline: the targets below were set for v1.2.0 "Caladbolg".
+> For current v2.3.0 behavior and multi-core read scaling, see
+> [README.md](../README.md) and [benchmarks/v2.3.0_benchmark_report.md](../benchmarks/v2.3.0_benchmark_report.md).
+>
+> **Version:** 1.2.0 "Caladbolg"  
+**Last Updated:** September 6, 2026
 **Test Platform:** Intel Core Ultra 5 125H (14 cores, 16GB LPDDR5 @ 7467MT/s)  
 **OS:** Ubuntu 24.04 LTS  
 **Compiler:** GCC 13.3.0
@@ -145,7 +149,9 @@ Parsing scales linearly up to 8 cores, then plateaus.
 2. **Arena Allocation**: Single-threaded `std::vector` growth
 3. **Merge Phase**: Thread-local caches merged sequentially
 
-**Recommendation:** Don't expect gains beyond 8-core systems without NUMA-aware architecture (planned for v2.1.0).
+**Recommendation:** Expect diminishing returns beyond 8 cores on shared-memory
+systems. v2.3.0 measured about 9.5× read throughput at 14 threads on the
+documented hybrid-core host; NUMA-aware parsing is not implemented.
 
 ---
 
@@ -162,7 +168,7 @@ Parsing scales linearly up to 8 cores, then plateaus.
 - **Load+Parse Time (v1.2.0)**: 0.245s for 100MB GZIP (86% reduction over v1.1.0 baseline through SIMD boundary scanning + hash map optimization)
 - **Load Memory (v1.2.0)**: 185MB peak (30% reduction from 263MB v1.1.0 — improved map memory efficiency from ankerl::unordered_dense)
 - **Lookup Performance**: Unchanged — once decompressed, GZIP and plain text data are identical in memory
-- **Steady-State Memory**: ~185MB across all versions after shink_to_fit
+- **Steady-State Memory**: ~185MB across all versions after `shrink_to_fit`
 
 **Improvement Breakdown (v1.1.0 → v1.2.0):**
 ```
@@ -210,14 +216,13 @@ To prevent performance regressions in CI/CD:
 # 1. Run benchmark and capture results
 ./build/traceon_driver lookup test.bin 1000000 prefix 100000 > result.txt
 
-# 2. Check against baseline
-python benchmarks/check_regression.py result.txt --baseline v1.1.0
+# 2. Check against the configured absolute threshold
+python benchmarks/check_regression.py result.txt
 ```
 
-**Exit Codes:**
-- `0`: Performance within acceptable range (< 10% degradation)
-- `1`: Warning threshold exceeded (10-20% degradation) - investigate
-- `2`: Failure threshold exceeded (> 20% degradation) - block merge
+**Exit codes:**
+- `0`: Throughput meets the configured threshold
+- `1`: Invalid input or throughput below the configured threshold
 
 ### Example CI Configuration
 
@@ -227,9 +232,8 @@ python benchmarks/check_regression.py result.txt --baseline v1.1.0
   run: |
     cmake -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build --target traceon_driver
-    cd benchmarks
-    python benchmark_runner.py --quick
-    python check_regression.py --baseline ${{ github.base_ref }}
+    ./build/traceon_driver lookup build/test.bin 100000 read_ 30000 > build/result.txt
+    python benchmarks/check_regression.py build/result.txt
 ```
 
 **GitLab CI:**
@@ -238,7 +242,7 @@ performance:
   script:
     - cmake -B build -DCMAKE_BUILD_TYPE=Release
     - cmake --build build -j
-    - cd benchmarks && python check_regression.py
+    - python benchmarks/check_regression.py build/result.txt
   rules:
     - if: '$CI_MERGE_REQUEST_ID'
 ```
@@ -437,7 +441,7 @@ VSPerfCmd /shutdown
 ---
 
 **Document Version:** 1.2.0  
-**Last Validated:** June 9, 2026  
-**Next Review:** July 2026 (post-v1.2.0 release)
+**Baseline measurements validated:** June 9, 2026
+**Documentation reviewed:** September 6, 2026 (v2.3.0)
 
 *"Trace On" - Profiling legendary performance from genomic data.* 📊

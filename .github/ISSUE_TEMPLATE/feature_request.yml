@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an enhancement to TracEon
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workload or use case is not served today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change? Include API sketch if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants affected
+      description: Which architecture invariants does this touch? (zero-copy reads, immutable-after-load, lock-free read path, v4 format — see docs/architecture/)

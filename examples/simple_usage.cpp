@@ -40,7 +40,7 @@ int main() {
     cache.save("example_cache.bin");
     std::cout << "  Cache saved\n";
     
-    // Step 4: Restore from binary (memory-mapped, zero-copy)
+    // Step 4: Restore from binary cache (v4 LZ4 Frame decode; views are zero-copy)
     std::cout << "\nRestoring from binary cache...\n";
     TracEon::Cache fast_cache;
     start = std::chrono::high_resolution_clock::now();

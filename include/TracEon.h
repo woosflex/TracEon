@@ -1,7 +1,7 @@
 /**
  * @file TracEon.h
  * @brief TracEon: High-Performance Genomic Data Cache
- * @version 2.0.0
+ * @version 2.3.0
  * @date 2026
  * 
  * @section DESCRIPTION
@@ -10,7 +10,7 @@
  * 
  * @section FEATURES
  * - Zero-copy string views (no allocation overhead)
- * - Lock-free concurrent reads (2x throughput)
+ * - Lock-free concurrent reads (no mutex/RMW on the read path; ~9.6x at 14 threads, see README)
  * - `.traceon` v4 binary cache (LZ4 Frame + whole-payload CRC32C, streamed)
  * - Multithreaded parsing (8-core scaling)
  * - 40M+ OPS/s random access on modern hardware
@@ -92,7 +92,8 @@ namespace TracEon {
     
     /**
      * @brief Check if Robin Hood hashing is available
-     * @return true if third_party/robin_hood.h was found at compile time
+     * @return false (retained for compatibility; robin_hood.h was removed in
+     *         v1.2.0 in favour of ankerl::unordered_dense — see MapDefs.h)
      */
     inline bool hasRobinHoodOptimization() {
 #ifdef TRACEON_USE_ROBIN_HOOD

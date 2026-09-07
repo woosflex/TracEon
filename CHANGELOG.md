@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+No unreleased changes documented yet.
+
 ## [2.3.0] - 2026-08-20
 
 **Codename: Harpe** — remote read access + multi-core read scaling.
@@ -44,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such requests with return 0 + diagnostic before any allocation; the no-throw/return-0
   contract is now platform-independent.
 
-### Added
+### Public API
 
 - **Public `Cache` facade completed to match the documented API surface**: the
   README documents `cache.loadGzipFile(...)` and the lifecycle contract names
@@ -79,16 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Investigated a TracEon `traceon_kmer` C API drop-in for minimap2's per-bucket
   `khash_t(idx)` table. Evidence and benchmark recommendations are recorded in
   `outputs/minimap2-traceon-integration-research.md`; no source files were
-  modified. Current experimental patch remains blocked on iterator ABI and
-  error-status handling fixes.
+  modified by that research workstream. Later release work resolved the C API
+  iterator ownership and error-status requirements described there.
 
----
+### Implementation details
 
-## [2.3.0] — v2.3.0 "Harpe" (unreleased)
-
-*Harpe slice 1 — remote read access.* Release stamp/date land at release.
-
-### Added
+#### Added
 
 - **Remote read access over TCP** (protocol, server, client):
   - `include/TraceonProto.h` — a minimal length-prefixed wire protocol
@@ -129,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tools/traceon_make_cache`**: converts FASTA/FASTQ into a v4 `.traceon`
   cache for server deployment.
 
-### Fixed
+#### Fixed
 
 - **`TraceonServer::stop()` deadlock**: closing the wake-pipe/listen fds while
   the accept thread is blocked in `poll()` is undefined behaviour on Linux and
@@ -636,9 +636,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    - Required for lock-free reads
    - Alternative: Reload entire cache (fast with mmap)
 
-3. **Single-Node Only**: No distributed caching
-   - Target: Local workstation/server workloads
-   - Future: v2.1.0 distributed architecture
+3. **Single-node only at release**: v1.0.0 targeted local workloads
+   - Trusted-network remote reads arrived in v2.3.0
+   - Transparent sharding and replication remain out of scope
 
 4. **Test Path Dependency**: Tests must run from build directory
    - Workaround: `cd build && ./unit_tests`
@@ -654,10 +654,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Version | Date | Codename | Key Features |
 |---------|------|----------|--------------|
 | 1.0.0 | 2025-12-16 | Avalon | Zero-copy, Lock-free, GZIP support, Memory mapping |
-| 1.1.0 | 2026-06-07 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
+| 1.1.0 | 2026-06-08 | Bakuya | zlib-ng integration, Pre-size + Direct-write, Optimized GZIP |
 | 1.2.0 | 2026-06-09 | Caladbolg | SIMD parsing, ankerl::unordered_dense hash map, 86% load time reduction |
-| 2.0.0 | 2026-Q3 | Durandal | C API, Streaming |
-| 2.1.0 | 2026-Q4 | Excalibur | Distributed caching |
+| 1.3.0 | 2026-06-25 | Hrunting | Parallel GZIP and LZ4 binary caches |
+| 2.0.0 | 2026-08-11 | Durandal | v4 cache integrity, lifecycle contract, optional k-mer API |
+| 2.1.0 | 2026-08-12 | Excalibur | Fuzzing gate and aligner validation |
+| 2.2.0 | 2026-08-14 | Gáe Bolg | Five-aligner validation matrix |
+| 2.3.0 | 2026-08-20 | Harpe | Remote reads and multi-core scaling |
 
 ---
 
@@ -692,7 +695,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Status:** ✅ Production Release  
-**Next Version:** v1.3.0 "Hrunting" (Q3 2026)
+**Current release:** v2.3.0 "Harpe" (2026-08-20)
 
 *"Trace On" - Projecting legendary performance from genomic data across eons.* ⚔️

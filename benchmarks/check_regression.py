@@ -1,16 +1,16 @@
 """
 TracEon Performance Regression Checker
-Version: 1.0.0 "Avalon"
+Applies to TracEon 2.3.0 "Harpe"
 
 Validates TracEon throughput against known baselines.
 """
 import sys
 import re
 
-VERSION = "1.0.0"
-CODENAME = "Avalon"
+VERSION = "2.3.0"
+CODENAME = "Harpe"
 
-# Thresholds (OPS/s) - Avalon baseline
+# Established absolute throughput thresholds (OPS/s).
 THRESHOLDS = {
     "10MB": 20_000_000,   # Should see 35M+, fail if < 20M
     "100MB": 8_000_000,   # Should see 12M+, fail if < 8M

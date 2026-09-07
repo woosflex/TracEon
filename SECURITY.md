@@ -29,7 +29,7 @@ treated as security issues.
 
 | Version       | Supported          |
 | ------------- | ------------------ |
-| latest release (v2.2.x) | ✅ |
+| latest release (v2.3.x) | ✅ |
 | older releases | ❌ — upgrade recommended |
 
 Orphaned/pre-release branches are not supported.

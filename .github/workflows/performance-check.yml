@@ -1,14 +1,14 @@
-name: TracEon Avalon - Performance Check
+name: TracEon - Performance Check
 
 on: [push, pull_request]
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    name: Avalon Performance Validation
+    name: Performance Validation
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Install Dependencies
       run: |

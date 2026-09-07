@@ -1,10 +1,13 @@
 # TracEon Benchmarking Suite
 
-**Version:** v1.4.0 "Caliburn"  
+**Applies to:** TracEon v2.3.0 "Harpe"
 **Purpose:** Performance validation and regression testing  
-**Last Updated:** 2026-07-01
+**Last Updated:** 2026-09-06
 
 This directory contains tools for benchmarking TracEon against synthetic and real-world genomic datasets, comparing against state-of-the-art tools (BioPython, PyFastX, SeqKit).
+
+The latest locally reproduced TracEon-only results are in the
+[v2.3.0 benchmark report](v2.3.0_benchmark_report.md).
 
 ---
 
@@ -160,7 +163,7 @@ PacBio       | 348       | 0.07   | 0.03   | 0.19   | 0.01    | 0.00    | 44,291
 - **SEQKIT:** SeqKit stats time (all formats, baseline)
 - **BIOPY:** BioPython parse time
 - **TRACEON:** TracEon load time (parse + index)
-- **RESTORE:** TracEon binary cache restore time (mmap)
+- **RESTORE:** TracEon binary cache restore time (v4: streamed LZ4 Frame decode + CRC32C verify)
 - **TRACEON OPS:** TracEon Lookups per second of Random Queries
 - **PYFASTX OPS:** PyFastX lookups per second
 - **MEM TRA:** TracEon peak memory usage (RSS)
@@ -318,15 +321,13 @@ jobs:
       
       - name: Run Regression Check
         run: |
-          cd benchmarks
-          python benchmark_runner.py --sizes 10,100 --quick
-          python check_regression.py --baseline v1.1.0
+          ./build/traceon_driver lookup build/test.bin 100000 read_ 30000 > build/result.txt
+          python benchmarks/check_regression.py build/result.txt
 ```
 
 **Exit codes:**
-- `0`: Performance within 10% of baseline (pass)
-- `1`: Performance degraded 10-20% (warning)
-- `2`: Performance degraded > 20% (fail)
+- `0`: Throughput meets the configured threshold
+- `1`: Invalid input or throughput below the configured threshold
 
 ---
 
@@ -346,9 +347,9 @@ jobs:
 - Validates correctness, not just performance
 
 **`check_regression.py`** (CI/CD integration)
-- Compares current results against baseline
-- Enforces performance thresholds
-- Exit codes for automated testing
+- Parses a `Throughput:` value from a benchmark result file
+- Enforces the configured absolute threshold (currently the 100 MB category)
+- Returns pass/fail exit codes for automated testing
 
 ### Configuration
 
@@ -484,8 +485,8 @@ import sys
 
 ---
 
-**Last Updated:** June 7, 2026  
-**Version:** 1.1.0 "Bakuya"  
+**Last Updated:** September 6, 2026
+**Applies to:** TracEon 2.3.0 "Harpe"
 **Platform:** Linux, macOS, Windows (with Python)
 
 *"Trace On" - Benchmarking legendary performance.* 📊

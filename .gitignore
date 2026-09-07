@@ -105,6 +105,7 @@ CMakeCache.txt
 CMakeFiles/
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 *.pyo

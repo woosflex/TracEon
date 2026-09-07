@@ -185,6 +185,8 @@ def cleanup():
     if os.path.isdir(TMP_DIR):
         shutil.rmtree(TMP_DIR, ignore_errors=True)
     for d in [REAL_DATA_DIR, "."]:
+        if not os.path.isdir(d):
+            continue
         for suf in [".fai", ".gzi", ".fxi", ".traceon_bench_tmp"]:
             for f in os.listdir(d):
                 if f.endswith(suf):

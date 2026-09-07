@@ -18,8 +18,11 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
         GIT_TAG        2.2.2
 )
-set(ZLIB_COMPAT ON)
-set(WITH_NATIVE_INSTRUCTIONS ON)
+set(ZLIB_COMPAT ON CACHE BOOL "Build zlib-ng with the zlib-compatible API" FORCE)
+set(WITH_NATIVE_INSTRUCTIONS ON CACHE BOOL "Enable native zlib-ng optimizations" FORCE)
+set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "Disable bundled zlib-ng tests" FORCE)
+set(ZLIBNG_ENABLE_TESTS OFF CACHE BOOL "Disable bundled zlib-ng tests" FORCE)
+set(WITH_GTEST OFF CACHE BOOL "Disable zlib-ng GoogleTest targets" FORCE)
 FetchContent_MakeAvailable(zlib-ng)
 
 # --- ankerl::unordered_dense (header-only, MIT license) ---
@@ -31,6 +34,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ankerl_unordered_dense)
 
 # --- LZ4 Support ---
+set(LZ4_BUILD_CLI OFF CACHE BOOL "Disable bundled LZ4 command-line tools" FORCE)
 add_subdirectory(third_party/lz4/build/cmake)
 
 # --- Source File Definitions (UPDATED PATHS) ---
@@ -71,8 +75,8 @@ set(TEST_SOURCES
         tests/CacheTests.cpp
         tests/FastqTests.cpp
         tests/MapDefsTests.cpp
-        # SmartStrategyTests.cpp split into per-domain TUs (128 cases / 4195
-        # assertions preserved across the combined unit_tests target).
+        # SmartStrategyTests.cpp was split into per-domain translation units;
+        # all core cases remain in the combined unit_tests target.
         tests/test_parser_fastq.cpp
         tests/test_parser_fasta.cpp
         tests/test_gzip.cpp

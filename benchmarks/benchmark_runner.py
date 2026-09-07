@@ -2,13 +2,16 @@ import os
 import time
 import subprocess
 import random
+import shutil
 import sys
 import threading
+from pathlib import Path
 import psutil
-import gzip 
+import gzip
 
 # === CONFIGURATION ===
-TRACEON_BINARY = "../build/traceon_driver"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TRACEON_BINARY = str(REPO_ROOT / "build" / "traceon_driver")
 SEQTK_BINARY = "seqtk"
 SEQKIT_BINARY = "seqkit"
 MAX_LOOKUPS = 500000
@@ -33,7 +36,7 @@ BP_PARSE_SCRIPT = "import sys, gzip; from Bio import SeqIO; open_func = gzip.ope
 
 PYFASTX_SCRIPT = """
 import sys, random, pyfastx
-fname, n, prefix, m = sys.argv[1], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+fname, n, prefix, m = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 
 # pyfastx handles gzip automatically
 if 'fastq' in fname: db = pyfastx.Fastq(fname)
@@ -71,10 +74,22 @@ def run_cmd(cmd):
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         t = threading.Thread(target=monitor_process, args=(p, stats))
         t.start()
-        p.communicate()
+        _, stderr = p.communicate()
         t.join()
+        if p.returncode != 0:
+            print(f"Command failed ({p.returncode}): {' '.join(cmd)}", file=sys.stderr)
+            if stderr:
+                print(stderr.strip(), file=sys.stderr)
         return p.returncode, time.time()-t0, stats['peak_mb']
-    except: return -1, 0, 0
+    except OSError as exc:
+        print(f"Could not run {' '.join(cmd)}: {exc}", file=sys.stderr)
+        return -1, 0, 0
+
+def run_required(cmd):
+    result = run_cmd(cmd)
+    if result[0] != 0:
+        raise RuntimeError(f"Benchmark command failed: {' '.join(cmd)}")
+    return result
 
 def parse_val(out, key):
     try: return float([l.split(":")[1] for l in out.splitlines() if key in l][0])
@@ -128,27 +143,38 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     
     res = {}
     res['FileSize'] = actual_size_mb
+    res['Iterations'] = iters
 
     # 1. PARSING
-    res['SeqTk'] = run_cmd([SEQTK_BINARY, "fqchk", fname]) if "fastq" in fmt else (0,0,0)
-    res['SeqKit'] = run_cmd([SEQKIT_BINARY, "stats", fname])
+    res['SeqTk'] = run_required([SEQTK_BINARY, "fqchk", fname]) if "fastq" in fmt else (0,0,0)
+    res['SeqKit'] = run_required([SEQKIT_BINARY, "stats", fname])
     
     clean_fmt = "fastq" if "fastq" in fmt else "fasta"
-    res['BioPy'] = run_cmd([sys.executable, "-c", BP_PARSE_SCRIPT, fname, clean_fmt])
-    res['TracEon'] = run_cmd([TRACEON_BINARY, "load", fname])
+    res['BioPy'] = run_required([sys.executable, "-c", BP_PARSE_SCRIPT, fname, clean_fmt])
+    res['TracEon'] = run_required([TRACEON_BINARY, "load", fname])
 
     # 2. LIFECYCLE
-    run_cmd([TRACEON_BINARY, "save", fname, bin_file])
-    p = subprocess.Popen([TRACEON_BINARY, "restore", bin_file], stdout=subprocess.PIPE, text=True)
-    out, _ = p.communicate()
+    run_required([TRACEON_BINARY, "save", fname, bin_file])
+    p = subprocess.run(
+        [TRACEON_BINARY, "restore", bin_file],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = p.stdout
     res['Restore'] = parse_val(out, "Restore_Time_s")
 
     # 3. LOOKUPS
     # NOTE: BioPython lookup test removed as per instructions
-    res['PyFastX_L'] = run_cmd([sys.executable, "-c", PYFASTX_SCRIPT, fname, str(iters), prefix, str(n_seqs)])
+    res['PyFastX_L'] = run_required([sys.executable, "-c", PYFASTX_SCRIPT, fname, str(iters), prefix, str(n_seqs)])
 
-    p = subprocess.Popen([TRACEON_BINARY, "lookup", bin_file, str(iters), prefix, str(n_seqs)], stdout=subprocess.PIPE, text=True)
-    out, _ = p.communicate()
+    p = subprocess.run(
+        [TRACEON_BINARY, "lookup", bin_file, str(iters), prefix, str(n_seqs)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = p.stdout
     res['TracEon_L'] = parse_val(out, "Throughput")
     res['Record_Count'] = n_seqs
 
@@ -164,6 +190,13 @@ def main():
     if not os.path.exists(TRACEON_BINARY):
         print("Compile driver first!")
         sys.exit(1)
+
+    missing = [tool for tool in (SEQTK_BINARY, SEQKIT_BINARY) if not shutil.which(tool)]
+    if missing:
+        print(f"Missing benchmark tools on PATH: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    random.seed(42)
 
     print(f"Starting Matrix Benchmark: {len(FILE_SIZES_MB)} Sizes x {len(DATA_TYPES)} Scenarios")
 
@@ -185,7 +218,7 @@ def main():
             
             ops_tra = f"{int(r['TracEon_L']):,}"
             
-            iters = min(MAX_LOOKUPS, max(1000, int(TARGET_LOOKUP_VOLUME_MB*1024*1024/avg_len)))
+            iters = r['Iterations']
             pfx_dur = r['PyFastX_L'][1]
             
             if pfx_dur > 0:

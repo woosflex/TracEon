@@ -61,9 +61,9 @@ Sign off every commit with `Signed-off-by: Your Name <you@example.com>` (use
 - **Style:** Modern C++20 (RAII, `std::string_view`, no raw `new` in core paths).
 - **Performance / invariants:** If you touch core logic, run the regression check:
   ```bash
-  python benchmarks/check_regression.py --baseline main
+  python benchmarks/check_regression.py build/result.txt
   ```
-  and confirm you haven't broken an architectural invariant (see AGENTS.md /
+  and confirm you haven't broken an architectural invariant (see the
   `docs/architecture/` ADRs): zero-copy reads, immutable-after-load, lock-free
   read path, pre-reserved maps.
 
