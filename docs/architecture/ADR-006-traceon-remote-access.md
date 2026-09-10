@@ -51,20 +51,25 @@ Every message on the wire is a single frame:
 
 First payload byte = message-type UUID:
 
+> **Post-ADR change:** the `HAS` / `STATS` / `OK_STATS` messages and the
+> `kInternal` / `kCrcMismatch` status codes below were removed — no client
+> ever called them. IDs are not reused. The table reflects the original
+> design; `include/TraceonProto.h` is the authoritative live spec.
+
 | Dir | Type | ID | Body |
 |-----|------|----|------|
 | C→S | HELLO | `0x01` | `"TRO-RPC"` (7 B) + protocol version (u8) |
 | C→S | GET | `0x02` | record key bytes (raw string) |
-| C→S | HAS | `0x03` | record key bytes (raw string) |
-| C→S | STATS | `0x04` | (empty) |
+| C→S | HAS *(removed)* | `0x03` | record key bytes (raw string) |
+| C→S | STATS *(removed)* | `0x04` | (empty) |
 | C→S | BYE | `0x05` | (empty) |
 | S→C | OK | `0x81` | `status(u8) \| plen(u32) \| payload[plen] \| crc32c(u32)` |
 | S→C | ERROR | `0x82` | `status(u8) \| mlen(u32) \| message[mlen]` |
-| S→C | OK_STATS | `0x83` | `entries(u64) \| format(u8) \| index_mode(u8) \| arena_bytes(u64) \| crc32c(u32)` |
+| S→C | OK_STATS *(removed)* | `0x83` | `entries(u64) \| format(u8) \| index_mode(u8) \| arena_bytes(u64) \| crc32c(u32)` |
 
 ### Integrity model (CRC32C)
 
-- Every **OK-type** response (`OK`, `OK_STATS`) carries a trailing
+- Every **OK-type** response (`OK`) carries a trailing
   CRC32C (Castagnoli, poly `0x1EDC6F41` — the SCTP/iSCSI variant, via
   `include/Crc32c.h`, the same family as the v4 cache format) over all body
   bytes **up to but excluding** the checksum field itself.

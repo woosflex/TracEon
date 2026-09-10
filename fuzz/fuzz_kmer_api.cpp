@@ -3,12 +3,11 @@
 //
 // Contract under test (vuln-0003): no C++ exception may ever cross the C
 // ABI boundary and no call may exhibit UB — with arbitrary keys/values, a
-// NULL handle, NULL output pointers, an uninitialized iterator, and the
-// freeze/pointer-stability state machine (get/iter_begin/freeze block later
-// inserts). Every operation here returns a status code; the harness drives
-// a full create → reserve → insert/get → iterate → destroy lifecycle per
-// input with bounds derived from the bytes. Any crash / leak / UB / thrown
-// exception escaping the boundary is a finding.
+// NULL handle, NULL output pointers, and the freeze/pointer-stability
+// state machine (get() blocks later inserts). Every operation here returns
+// a status code; the harness drives a full create → reserve → insert/get →
+// destroy lifecycle per input with bounds derived from the bytes. Any
+// crash / leak / UB / thrown exception escaping the boundary is a finding.
 
 #include "kmerindex_c_api.h"
 #include "fuzz_common.h"
@@ -56,34 +55,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         (void)kmerindex_last_error(h); // thread-local diagnostic, never NULL
     }
 
-    // Caller-owned iteration (reentrant, bounded).
-    kmerindex_iter_t it{};
-    if (kmerindex_iter_begin(h, &it)) {
-        uint64_t k2 = 0, v2 = 0;
-        for (int i = 0; i < 10000 && kmerindex_iter_next(&it, &k2, &v2); ++i) {
-            volatile uint64_t sink = k2 ^ v2;
-            (void)sink;
-        }
-    }
-    // iter_next on an uninitialized iterator: the magic guard must return 0.
-    {
-        kmerindex_iter_t uninit{};
-        uint64_t k3 = 0, v3 = 0;
-        (void)kmerindex_iter_next(&uninit, &k3, &v3);
-    }
-    (void)kmerindex_freeze(h);
     (void)kmerindex_size(h);
-    (void)kmerindex_insert(h, 1, 2); // after freeze: must fail, not crash
 
     // NULL-handle coverage: every function must return its failure value.
     (void)kmerindex_reserve(nullptr, 1);
     (void)kmerindex_size(nullptr);
     (void)kmerindex_insert(nullptr, 1, 2);
     (void)kmerindex_get(nullptr, 1, nullptr);
-    (void)kmerindex_freeze(nullptr);
-    (void)kmerindex_iter_begin(nullptr, &it);
-    uint64_t k4 = 0, v4 = 0;
-    (void)kmerindex_iter_next(nullptr, &k4, &v4);
     (void)kmerindex_last_error(nullptr);
 
     kmerindex_destroy(h);

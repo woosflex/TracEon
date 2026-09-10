@@ -14,7 +14,6 @@ bytes.
 | `fuzz_fasta`      | FASTA text parsing + in-place `normalizeFastaArena` (GENOME + NGS modes)         |
 | `fuzz_kmer_encode`| `encode_kmer` (vuln-0001 contract: no OOB read, no bad shift)                   |
 | `fuzz_kmer_api`   | kmerindex C API (vuln-0003: no exception/UB across the C boundary)              |
-| `fuzz_trki`       | `KmerReferenceIndex::mmap_open` (vuln-0006: crafted TRKI must reject, no SEGV)   |
 
 Every target uses the standard entry point:
 
@@ -50,7 +49,7 @@ calling the API.
 cmake -B build-fuzz -DTRACEON_BUILD_FUZZERS=ON \
       -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-fuzz -j 4 --target fuzz_v4_loader fuzz_gzip_loader \
-      fuzz_fastq fuzz_fasta fuzz_kmer_encode fuzz_kmer_api fuzz_trki
+      fuzz_fastq fuzz_fasta fuzz_kmer_encode fuzz_kmer_api
 ./build-fuzz/fuzz_v4_loader -max_total_time=120 fuzz/corpus/v4_loader/
 ```
 
@@ -99,10 +98,7 @@ Contents per target:
 - **kmer_encode/** — `(int32 k, seq bytes)` inputs incl. k=0/33, short views,
   non-ACGT bases.
 - **kmer_api/** — empty / tiny / random bytes driving
-  create→reserve→insert→get→iterate→destroy.
-- **trki/** — valid small index + every vuln-0006 PoC: `n_slots=2^60`
-  56-byte evil file, out-of-range slot offsets, truncated/oversized, bad
-  magic/version/k, non-pow2 n_slots, n_keys>n_slots, empty 40-byte index.
+  create→reserve→insert→get→destroy.
 
 The >10MB multithreaded-parser seeds are generated at CI time (not committed
 — they'd bloat the repo); see the "Generate large corpus seeds" step in

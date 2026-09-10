@@ -34,64 +34,7 @@ def le32(v):
 def le64(v):
     return struct.pack("<Q", v)
 
-def trki(version, k, n_slots, n_keys, n_positions, slots=(), positions=(),
-         bad_magic=False):
-    b = bytearray()
-    b += b"XXXX" if bad_magic else b"TRKI"
-    b += le32(version) + le32(k) + le32(0)   # version, k, reserved
-    b += le64(n_slots) + le64(n_keys) + le64(n_positions)
-    for key, val in slots:
-        b += le64(key) + le64(val)
-    for p in positions:
-        b += le64(p)
-    return bytes(b)
-
-
 def main():
-    # ── trki/ ────────────────────────────────────────────────────────────────
-    d = os.path.join(CORPUS, "trki")
-    ensure(d)
-    # Valid minimal index: 1 slot (pow2), 1 key, 1 position. 64 bytes.
-    write(os.path.join(d, "valid.trki"),
-          trki(1, 4, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,)))
-    # vuln-0006 case (a): n_slots=2^60, 56-byte file (wraps n_slots*16 in
-    # unchecked arithmetic; must be rejected by the division-form check).
-    write(os.path.join(d, "evil_nslots_2pow60.trki"),
-          trki(1, 4, 1 << 60, 1, 2, slots=(), positions=(0, 0)))
-    # vuln-0006 case (b): slot value (1,000,000<<32)|4 with n_positions=1.
-    write(os.path.join(d, "evil_slot_oob.trki"),
-          trki(1, 4, 1, 1, 1, slots=((42, (1_000_000 << 32) | 4),), positions=(0,)))
-    # Truncated: claims 4 slots, writes none (40 + 8 = 48 bytes).
-    write(os.path.join(d, "truncated.trki"),
-          trki(1, 4, 4, 1, 1, slots=(), positions=(0,)))
-    # Trailing garbage: valid 64-byte index + 8 junk bytes.
-    write(os.path.join(d, "trailing_garbage.trki"),
-          trki(1, 4, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,))
-          + b"JUNKJUNK")
-    # Too small to contain a header.
-    write(os.path.join(d, "tiny.trki"), b"TRKI")
-    # Bad magic / version / k.
-    write(os.path.join(d, "bad_magic.trki"),
-          trki(1, 4, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,),
-               bad_magic=True))
-    write(os.path.join(d, "bad_version.trki"),
-          trki(2, 4, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,)))
-    write(os.path.join(d, "bad_k0.trki"),
-          trki(1, 0, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,)))
-    write(os.path.join(d, "bad_k33.trki"),
-          trki(1, 33, 1, 1, 1, slots=((27, (0 << 32) | 1),), positions=(0,)))
-    # n_slots not a power of two.
-    write(os.path.join(d, "not_pow2.trki"),
-          trki(1, 4, 3, 3, 3, slots=((1, 0), (2, 0), (3, 0)), positions=(0, 1, 2)))
-    # n_keys > n_slots.
-    write(os.path.join(d, "nkeys_exceed.trki"),
-          trki(1, 4, 2, 5, 1, slots=((1, 0), (2, 0)), positions=(0,)))
-    # Empty index (40-byte file) — loads and queries empty.
-    write(os.path.join(d, "empty.trki"), trki(1, 4, 0, 0, 0))
-    # Truly arbitrary garbage (magic may or may not align).
-    write(os.path.join(d, "random_garbage.trki"), bytes(rng.randrange(256)
-                                                        for _ in range(137)))
-
     # ── kmer_encode/ (int32 LE k + sequence bytes) ───────────────────────────
     d = os.path.join(CORPUS, "kmer_encode")
     ensure(d)

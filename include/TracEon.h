@@ -64,7 +64,6 @@
 #include "Cache.h"
 #include "Crc32c.h"
 #include "DecodedRecordTypes.h"
-#include "RecordTypes.h"
 
 // Advanced users may need direct access
 #include "SmartStrategy.h"
@@ -81,27 +80,6 @@ namespace TracEon {
      */
     constexpr const char* VERSION = "2.3.0";
     constexpr const char* CODENAME = "Harpe";
-    
-    /**
-     * @brief Check if lock-free optimization is active
-     * @return true if using atomic acquire/release pattern
-     */
-    inline bool hasLockFreeReads() {
-        return true; // Always enabled in RC1+
-    }
-    
-    /**
-     * @brief Check if Robin Hood hashing is available
-     * @return false (retained for compatibility; robin_hood.h was removed in
-     *         v1.2.0 in favour of ankerl::unordered_dense — see MapDefs.h)
-     */
-    inline bool hasRobinHoodOptimization() {
-#ifdef TRACEON_USE_ROBIN_HOOD
-        return true;
-#else
-        return false;
-#endif
-    }
 }
 
 #endif // TRACEON_H

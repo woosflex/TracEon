@@ -58,8 +58,7 @@ Measured on an **Intel Core Ultra 5 125H (14 cores / 18 threads, single NUMA nod
 ## 🎯 What's New in v2.0.0
 
 > **Breaking release.** v2.0.0 makes a clean break in the binary format and
-> lifecycle contract (no public adopters were identified; see the
-> [design review](outputs/traceon-v2-design-review.md)). Read the
+> lifecycle contract (no public adopters were identified). Read the
 > [Migration / Breaking Changes](#migration--breaking-changes) section before
 > upgrading. The opt-in k-mer C API ships as a separate target and is used by the
 > aligner forks (minimap2/Winnowmap `traceon-backend`).
@@ -365,12 +364,11 @@ TracEon/
 │   ├── Cache.h           # High-level interface
 │   ├── SmartStrategy.h   # Core engine (advanced users)
 │   ├── SimdUtils.h       # SIMD character-search (AVX2/NEON/scalar)
-│   ├── RecordTypes.h     # Type definitions
+│   ├── DecodedRecordTypes.h # Decoded FASTQ records
 │   └── MapDefs.h         # ankerl::unordered_dense typedefs
 ├── src/                  # Implementation
 │   ├── Cache.cpp
 │   ├── SmartStrategy.cpp # Lock-free logic, GZIP, SIMD parsers
-│   └── IEncodingStrategy.cpp
 ├── tests/                # Unit & integration tests (Catch2)
 │   ├── TestHelpers.h          # Shared fixtures/helpers
 │   ├── CacheTests.cpp

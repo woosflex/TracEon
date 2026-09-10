@@ -51,34 +51,24 @@ uint16_t unusedPort() {
 
 } // namespace
 
-// ── Protocol unit tests (pure codecs — no socket) ───────────────────────────
+// Raw TCP connect to 127.0.0.1:port for protocol-violation tests. Returns
+// -1 (after closing) on any failure instead of throwing.
+static int connectRaw(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    if (::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) != 1 ||
+        ::connect(fd, reinterpret_cast<const sockaddr*>(&a), sizeof(a)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// ── Protocol unit tests (pure codecs — no socket) ───────────────────────────────
 TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]") {
-    SECTION("encodeFrame/decodeFrame round-trip") {
-        std::vector<char> body{'A', 'C', 'G', 'T'};
-        const std::vector<char> wire = proto::encodeFrame(proto::MsgType::Get, body);
-        REQUIRE(wire.size() == proto::kFrameHeaderSize + 1 + body.size());
-        // payload_len counts the leading msg-type byte.
-        REQUIRE(proto::read_le64(wire.data()) == 1 + body.size());
-        auto [f, consumed] = proto::decodeFrame(wire.data(), wire.size());
-        REQUIRE(f.type == proto::MsgType::Get);
-        REQUIRE(f.body == body);
-        REQUIRE(consumed == wire.size());
-    }
-
-    SECTION("decodeFrame rejects implausible payload lengths") {
-        std::vector<char> zero(proto::kFrameHeaderSize, 0); // payload_len == 0
-        REQUIRE_THROWS_AS(proto::decodeFrame(zero.data(), zero.size()),
-                          std::runtime_error);
-
-        std::vector<char> huge(proto::kFrameHeaderSize, 0);
-        proto::append_le64(huge, proto::kMaxMessageSize + 1); // > 64 MiB cap
-        REQUIRE_THROWS_AS(proto::decodeFrame(huge.data(), huge.size()),
-                          std::runtime_error);
-
-        REQUIRE_THROWS_AS(proto::decodeFrame(huge.data(), proto::kFrameHeaderSize - 1),
-                          std::runtime_error); // truncated header
-    }
-
     SECTION("encodeFrame rejects bodies over the 64 MiB cap") {
         std::vector<char> big(proto::kMaxMessageSize, 'A'); // 1 + 64 MiB > cap
         REQUIRE_THROWS_AS(proto::encodeFrame(proto::MsgType::Get, big),
@@ -114,24 +104,6 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         REQUIRE(status == proto::kNotFound);
         REQUIRE(msg == "record key not found");
         REQUIRE_THROWS_AS(proto::decodeError(std::vector<char>(3, 0)),
-                          std::runtime_error);
-    }
-
-    SECTION("encodeOkStats/decodeOkStats round-trip with CRC") {
-        const std::vector<char> body =
-            proto::encodeOkStats(12345, 0x03, 0x01, 987654321);
-        const proto::OkStats s = proto::decodeOkStats(body);
-        REQUIRE(s.entries == 12345);
-        REQUIRE(s.format == 0x03);
-        REQUIRE(s.index_mode == 0x01);
-        REQUIRE(s.arena_bytes == 987654321);
-    }
-
-    SECTION("decodeOkStats throws on a forged CRC / malformed body") {
-        std::vector<char> body = proto::encodeOkStats(1, 0, 0, 2);
-        body[body.size() - 2] ^= 0xFF; // corrupt a checksum byte
-        REQUIRE_THROWS_AS(proto::decodeOkStats(body), std::runtime_error);
-        REQUIRE_THROWS_AS(proto::decodeOkStats(std::vector<char>(5, 0)),
                           std::runtime_error);
     }
 }
@@ -215,13 +187,8 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         server.start();
         const uint16_t p = server.port();
 
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int fd = connectRaw(p);
         REQUIRE(fd >= 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = htons(p);
-        REQUIRE(::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) == 1);
-        REQUIRE(::connect(fd, reinterpret_cast<const sockaddr*>(&a), sizeof(a)) == 0);
 
         std::vector<char> body(proto::kMagic.begin(), proto::kMagic.end());
         body.push_back(99); // unsupported protocol version
@@ -237,7 +204,109 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         server.stop();
     }
 
-    SECTION("GET/HAS/STATS round-trip against the real cache") {
+    // Regression tests for the handleClient() epilogue: every early-exit
+    // path (handshake rejection, protocol violation, clean EOF, BYE) must
+    // run the unregister/shutdown/close epilogue exactly once — the server
+    // must stop() cleanly with no leaked/jammed descriptors or threads.
+    SECTION("raw-socket epilogue paths: handshake rejects, violations, EOF, BYE") {
+        TraceonServer server(cache, 0, "127.0.0.1");
+        server.start();
+        const uint16_t p = server.port();
+
+        // (a) HELLO with a corrupted magic string.
+        {
+            int fd = connectRaw(p);
+            REQUIRE(fd >= 0);
+            std::vector<char> body{'X', 'X', 'X', '-', 'R', 'P', 'C', 1};
+            REQUIRE(proto::writeFrame(fd, proto::MsgType::Hello, body));
+            auto rsp = proto::readFrame(fd, 5000);
+            REQUIRE(rsp.has_value());
+            REQUIRE(rsp->type == proto::MsgType::Error);
+            auto [st, msg] = proto::decodeError(rsp->body);
+            REQUIRE(st == proto::kBadRequest);
+            REQUIRE(msg == "bad HELLO magic");
+            ::close(fd);
+        }
+
+        // (b) First frame is not HELLO (GET before handshake).
+        {
+            int fd = connectRaw(p);
+            REQUIRE(fd >= 0);
+            REQUIRE(proto::writeFrame(fd, proto::MsgType::Get, {'k'}));
+            auto rsp = proto::readFrame(fd, 5000);
+            REQUIRE(rsp.has_value());
+            REQUIRE(rsp->type == proto::MsgType::Error);
+            auto [st, msg] = proto::decodeError(rsp->body);
+            REQUIRE(st == proto::kBadRequest);
+            REQUIRE(msg == "expected HELLO handshake");
+            ::close(fd);
+        }
+
+        // (c) Connect then immediate EOF (no bytes): clean server-side exit.
+        {
+            int fd = connectRaw(p);
+            REQUIRE(fd >= 0);
+            ::close(fd); // EOF at frame boundary — not a protocol violation
+        }
+
+        // (d) payload_len == 0: implausible-length protocol violation. This
+        // is the only client-triggerable path through the catch → epilogue
+        // (readFrame throws; the server replies ERROR with the message).
+        {
+            int fd = connectRaw(p);
+            REQUIRE(fd >= 0);
+            const char zeros[8] = {0};
+            REQUIRE(proto::writeAll(fd, zeros, sizeof(zeros)));
+            auto rsp = proto::readFrame(fd, 5000);
+            REQUIRE(rsp.has_value());
+            REQUIRE(rsp->type == proto::MsgType::Error);
+            auto [st, msg] = proto::decodeError(rsp->body);
+            REQUIRE(st == proto::kBadRequest);
+            REQUIRE(msg.find("implausible payload length") != std::string::npos);
+            ::close(fd);
+        }
+
+        // (e) Unknown message type after a valid handshake.
+        // (f) Explicit BYE round-trip: OK, then the server closes.
+        for (int variant = 0; variant < 2; ++variant) {
+            int fd = connectRaw(p);
+            REQUIRE(fd >= 0);
+            std::vector<char> hello(proto::kMagic.begin(), proto::kMagic.end());
+            hello.push_back(static_cast<char>(proto::kProtocolVersion));
+            REQUIRE(proto::writeFrame(fd, proto::MsgType::Hello, hello));
+            auto hs = proto::readFrame(fd, 5000);
+            REQUIRE(hs.has_value());
+            REQUIRE(hs->type == proto::MsgType::Ok);
+
+            if (variant == 0) {
+                REQUIRE(proto::writeFrame(fd, static_cast<proto::MsgType>(0x7F), {}));
+                auto rsp = proto::readFrame(fd, 5000);
+                REQUIRE(rsp.has_value());
+                REQUIRE(rsp->type == proto::MsgType::Error);
+                auto [st, msg] = proto::decodeError(rsp->body);
+                REQUIRE(st == proto::kBadRequest);
+                REQUIRE(msg == "unknown message type");
+                // Connection must be closed after the violation (EOF next).
+                REQUIRE_FALSE(proto::readFrame(fd, 5000).has_value());
+            } else {
+                REQUIRE(proto::writeFrame(fd, proto::MsgType::Bye, {}));
+                auto rsp = proto::readFrame(fd, 5000);
+                REQUIRE(rsp.has_value());
+                REQUIRE(rsp->type == proto::MsgType::Ok);
+                auto [st, payload] = proto::decodeOk(rsp->body);
+                REQUIRE(st == proto::kOk);
+                REQUIRE(payload.empty());
+            }
+            ::close(fd);
+        }
+
+        // The point of the epilogue guarantee: after all of the above, stop()
+        // must join every worker cleanly and promptly (no hang, no abort).
+        server.stop();
+        REQUIRE(!server.isRunning());
+    }
+
+    SECTION("GET round-trip against the real cache") {
         TraceonServer server(cache, 0, "127.0.0.1");
         server.start();
         TraceonClient client("127.0.0.1", server.port());
@@ -249,16 +318,6 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         // A missing key is a definitive NOT_FOUND — never garbage.
         REQUIRE(!client.getView("missing").has_value());
         REQUIRE(!client.getView("").has_value());
-
-        REQUIRE(client.has("seq1"));
-        REQUIRE(client.has("seq2"));
-        REQUIRE(!client.has("missing"));
-
-        const TraceonStats st = client.stats();
-        REQUIRE(st.entries == records.size());
-        REQUIRE(st.format == FileFormat::DNA_FASTA);
-        REQUIRE(st.index_mode == IndexMode::GENOME);
-        REQUIRE(st.arena_bytes > 0);
 
         client.close();
         server.stop();

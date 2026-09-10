@@ -32,32 +32,7 @@
 #  include <intrin.h>
 #endif
 
-// Portable count-trailing-zeros (undefined if x == 0)
-namespace TracEon::detail {
-
-#if defined(_MSC_VER)
-#  pragma intrinsic(_BitScanForward)
-    inline int ctz32(unsigned int x) noexcept {
-        unsigned long i; _BitScanForward(&i, x); return static_cast<int>(i);
-    }
-#  if defined(_WIN64)
-#    pragma intrinsic(_BitScanForward64)
-    inline int ctz64(unsigned long long x) noexcept {
-        unsigned long i; _BitScanForward64(&i, x); return static_cast<int>(i);
-    }
-#  else
-    inline int ctz64(unsigned long long x) noexcept {
-        unsigned lo = static_cast<unsigned>(x);
-        if (lo) return ctz32(lo);
-        return 32 + ctz32(static_cast<unsigned>(x >> 32));
-    }
-#  endif
-#else
-    inline int ctz32(unsigned int x) noexcept { return __builtin_ctz(x); }
-    inline int ctz64(unsigned long long x) noexcept { return __builtin_ctzll(x); }
-#endif
-
-} // namespace TracEon::detail
+#include <bit>
 
 namespace TracEon {
 
@@ -79,8 +54,8 @@ namespace TracEon {
         uint64_t lo = vgetq_lane_u64(eq64, 0);
         uint64_t hi = vgetq_lane_u64(eq64, 1);
         if (lo | hi) {
-            if (lo) return ptr + (detail::ctz64(lo) >> 3);
-            else    return ptr + 8 + (detail::ctz64(hi) >> 3);
+            if (lo) return ptr + (std::countr_zero(lo) >> 3);
+            else    return ptr + 8 + (std::countr_zero(hi) >> 3);
         }
         ptr += 16;
     }
@@ -97,7 +72,7 @@ namespace TracEon {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
         __m256i eq = _mm256_cmpeq_epi8(chunk, needle);
         unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(eq));
-        if (mask) return ptr + detail::ctz32(mask);
+        if (mask) return ptr + std::countr_zero(mask);
         ptr += 32;
     }
     while (ptr < end) { if (*ptr == c) return ptr; ++ptr; }

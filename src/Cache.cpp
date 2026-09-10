@@ -78,8 +78,4 @@ namespace TracEon {
         return m_strategy->getDetectedFormat();
     }
 
-    IEncodingStrategy* Cache::getStrategy() const {
-        return m_strategy.get();
-    }
-
 } // namespace TracEon

@@ -2,7 +2,6 @@
 #define TRACEON_DECODEDRECORDTYPES_H
 
 #include <string>
-#include <optional> // Used to safely return a record that might not exist
 
 namespace TracEon {
 

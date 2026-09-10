@@ -63,8 +63,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            auto strategy = (TracEon::SmartStrategy*)cache.getStrategy();
-            std::vector<std::string> all_keys = strategy->getAllKeys();
+            std::vector<std::string> all_keys = cache.getAllKeys();
             
             if (all_keys.empty()) {
                 std::cerr << "Error: No keys found." << std::endl;

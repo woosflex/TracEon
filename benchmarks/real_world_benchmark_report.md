@@ -1,9 +1,9 @@
 # TracEon Real-World Benchmark Report
 
-Regenerated fresh from three harnesses:
-- `benchmarks/real_comparative_benchmark.py` — TracEon vs SeqTk/SeqKit/BioPython/PyFastX on real NCBI genomes + realistic FASTQ files (report §1).
-- `benchmarks/integrated_pipeline_benchmark.py` — total wall-clock time for a simulated repeated-use pipeline (parse once, reuse many times) vs re-doing the work from scratch each time with baseline tools (report §2).
-- `benchmarks/value_chain_benchmark.py` — **new** apples-to-apples value-chain story: parse-only vs parse+index, end-to-end repeated-use workflows, and capability comparison (report §3). This is the authoritative comparison; it fixes the apples problem in §1, where TracEon `load` (parse + full index + arena buffer) was compared against SeqKit `stats` (streaming parse + statistics, discards data).
+Regenerated fresh from the harness below (§1/§2 were produced by two
+harnesses since removed from the repo — `real_comparative_benchmark.py` and
+`integrated_pipeline_benchmark.py` — and are kept as historical results):
+- `benchmarks/value_chain_benchmark.py` — apples-to-apples value-chain story: parse-only vs parse+index, end-to-end repeated-use workflows, and capability comparison (report §3). This is the authoritative comparison; it fixes the apples problem in §1, where TracEon `load` (parse + full index + arena buffer) was compared against SeqKit `stats` (streaming parse + statistics, discards data).
 
 Environment: `traceon_bench` micromamba env (python 3.13.11, biopython 1.85, pyfastx 2.3.1, psutil 7.0.0, seqkit 2.12.0, seqtk 1.5). Driver: `build/traceon_driver` (x86-64, `CMAKE_BUILD_TYPE=Release`).
 
@@ -188,8 +188,6 @@ TracEon is **not a parser** — it is a **parse-once / cache-many / query-O(1) e
 ```bash
 cmake --build build --target traceon_driver -j
 cd benchmarks
-micromamba run -n traceon_bench python3 real_comparative_benchmark.py
-micromamba run -n traceon_bench python3 integrated_pipeline_benchmark.py
 micromamba run -n traceon_bench python3 value_chain_benchmark.py
 ```
 

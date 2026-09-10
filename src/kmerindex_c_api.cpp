@@ -11,11 +11,9 @@
 // Custom hash/equality replicating minimap2's exact khash instantiation
 // for its minimizer table (index.c: idx_hash/idx_eq) -- bit 0 of the key
 // is a flag both functions ignore, so a query with bit0=0 correctly finds
-// an entry stored with bit0=1. This is deliberately NOT the same as
-// TracEon::KmerIndex (Phase 1's validated generic packed-kmer index,
-// include/KmerIndex.h), which uses plain full-key equality -- reusing
-// that class here would silently produce wrong lookups on any minimizer
-// that was ever flagged as a singleton.
+// an entry stored with bit0=1. This is deliberately NOT plain full-key
+// equality (as a generic map would use): that would silently produce wrong
+// lookups on any minimizer that was ever flagged as a singleton.
 struct MinimizerKeyHash {
     using is_avalanching = void;
     size_t operator()(uint64_t k) const noexcept {
@@ -30,35 +28,19 @@ using MinimizerMap = ankerl::unordered_dense::map<uint64_t, uint64_t, MinimizerK
 
 struct kmerindex_t {
     MinimizerMap map;
-    // Phase-transition flag: set once the read phase begins
-    // (get/iter_begin/freeze), blocking insert/reserve so interior
-    // pointers returned by get() can never be invalidated by a later
-    // rehash. ATOMIC (not a plain bool): minimap2 performs concurrent
-    // lookups from mapping worker threads, and every get() WRITES the
-    // flag while a straggler insert()/reserve() READS it -- concurrent
-    // read/write on a plain bool is UB. The freeze paths use a RELEASE
-    // store (publishing all map writes done before the freeze) and the
-    // check paths an ACQUIRE load, so an insert that observes frozen==true
-    // happens-after every write published by the freeze. `mutable` because
-    // get()/iter_begin() take a const handle (reads) but still transition
-    // the index phase.
+    // Phase-transition flag: set once the read phase begins (get),
+    // blocking insert/reserve so interior pointers returned by get() can
+    // never be invalidated by a later rehash. ATOMIC (not a plain bool):
+    // minimap2 performs concurrent lookups from mapping worker threads,
+    // and every get() WRITES the flag while a straggler insert()/reserve()
+    // READS it -- concurrent read/write on a plain bool is UB. The freeze
+    // path uses a RELEASE store (publishing all map writes done before the
+    // freeze) and the check paths an ACQUIRE load, so an insert that
+    // observes frozen==true happens-after every write published by the
+    // freeze. `mutable` because get() takes a const handle (a read) but
+    // still transitions the index phase.
     mutable std::atomic<bool> frozen{false};
 };
-
-// Internal state stored inside the caller-owned opaque kmerindex_iter_t.
-// `magic` guards against iter_next() being called on an uninitialized
-// iterator; the ankerl const_iterator over a map is a pointer into the
-// map's value vector, so it stays valid as long as the (frozen) index is
-// alive and unmodified -- the caller must not destroy the index while an
-// iterator over it is live.
-struct KmerIndexIterState {
-    static constexpr uint64_t kMagic = 0x4B4D455249544552ull; // "KMERITER"
-    uint64_t magic = 0;
-    const MinimizerMap* map = nullptr;
-    MinimizerMap::const_iterator it{};
-};
-static_assert(sizeof(KmerIndexIterState) <= sizeof(kmerindex_iter_t),
-              "kmerindex_iter_t opaque storage too small for the internal iterator");
 
 namespace {
 
@@ -118,9 +100,9 @@ int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
         set_error("kmerindex_reserve: null handle");
         return 0;
     }
-    // ACQUIRE: observe a freeze published by get()/iter_begin()/freeze()
-    // (their RELEASE stores). If the index is frozen, fail BEFORE touching
-    // the map -- no mutation may race with the concurrent readers.
+    // ACQUIRE: observe a freeze published by get() (its RELEASE store). If
+    // the index is frozen, fail BEFORE touching the map -- no mutation may
+    // race with the concurrent readers.
     if (h->frozen.load(std::memory_order_acquire)) {
         set_error("kmerindex_reserve: index is frozen");
         return 0;
@@ -168,9 +150,9 @@ int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) noexcep
         set_error("kmerindex_insert: null handle");
         return 0;
     }
-    // ACQUIRE: observe a freeze published by get()/iter_begin()/freeze()
-    // (their RELEASE stores). If the index is frozen, fail BEFORE touching
-    // the map -- no mutation may race with the concurrent readers.
+    // ACQUIRE: observe a freeze published by get() (its RELEASE store). If
+    // the index is frozen, fail BEFORE touching the map -- no mutation may
+    // race with the concurrent readers.
     if (h->frozen.load(std::memory_order_acquire)) {
         set_error("kmerindex_insert: index is frozen");
         return 0;
@@ -228,68 +210,6 @@ const uint64_t* kmerindex_get(const kmerindex_t* h, uint64_t query_key,
         set_error("kmerindex_get: unknown error");
         return nullptr;
     }
-}
-
-int kmerindex_freeze(kmerindex_t* h) noexcept {
-    if (!h) {
-        set_error("kmerindex_freeze: null handle");
-        return 0;
-    }
-    // RELEASE store (see kmerindex_get): publishes the freeze so any
-    // concurrent/future insert/reserve ACQUIRE-load sees it.
-    h->frozen.store(true, std::memory_order_release);
-    clear_error();
-    return 1;
-}
-
-int kmerindex_iter_begin(const kmerindex_t* h, kmerindex_iter_t* out) noexcept {
-    if (!h) {
-        set_error("kmerindex_iter_begin: null handle");
-        return 0;
-    }
-    if (!out) {
-        set_error("kmerindex_iter_begin: null iterator");
-        return 0;
-    }
-    try {
-        auto* st = new (out->opaque) KmerIndexIterState();
-        st->magic = KmerIndexIterState::kMagic;
-        st->map = &h->map;
-        st->it = h->map.begin();
-        // Iteration is part of the read phase; RELEASE store (see
-        // kmerindex_get) so inserts/reserves observe the freeze.
-        h->frozen.store(true, std::memory_order_release);
-        clear_error();
-        return 1;
-    } catch (...) {
-        set_error("kmerindex_iter_begin: unknown error");
-        return 0;
-    }
-}
-
-int kmerindex_iter_next(kmerindex_iter_t* it, uint64_t* key_out, uint64_t* val_out) noexcept {
-    if (!it) {
-        set_error("kmerindex_iter_next: null iterator");
-        return 0;
-    }
-    if (!key_out || !val_out) {
-        set_error("kmerindex_iter_next: null output pointer");
-        return 0;
-    }
-    auto* st = reinterpret_cast<KmerIndexIterState*>(it->opaque);
-    if (st->magic != KmerIndexIterState::kMagic) {
-        set_error("kmerindex_iter_next: iterator not initialized (call kmerindex_iter_begin first)");
-        return 0;
-    }
-    if (!st->map || st->it == st->map->end()) {
-        clear_error();
-        return 0;
-    }
-    *key_out = st->it->first;
-    *val_out = st->it->second;
-    ++st->it;
-    clear_error();
-    return 1;
 }
 
 const char* kmerindex_last_error(const kmerindex_t* h) noexcept {

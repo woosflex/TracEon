@@ -1,7 +1,6 @@
 #ifndef TRACEON_SMARTSTRATEGY_H
 #define TRACEON_SMARTSTRATEGY_H
 
-#include "IEncodingStrategy.h"
 #include "MapDefs.h"
 
 #include <string>
@@ -23,11 +22,6 @@ enum class FileFormat : uint8_t {
     DNA_FASTA = 0x00, RNA_FASTA = 0x01, PROTEIN_FASTA = 0x02,
     DNA_FASTQ = 0x03, RNA_FASTQ = 0x04, PROTEIN_FASTQ = 0x05,
     UNKNOWN = 0xFF
-};
-
-enum class CompressionMode {
-    LZ4Default, ///< LZ4_compress_default() — fast, general case
-    LZ4HC,      ///< LZ4_compress_HC() — higher ratio for large nucleotide data
 };
 
 struct SequenceView {
@@ -53,13 +47,10 @@ using NGSIndex = HashMap<uint64_t, SequenceView>;
 
 enum class IndexMode { GENOME, NGS };
 
-class SmartStrategy : public IEncodingStrategy {
+class SmartStrategy {
 public:
     explicit SmartStrategy(IndexMode mode = IndexMode::GENOME);
-    virtual ~SmartStrategy();
-
-    std::vector<unsigned char> encode(const std::string& data, DataTypeHint hint = DataTypeHint::Generic) const override;
-    std::string decode(const std::vector<unsigned char>& data) const override;
+    ~SmartStrategy();
 
     /**
      * @brief Load file with automatic format detection.
@@ -273,8 +264,6 @@ private:
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
-    uint64_t hash_key(std::string_view key) const;
-
     void clearInternal();
 
     /**
@@ -292,20 +281,10 @@ private:
     void serializePayload(const std::function<void(const char*, size_t)>& sink) const;
 
     /**
-     * @brief Choose a compression algorithm based on payload size and detected format.
-     *
-     * Rules (in priority order):
-     *  1. payload_size > 10 MiB AND format is DNA/RNA → LZ4HC  (high repetition)
-     *  2. everything else                              → LZ4Default
-     */
-    CompressionMode selectCompressionStrategy(size_t payload_size) const;
-
-    /**
-     * @brief Serialized (uncompressed) payload size, used to pick LZ4 vs
-     * LZ4HC before streaming starts (selectCompressionStrategy() needs a
-     * size up front). Backed by serialized_size_estimate_, which is updated
-     * incrementally at every record insertion rather than recomputed by
-     * walking the whole map here.
+     * @brief Serialized (uncompressed) payload size, used to size the v4
+     * header before streaming starts. Backed by serialized_size_estimate_,
+     * which is updated incrementally at every record insertion rather than
+     * recomputed by walking the whole map here.
      */
     size_t estimatePayloadSize() const;
 

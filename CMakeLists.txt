@@ -40,10 +40,7 @@ add_subdirectory(third_party/lz4/build/cmake)
 # --- Source File Definitions (UPDATED PATHS) ---
 set(CORE_SOURCES
         src/Cache.cpp
-        src/IEncodingStrategy.cpp
         src/SmartStrategy.cpp
-        # MapDefs.h is a header, not a source, so strictly speaking not needed here
-        # but kept if you want IDEs to index it easily via add_library
 )
 
 # ── Remote read access (v2.3.0 "Harpe") ──────────────────────────────────────
@@ -71,25 +68,10 @@ else()
 endif()
 
 set(TEST_SOURCES
-        tests/main.cpp
         tests/CacheTests.cpp
         tests/FastqTests.cpp
         tests/MapDefsTests.cpp
-        # SmartStrategyTests.cpp was split into per-domain translation units;
-        # all core cases remain in the combined unit_tests target.
-        tests/test_parser_fastq.cpp
-        tests/test_parser_fasta.cpp
-        tests/test_gzip.cpp
-        tests/test_binary_cache.cpp
-        tests/test_lifecycle.cpp
-        tests/test_api_misc.cpp
 )
-
-# Remote access tests join the combined suite and get their own executable
-# (POSIX-only, matching the server/client).
-if(TRACEON_BUILD_SERVER AND NOT WIN32)
-    list(APPEND TEST_SOURCES tests/test_remote.cpp)
-endif()
 
 # --- Library Target ---
 add_library(traceon_core STATIC ${CORE_SOURCES})
@@ -183,9 +165,6 @@ enable_testing()
 
 add_executable(unit_tests ${TEST_SOURCES})
 target_link_libraries(unit_tests PRIVATE traceon_core Catch2::Catch2WithMain)
-if(TRACEON_BUILD_SERVER AND NOT WIN32)
-    target_link_libraries(unit_tests PRIVATE traceon_remote)
-endif()
 
 include(CTest)
 add_test(NAME TracEonTests COMMAND unit_tests)
@@ -226,8 +205,8 @@ endif()
 # the public umbrella header (TracEon.h), and is not linked into
 # traceon_core. It is an opt-in, separately built static library covering
 # the C shim for the minimap2-style minimizer table
-# (src/kmerindex_c_api.cpp) plus the header-only k-mer encoders/indexes
-# (KmerEncoding.h, KmerReferenceIndex.h).
+# (src/kmerindex_c_api.cpp) plus the header-only k-mer encoder
+# (KmerEncoding.h).
 add_library(traceon_kmer STATIC src/kmerindex_c_api.cpp)
 # Consumers need include/ for kmerindex_c_api.h + the header-only k-mer
 # headers; ankerl is an implementation detail of the shim only.
@@ -308,7 +287,6 @@ if(TRACEON_BUILD_FUZZERS)
         fuzz_fasta
         fuzz_kmer_encode
         fuzz_kmer_api
-        fuzz_trki
     )
     foreach(fuzz_target ${TRACEON_FUZZ_TARGETS})
         add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)

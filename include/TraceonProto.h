@@ -23,15 +23,11 @@
  *   Client -> Server
  *     HELLO 0x01  body: "TRO-RPC" (7 bytes) + protocol version (u8)
  *     GET   0x02  body: record key bytes (raw string)
- *     HAS   0x03  body: record key bytes (raw string)
- *     STATS 0x04  body: (empty)
  *     BYE   0x05  body: (empty)
  *
  *   Server -> Client
  *     OK       0x81  body: status(u8) | plen(u32 LE) | payload[plen] | crc32c(u32 LE)
  *     ERROR    0x82  body: status(u8) | mlen(u32 LE) | message[mlen]
- *     OK_STATS 0x83  body: entries(u64 LE) | format(u8) | index_mode(u8)
- *                       | arena_bytes(u64 LE) | crc32c(u32 LE)
  *
  * Integrity
  * ---------
@@ -43,7 +39,7 @@
  * (they only ever carry error codes + short human-readable text).
  *
  * Status codes (OK body status byte / ERROR body status byte):
- *   0 OK, 1 NOT_FOUND, 2 BAD_REQUEST, 3 INTERNAL, 4 CRC_MISMATCH
+ *   0 OK, 1 NOT_FOUND, 2 BAD_REQUEST
  *
  * @note POSIX-only (v2.3.0 scope): this header uses <sys/socket.h> fd
  * helpers. Windows support is out of scope for the remote slice.
@@ -82,12 +78,9 @@ inline constexpr std::string_view kMagic = "TRO-RPC";
 enum class MsgType : uint8_t {
     Hello    = 0x01,
     Get      = 0x02,
-    Has      = 0x03,
-    Stats    = 0x04,
     Bye      = 0x05,
     Ok       = 0x81,
     Error    = 0x82,
-    OkStats  = 0x83,
 };
 
 // Status / error codes.
@@ -95,8 +88,6 @@ enum Status : uint8_t {
     kOk          = 0,
     kNotFound    = 1,
     kBadRequest  = 2,
-    kInternal    = 3,
-    kCrcMismatch = 4,
 };
 
 // A decoded frame: the message type plus its raw body bytes (excluding the
@@ -145,32 +136,7 @@ inline std::vector<char> encodeFrame(MsgType type, const std::vector<char>& body
     return wire;
 }
 
-/**
- * Decode a frame from a buffer that begins at the 8-byte length prefix.
- * Returns {frame, bytes_consumed}. Throws std::runtime_error when the
- * advertised payload length exceeds kMaxMessageSize.
- */
-inline std::pair<Frame, size_t> decodeFrame(const char* buf, size_t avail) {
-    if (avail < kFrameHeaderSize) {
-        throw std::runtime_error("traceon protocol: truncated frame header");
-    }
-    const uint64_t payload_len = read_le64(buf);
-    if (payload_len == 0 || payload_len > kMaxMessageSize) {
-        throw std::runtime_error("traceon protocol: implausible payload length "
-                                 "(0 or > 64 MiB)");
-    }
-    const size_t total = static_cast<size_t>(payload_len) + kFrameHeaderSize;
-    if (avail < total) {
-        throw std::runtime_error("traceon protocol: truncated frame payload");
-    }
-    Frame f;
-    f.type  = static_cast<MsgType>(static_cast<uint8_t>(buf[kFrameHeaderSize]));
-    f.body.assign(buf + kFrameHeaderSize + 1,
-                  buf + kFrameHeaderSize + static_cast<size_t>(payload_len));
-    return {std::move(f), total};
-}
-
-// ── OK / ERROR / OK_STATS body builders and validators ───────────────────────
+// ── OK / ERROR body builders and validators ─────────────────────────
 /**
  * Build an OK body: status(u8) | plen(u32 LE) | payload | crc32c(u32 LE).
  * The CRC covers status + plen + payload (everything before the checksum).
@@ -235,46 +201,6 @@ inline std::pair<uint8_t, std::string> decodeError(const std::vector<char>& body
         throw std::runtime_error("traceon protocol: malformed ERROR frame (length mismatch)");
     }
     return {status, std::string(body.data() + 1 + 4, mlen)};
-}
-
-/** Build an OK_STATS body with the trailing CRC32C over its fixed fields. */
-inline std::vector<char> encodeOkStats(uint64_t entries, uint8_t format,
-                                       uint8_t index_mode, uint64_t arena_bytes) {
-    std::vector<char> body;
-    body.reserve(8 + 1 + 1 + 8 + 4);
-    append_le64(body, entries);
-    append_u8(body, format);
-    append_u8(body, index_mode);
-    append_le64(body, arena_bytes);
-    TracEon::Crc32c c;
-    c.update(body.data(), body.size());
-    append_le32(body, c.finalize());
-    return body;
-}
-
-struct OkStats {
-    uint64_t entries = 0;
-    uint8_t  format = 0xFF;
-    uint8_t  index_mode = 0;
-    uint64_t arena_bytes = 0;
-};
-
-inline OkStats decodeOkStats(const std::vector<char>& body) {
-    if (body.size() != 8 + 1 + 1 + 8 + 4) {
-        throw std::runtime_error("traceon protocol: malformed OK_STATS frame");
-    }
-    const uint32_t wire_crc = read_le32(body.data() + 8 + 1 + 1 + 8);
-    TracEon::Crc32c c;
-    c.update(body.data(), 8 + 1 + 1 + 8); // entries + format + mode + arena_bytes
-    if (c.finalize() != wire_crc) {
-        throw std::runtime_error("traceon protocol: CRC32C mismatch in OK_STATS frame");
-    }
-    OkStats s;
-    s.entries      = read_le64(body.data());
-    s.format       = static_cast<uint8_t>(body[8]);
-    s.index_mode   = static_cast<uint8_t>(body[9]);
-    s.arena_bytes  = read_le64(body.data() + 10);
-    return s;
 }
 
 // ── POSIX socket helpers (Linux/macOS; v2.3.0 scope) ─────────────────────────

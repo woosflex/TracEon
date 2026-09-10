@@ -30,18 +30,10 @@ void setBlocking(int fd) {
     ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 
-// Mark the connection dead and throw — used by getView()/stats() when the
+// Mark the connection dead and throw — used by getView() when the
 // read side of the transport fails mid-pair.
 [[noreturn]] void connectionDead() {
     throw std::runtime_error("TraceonClient: connection lost during request");
-}
-
-// Used by has(): a transport failure on a membership check must not be
-// reported as a definitive "absent" — but we cannot be sure of the answer.
-// The honest behavior is to throw: the caller asked for a definitive
-// boolean and the transport cannot provide one.
-[[noreturn]] bool miss() {
-    throw std::runtime_error("TraceonClient: connection lost during HAS request");
 }
 
 } // namespace
@@ -164,57 +156,6 @@ std::optional<std::string> TraceonClient::getView(const std::string& key) {
         throw std::runtime_error("TraceonClient: GET status " + std::to_string(st));
     }
     return std::string(payload);
-}
-
-bool TraceonClient::has(const std::string& key) {
-    std::lock_guard<std::mutex> lock(io_mu_);
-    if (!open_.load(std::memory_order_acquire) || fd_ < 0) {
-        throw std::logic_error("TraceonClient: connection is closed");
-    }
-    std::vector<char> body(key.begin(), key.end());
-    if (!proto::writeFrame(fd_, proto::MsgType::Has, body)) miss();
-    auto rsp = proto::readFrame(fd_, recv_timeout_ms_);
-    if (!rsp) miss();
-    if (rsp->type == proto::MsgType::Error) {
-        auto [st, msg] = proto::decodeError(rsp->body);
-        throw std::runtime_error("TraceonClient: server error (status " +
-                                 std::to_string(st) + "): " + msg);
-    }
-    if (rsp->type != proto::MsgType::Ok) {
-        throw std::runtime_error("TraceonClient: unexpected response type");
-    }
-    auto [st, payload] = proto::decodeOk(rsp->body); // CRC32C verified here
-    if (st != proto::kOk) {
-        throw std::runtime_error("TraceonClient: HAS status " + std::to_string(st));
-    }
-    return !payload.empty() && payload[0] != 0;
-}
-
-TraceonStats TraceonClient::stats() {
-    std::lock_guard<std::mutex> lock(io_mu_);
-    if (!open_.load(std::memory_order_acquire) || fd_ < 0) {
-        throw std::logic_error("TraceonClient: connection is closed");
-    }
-    if (!proto::writeFrame(fd_, proto::MsgType::Stats, {})) {
-        throw std::runtime_error("TraceonClient: failed to send STATS");
-    }
-    auto rsp = proto::readFrame(fd_, recv_timeout_ms_);
-    if (!rsp) throw std::runtime_error("TraceonClient: no STATS response");
-    if (rsp->type == proto::MsgType::Error) {
-        auto [st, msg] = proto::decodeError(rsp->body);
-        throw std::runtime_error("TraceonClient: server error (status " +
-                                 std::to_string(st) + "): " + msg);
-    }
-    if (rsp->type != proto::MsgType::OkStats) {
-        throw std::runtime_error("TraceonClient: unexpected response type for STATS");
-    }
-    const proto::OkStats s = proto::decodeOkStats(rsp->body); // CRC32C verified
-    TraceonStats out;
-    out.entries     = s.entries;
-    out.format      = static_cast<FileFormat>(s.format);
-    out.index_mode  = static_cast<IndexMode>(s.index_mode);
-    out.arena_bytes = s.arena_bytes;
-    return out;
 }
 
 void TraceonClient::close() {

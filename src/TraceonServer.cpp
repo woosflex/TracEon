@@ -192,11 +192,14 @@ void TraceonServer::unregisterClient(int fd) {
 
 void TraceonServer::handleClient(int fd) {
     registerClient(fd);
-    bool clean = false;
     try {
+        // All early returns below exit this lambda, never the function, so
+        // the unregister/shutdown/close epilogue after the try/catch always
+        // runs exactly once per connection (no descriptor or bookkeeping leak).
+        [&] {
         // ── HELLO handshake ───────────────────────────────────────────────
         auto first = proto::readFrame(fd, recv_timeout_ms_);
-        if (!first) { clean = true; return; }
+        if (!first) return;
         if (first->type != proto::MsgType::Hello) {
             proto::writeFrame(fd, proto::MsgType::Error,
                               proto::encodeError(proto::kBadRequest,
@@ -226,7 +229,6 @@ void TraceonServer::handleClient(int fd) {
 
         // ── Request dispatch loop ─────────────────────────────────────────
         while (auto req = proto::readFrame(fd, recv_timeout_ms_)) {
-            bool close_after = false;
             switch (req->type) {
                 case proto::MsgType::Get: {
                     const std::string key(req->body.begin(), req->body.end());
@@ -246,26 +248,6 @@ void TraceonServer::handleClient(int fd) {
                     }
                     break;
                 }
-                case proto::MsgType::Has: {
-                    const std::string key(req->body.begin(), req->body.end());
-                    std::vector<char> payload(1, cache_.hasSequence(key) ? 1 : 0);
-                    if (!proto::writeFrame(fd, proto::MsgType::Ok,
-                                           proto::encodeOk(proto::kOk, payload))) {
-                        return;
-                    }
-                    break;
-                }
-                case proto::MsgType::Stats: {
-                    uint64_t entries = static_cast<uint64_t>(cache_.size());
-                    uint8_t fmt = static_cast<uint8_t>(cache_.getDetectedFormat());
-                    uint8_t mode = static_cast<uint8_t>(cache_.getIndexMode());
-                    uint64_t arena = static_cast<uint64_t>(cache_.getArenaBytes());
-                    if (!proto::writeFrame(fd, proto::MsgType::OkStats,
-                                           proto::encodeOkStats(entries, fmt, mode, arena))) {
-                        return;
-                    }
-                    break;
-                }
                 case proto::MsgType::Bye:
                     proto::writeFrame(fd, proto::MsgType::Ok, proto::encodeOk(proto::kOk, {}));
                     return;
@@ -273,12 +255,10 @@ void TraceonServer::handleClient(int fd) {
                     proto::writeFrame(fd, proto::MsgType::Error,
                                       proto::encodeError(proto::kBadRequest,
                                                          "unknown message type"));
-                    close_after = true;
-                    break;
+                    return;
             }
-            if (close_after) return;
         }
-        clean = true;
+        }(); // end of scoped request body; epilogue below always runs
     } catch (const std::exception& e) {
         // Protocol violations (bad length prefix, corrupt frame) — send
         // an ERROR when the connection is still usable, then close.
@@ -291,7 +271,6 @@ void TraceonServer::handleClient(int fd) {
     unregisterClient(fd);
     ::shutdown(fd, SHUT_RDWR);
     ::close(fd);
-    (void)clean;
 }
 
 void TraceonServer::stop() {
@@ -324,7 +303,10 @@ void TraceonServer::stop() {
         workers_.clear();
         client_fds_.clear();
         running_ = false;
-        stopping_ = false;
+        // NOTE: stopping_ is deliberately NOT reset here. The accept loop can
+        // still be between its final stopping_ re-check and a worker spawn
+        // until the joins below complete; resetting it now would let that
+        // spawn slip into the cleared workers_ unjoined. start() resets it.
     }
     // Join first: the accept loop must have returned before we tear down the
     // listener and wake pipe, so we never close an fd it is still poll()ing.

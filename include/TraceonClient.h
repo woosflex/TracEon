@@ -29,17 +29,8 @@
 #include <mutex>
 
 #include "TraceonProto.h"
-#include "SmartStrategy.h" // FileFormat / IndexMode enums
 
 namespace TracEon {
-
-/** Server statistics as reported by the STATS message (OK_STATS). */
-struct TraceonStats {
-    uint64_t  entries = 0;
-    FileFormat format = FileFormat::UNKNOWN;
-    IndexMode  index_mode = IndexMode::GENOME;
-    uint64_t  arena_bytes = 0;
-};
 
 class TraceonClient {
 public:
@@ -62,12 +53,6 @@ public:
      * or a CRC32C mismatch on the wire (connection is closed afterwards).
      */
     std::optional<std::string> getView(const std::string& key);
-
-    /** True iff the key exists in the served cache. */
-    bool has(const std::string& key);
-
-    /** Fetch server statistics (entries, format, index mode, arena bytes). */
-    TraceonStats stats();
 
     /** Send BYE (best-effort) and close the connection. Idempotent. */
     void close();

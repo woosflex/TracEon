@@ -54,36 +54,21 @@
  * ---------------------------------------------------------------------------
  * kmerindex_get() returns an interior pointer into the index. To prevent
  * dangling-pointer hazards from a later rehash, the index is FROZEN once
- * any of the following happens (whichever comes first):
- *   * kmerindex_get() is called,
- *   * kmerindex_iter_begin() is called, or
- *   * kmerindex_freeze() is called explicitly.
- * After freezing, kmerindex_insert() and kmerindex_reserve() fail with
- * return 0 and last_error "index is frozen". Read operations (get, size,
- * iteration) remain valid and safe after freezing.
+ * kmerindex_get() is called. After freezing, kmerindex_insert() and
+ * kmerindex_reserve() fail with return 0 and last_error "index is frozen".
+ * Read operations (get, size) remain valid and safe after freezing.
  *
  * THREAD SAFETY: the freeze flag is an atomic<bool> with release/acquire
- * ordering. get()/iter_begin()/freeze() publish the freeze with a RELEASE
- * store; insert()/reserve() check it with an ACQUIRE load before mutating.
- * Concurrent lookups from multiple threads (minimap2 mapping workers) may
- * therefore race with insert/reserve attempts on the flag itself without
- * UB, and any insert that observes the freeze is guaranteed to see every
- * map write published before it. Concurrent get()/size()/iteration on a
- * frozen index are safe (no mutation, no shared mutable state). The build
- * phase (insert/reserve) must itself be single-threaded or otherwise
- * externally serialized -- the freeze only guards the read/write
- * transition, not concurrent mutators.
- *
- * ---------------------------------------------------------------------------
- * ITERATION (caller-owned, reentrant)
- * ---------------------------------------------------------------------------
- * kmerindex_iter_t is an opaque, FIXED-SIZE structure owned by the caller
- * (stack-allocatable in C). Each iter_begin/iter_next pair uses its own
- * private cursor -- no shared mutable state lives in the index, so two
- * iterators over the same index can be interleaved freely, and iteration
- * is safe for concurrent readers of a frozen index. An iterator must be
- * initialized with kmerindex_iter_begin() before kmerindex_iter_next().
- * iter_begin() freezes the index (see above).
+ * ordering. get() publishes the freeze with a RELEASE store; insert()/
+ * reserve() check it with an ACQUIRE load before mutating. Concurrent
+ * lookups from multiple threads (minimap2 mapping workers) may therefore
+ * race with insert/reserve attempts on the flag itself without UB, and
+ * any insert that observes the freeze is guaranteed to see every map
+ * write published before it. Concurrent get()/size() on a frozen index
+ * are safe (no mutation, no shared mutable state). The build phase
+ * (insert/reserve) must itself be single-threaded or otherwise externally
+ * serialized -- the freeze only guards the read/write transition, not
+ * concurrent mutators.
  */
 
 #include <stdint.h>
@@ -99,13 +84,6 @@ extern "C" {
 #endif
 
 typedef struct kmerindex_t kmerindex_t;
-
-/* Caller-owned opaque iterator. The fixed size (4 pointers) is a public
- * ABI commitment: the internal C++ cursor must fit inside it (checked by
- * static_assert in the implementation). */
-typedef struct kmerindex_iter_t {
-    void* opaque[4];
-} kmerindex_iter_t;
 
 /* Creates a new empty index. Returns NULL (and records an error) on
  * allocation failure. */
@@ -142,8 +120,8 @@ size_t kmerindex_size(const kmerindex_t* h) TRACEON_CAPI_NOEXCEPT;
  *       frozen, OR the handle is NULL. Distinguish via
  *       kmerindex_last_error() (empty string = plain collision).
  *   -1  a C++ exception was caught (e.g. std::bad_alloc on rehash).
- * Fails (0, "index is frozen") once kmerindex_get()/iter_begin()/freeze()
- * has begun the read phase. */
+ * Fails (0, "index is frozen") once kmerindex_get() has begun the read
+ * phase. */
 int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) TRACEON_CAPI_NOEXCEPT;
 
 /* Looks up `query_key` (bit0 always 0, as index.c constructs it fresh per
@@ -156,20 +134,6 @@ int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) TRACEON
  * (NULL handle or NULL matched_key_out). FREEZES the index. */
 const uint64_t* kmerindex_get(const kmerindex_t* h, uint64_t query_key,
                                uint64_t* matched_key_out) TRACEON_CAPI_NOEXCEPT;
-
-/* Explicitly freezes the index: subsequent insert/reserve fail. Returns 1
- * on success, 0 on a NULL handle. Read operations remain available. */
-int kmerindex_freeze(kmerindex_t* h) TRACEON_CAPI_NOEXCEPT;
-
-/* Initializes the caller-owned iterator `out` over the index `h`. Returns
- * 1 on success, 0 on error (NULL handle/iterator). FREEZES the index. */
-int kmerindex_iter_begin(const kmerindex_t* h, kmerindex_iter_t* out) TRACEON_CAPI_NOEXCEPT;
-
-/* Advances the caller-owned iterator; yields one (stored_key, value) pair
- * per call, in no particular order. Returns 1 while entries remain, 0 at
- * end or on error (NULL iterator/outputs). Reentrant: independent cursors
- * per kmerindex_iter_t. */
-int kmerindex_iter_next(kmerindex_iter_t* it, uint64_t* key_out, uint64_t* val_out) TRACEON_CAPI_NOEXCEPT;
 
 /* Thread-local diagnostic for the last failed call in the calling thread.
  * Never NULL; empty string if the last call succeeded. Backed by a fixed,

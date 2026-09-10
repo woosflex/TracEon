@@ -187,6 +187,11 @@ def run_benchmark(label, fmt, size_mb, avg_len):
     return res
 
 def main():
+    global FILE_SIZES_MB, DATA_TYPES
+    if "--quick" in sys.argv:
+        # Reduced matrix for fast sanity checks (replaces quick_benchmark.py).
+        FILE_SIZES_MB = [10]
+        DATA_TYPES = DATA_TYPES[:3]
     if not os.path.exists(TRACEON_BINARY):
         print("Compile driver first!")
         sys.exit(1)

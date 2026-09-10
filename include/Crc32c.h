@@ -233,9 +233,4 @@ private:
 #endif
 }
 
-/** @brief Name of the implementation the dispatcher selected on this CPU. */
-[[nodiscard]] inline const char* crc32c_active_impl() noexcept {
-    return detail::crc32c_impl_name();
-}
-
 } // namespace TracEon

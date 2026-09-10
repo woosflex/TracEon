@@ -7,7 +7,6 @@
 #include <memory>
 #include <optional>
 
-#include "IEncodingStrategy.h"
 #include "DecodedRecordTypes.h"
 #include "SmartStrategy.h"
 
@@ -164,9 +163,6 @@ namespace TracEon {
          * @brief Detected format of the loaded data (UNKNOWN when empty).
          */
         FileFormat getDetectedFormat() const;
-
-        // --- Internal / Diagnostics ---
-        IEncodingStrategy* getStrategy() const;
 
     private:
         std::unique_ptr<SmartStrategy> m_strategy;

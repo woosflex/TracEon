@@ -54,33 +54,13 @@ int main(void) {
     if (strstr(kmerindex_last_error(h), "frozen") == NULL)
         return fail("frozen error message expected", 11);
 
-    /* caller-owned iteration over the frozen index */
-    kmerindex_iter_t it;
-    if (kmerindex_iter_begin(h, &it) != 1) return fail("iter_begin failed", 12);
-    uint64_t k = 0, val = 0;
-    int n = 0;
-    while (kmerindex_iter_next(&it, &k, &val) == 1) ++n;
-    if (n != 1) return fail("iteration must visit exactly 1 entry", 13);
-    if (k != 3 || val != 10) return fail("iteration must yield (3, 10)", 14);
+    /* reads still work on the frozen index; miss freezes too */
+    v = kmerindex_get(h, 2, &matched);
+    if (!v || *v != 10) return fail("get after freeze must still hit", 12);
 
-    /* iter_next on an uninitialized iterator must fail cleanly, not crash */
-    kmerindex_iter_t uninit;
-    memset(&uninit, 0, sizeof(uninit));
-    if (kmerindex_iter_next(&uninit, &k, &val) != 0)
-        return fail("iter_next on uninitialized iterator must return 0", 15);
-
-    /* explicit freeze + null-handle sweep */
-    kmerindex_t* h2 = kmerindex_create();
-    if (!h2) return fail("second create returned NULL", 16);
-    if (kmerindex_freeze(h2) != 1) return fail("freeze failed", 17);
-    if (kmerindex_insert(h2, 8, 30) != 0) return fail("insert after freeze must return 0", 18);
-    kmerindex_destroy(h2);
-
-    if (kmerindex_size(NULL) != 0) return fail("size(NULL) must return 0", 19);
-    if (kmerindex_get(NULL, 1, &matched) != NULL) return fail("get(NULL) must return NULL", 20);
-    if (kmerindex_iter_begin(h, NULL) != 0) return fail("iter_begin(NULL out) must return 0", 21);
-    if (kmerindex_iter_next(NULL, &k, &val) != 0) return fail("iter_next(NULL) must return 0", 22);
-    if (kmerindex_get(h, 1, NULL) != NULL) return fail("get(NULL out) must return NULL", 23);
+    if (kmerindex_size(NULL) != 0) return fail("size(NULL) must return 0", 13);
+    if (kmerindex_get(NULL, 1, &matched) != NULL) return fail("get(NULL) must return NULL", 14);
+    if (kmerindex_get(h, 1, NULL) != NULL) return fail("get(NULL out) must return NULL", 15);
 
     kmerindex_destroy(h);
     puts("kmer_c_compile_test: OK (C99 compile + link + runtime contract)");

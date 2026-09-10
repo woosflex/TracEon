@@ -47,7 +47,7 @@ jobs:
       run: |
         cmake --build build-fuzz -j 4 --target \
           fuzz_v4_loader fuzz_gzip_loader fuzz_fastq fuzz_fasta \
-          fuzz_kmer_encode fuzz_kmer_api fuzz_trki
+          fuzz_kmer_encode fuzz_kmer_api
 
     # The multithreaded FASTQ/FASTA parsers only engage above the 10MB
     # threshold (MULTITHREAD_THRESHOLD in parseArena()). Shipping 10MB+ seed
@@ -103,7 +103,6 @@ jobs:
           [fuzz_fasta]="fuzz/corpus/fasta"
           [fuzz_kmer_encode]="fuzz/corpus/kmer_encode"
           [fuzz_kmer_api]="fuzz/corpus/kmer_api"
-          [fuzz_trki]="fuzz/corpus/trki"
         )
         for target in "${!corpus[@]}"; do
           echo "== fuzzing $target (seed corpus: ${corpus[$target]}) =="
