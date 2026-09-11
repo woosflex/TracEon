@@ -264,6 +264,9 @@ private:
     void determine_format_from_cache();
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
+    // Hash an NGS record id into its map key (GENOME keys use the raw view).
+    uint64_t hash_key(std::string_view key) const;
+
     void clearInternal();
 
     /**

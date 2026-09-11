@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No unreleased changes documented yet.
+### Changed
+
+- **Breaking (C API):** removed the unused `kmerindex_freeze`,
+  `kmerindex_iter_begin`, and `kmerindex_iter_next` exports from the k-mer
+  shim. The index now freezes on the first `kmerindex_get()` call
+  (contract unchanged and documented in `include/kmerindex_c_api.h`).
+  Stale callers fail at link time with an undefined reference to the
+  removed symbol. No in-tree callers existed.
+- **Breaking (remote protocol):** removed the unused `HAS` / `STATS` /
+  `OK_STATS` messages and the `kInternal` / `kCrcMismatch` status codes.
+  Only the HELLO/GET/BYE read path remains; see ADR-006 for the recorded
+  design and the post-ADR removal note.
+- Removed other dead public API surface and development-only artifacts from
+  the repository (KmerIndex.h, KmerReferenceIndex.h, unused benchmarks).
+- Hardened remote connection cleanup and added regression coverage for remote
+  lifecycle and shutdown paths.
+- Kept the v2.3.0 benchmark report as historical provenance; current-checkout
+  validation is reported separately until the next release is tagged.
 
 ## [2.3.0] - 2026-08-20
 

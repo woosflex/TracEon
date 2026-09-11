@@ -129,6 +129,12 @@ SmartStrategy::SmartStrategy(IndexMode mode)
       file_cache_(mode == IndexMode::NGS ? std::variant<GenomeIndex, NGSIndex>(NGSIndex{}) : std::variant<GenomeIndex, NGSIndex>(GenomeIndex{})) {}
 SmartStrategy::~SmartStrategy() { clearCache(); }
 
+// NGS keys are hashed ids (GENOME keys are raw id views). One-liner kept
+// as a named intent marker across the call sites.
+inline uint64_t SmartStrategy::hash_key(std::string_view key) const {
+    return std::hash<std::string_view>{}(key);
+}
+
 void SmartStrategy::clearInternal() {
     // ── Reader-quiescence diagnostic (TRACEON_DEBUG_LIFECYCLE, opt-in) ──────
     // Detects a getView() call whose LOOKUP overlaps this teardown. It cannot
@@ -205,7 +211,7 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
     if (std::holds_alternative<GenomeIndex>(file_cache_)) {
         if (std::get<GenomeIndex>(file_cache_).count(id) > 0) return;
     } else {
-        if (std::get<NGSIndex>(file_cache_).count(std::hash<std::string_view>{}(id)) > 0) return;
+        if (std::get<NGSIndex>(file_cache_).count(hash_key(id)) > 0) return;
     }
 
     // OOM guard: manual_store_ is the only remaining unbounded growth path
@@ -262,7 +268,7 @@ void SmartStrategy::addEntry(const std::string& id, const std::string& seq, cons
         serialized_size_estimate_.fetch_add(
             3 * sizeof(uint32_t) + id.size() + seq.size() + qual.size(), std::memory_order_relaxed);
     } else {
-        std::get<NGSIndex>(file_cache_).emplace(std::hash<std::string_view>{}(id), SequenceView{id_view, seq_view, qual_view});
+        std::get<NGSIndex>(file_cache_).emplace(hash_key(id), SequenceView{id_view, seq_view, qual_view});
         serialized_size_estimate_.fetch_add(
             sizeof(uint64_t) + 3 * sizeof(uint32_t) + id.size() + seq.size() + qual.size(),
             std::memory_order_relaxed);
@@ -1048,7 +1054,7 @@ template <typename MapType> void SmartStrategy::parseFastaMultithreadedTemplate(
             std::string_view seq(seq_start, seq_end - seq_start);
             if (!id.empty() && !seq.empty()) {
                 if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(id, SequenceView{id, seq, {}}); }
-                else { thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, {}}); }
+                else { thread_caches[thread_id].emplace(hash_key(id), SequenceView{id, seq, {}}); }
             }
         }
     };
@@ -1160,7 +1166,7 @@ template <typename MapType> void SmartStrategy::parseFastqMultithreadedTemplate(
             std::string_view qual(qual_start, qual_end - qual_start);
             if (!id.empty() && !seq.empty()) {
                 if constexpr (std::is_same_v<MapType, GenomeIndex>) { thread_caches[thread_id].emplace(id, SequenceView{id, seq, qual}); }
-                else { thread_caches[thread_id].emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, qual}); }
+                else { thread_caches[thread_id].emplace(hash_key(id), SequenceView{id, seq, qual}); }
             }
         }
     };
@@ -1187,7 +1193,7 @@ template <typename MapType> void SmartStrategy::parseFastaInternal(std::string_v
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start);
         if (!id.empty() && !seq.empty()) {
             if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(id, SequenceView{id, seq, {}}); }
-            else { map.emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, {}}); }
+            else { map.emplace(hash_key(id), SequenceView{id, seq, {}}); }
         }
     }
 }
@@ -1218,7 +1224,7 @@ template <typename MapType> void SmartStrategy::parseFastqInternal(std::string_v
         std::string_view id(id_start, id_end - id_start); std::string_view seq(seq_start, seq_end - seq_start); std::string_view qual(qual_start, qual_end - qual_start);
         if (!id.empty() && !seq.empty()) {
             if constexpr (std::is_same_v<MapType, GenomeIndex>) { map.emplace(id, SequenceView{id, seq, qual}); }
-            else { map.emplace(std::hash<std::string_view>{}(id), SequenceView{id, seq, qual}); }
+            else { map.emplace(hash_key(id), SequenceView{id, seq, qual}); }
         }
     }
 }
@@ -1692,7 +1698,7 @@ std::string_view SmartStrategy::getView(const std::string_view& sequence_id) con
             if (it != map.end()) return it->second.sequence;
         } else {
             const auto& map = std::get<NGSIndex>(file_cache_);
-            uint64_t h = std::hash<std::string_view>{}(sequence_id); 
+            uint64_t h = hash_key(sequence_id);
             auto it = map.find(h);
             if (it != map.end() && it->second.id == sequence_id) return it->second.sequence;
         }
@@ -1711,7 +1717,7 @@ std::string SmartStrategy::getQuality(const std::string& sequence_id) const {
             return (it != map.end()) ? std::string(it->second.quality) : "";
         } else {
             auto& map = std::get<NGSIndex>(file_cache_);
-            auto it = map.find(std::hash<std::string_view>{}(sequence_id));
+            auto it = map.find(hash_key(sequence_id));
             return (it != map.end() && it->second.id == sequence_id) ? std::string(it->second.quality) : "";
         }
     }
@@ -1724,7 +1730,7 @@ bool SmartStrategy::hasSequence(const std::string& sequence_id) const {
             return std::get<GenomeIndex>(file_cache_).count(sequence_id) > 0;
         } else {
             auto& map = std::get<NGSIndex>(file_cache_);
-            auto it = map.find(std::hash<std::string_view>{}(sequence_id));
+            auto it = map.find(hash_key(sequence_id));
             return (it != map.end() && it->second.id == sequence_id);
         }
     }
