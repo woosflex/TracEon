@@ -438,7 +438,8 @@ inline std::optional<Frame> readFrameUntil(int fd, IoDeadline deadline) {
             throw std::runtime_error("traceon protocol: truncated frame payload");
         if (f.body.size() + to_read > f.body.capacity()) {
             const size_t needed = f.body.size() + to_read;
-            const size_t target = std::min(payload_len - 1, std::max(needed, f.body.capacity() * 2));
+            const size_t target = std::min(static_cast<size_t>(payload_len - 1),
+                                           std::max(needed, f.body.capacity() * 2));
             f.body.reserve(target);
         }
         f.body.insert(f.body.end(), chunk, chunk + to_read);
