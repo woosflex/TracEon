@@ -58,6 +58,11 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
+#include <csignal>
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
 #endif
 
 #include <cstdint>
@@ -359,13 +364,19 @@ inline bool readFullUntil(int fd, char* buf, size_t n, IoDeadline deadline) {
     while (got < n) {
         const int remaining = remainingMillis(deadline);
         if (remaining == 0) return false;
+        const int poll_timeout = std::min(remaining, 200);
         struct pollfd p{fd, POLLIN, 0};
-        const int pr = ::poll(&p, 1, remaining);
-        if (pr == 0) return false;
+        const int pr = ::poll(&p, 1, poll_timeout);
+        if (pr == 0) {
+            if (remainingMillis(deadline) == 0) return false;
+            continue;
+        }
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
         }
+        if (p.revents & (POLLERR | POLLNVAL)) return false;
+        if ((p.revents & POLLHUP) && !(p.revents & POLLIN)) return false;
         const ssize_t r = ::recv(fd, buf + got, n - got, MSG_DONTWAIT);
         if (r == 0) return false;
         if (r < 0) {
@@ -383,13 +394,21 @@ inline bool readFull(int fd, char* buf, size_t n, int timeout_ms = kReadTimeoutM
 
 /** Write all bytes before one caller-owned absolute deadline. */
 inline bool writeAllUntil(int fd, const char* buf, size_t n, IoDeadline deadline) {
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     size_t sent = 0;
     while (sent < n) {
         const int remaining = remainingMillis(deadline);
         if (remaining == 0) return false;
+        const int poll_timeout = std::min(remaining, 200);
         struct pollfd p{fd, POLLOUT, 0};
-        const int pr = ::poll(&p, 1, remaining);
-        if (pr == 0) return false;
+        const int pr = ::poll(&p, 1, poll_timeout);
+        if (pr == 0) {
+            if (remainingMillis(deadline) == 0) return false;
+            continue;
+        }
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;

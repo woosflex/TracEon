@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <utility>
 #include <algorithm>
+#include <csignal>
 #include <openssl/evp.h>
 
 namespace TracEon {
@@ -102,6 +103,9 @@ TraceonServer::TraceonServer(Cache& cache, uint16_t port, std::string host,
 TraceonServer::~TraceonServer() { stop(); }
 
 void TraceonServer::start() {
+#ifndef _WIN32
+    (void)::signal(SIGPIPE, SIG_IGN);
+#endif
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mu_);
     std::lock_guard<std::mutex> lock(mu_);
     if (running_) {

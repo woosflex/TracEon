@@ -19,17 +19,36 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <csignal>
 #endif
 
 using namespace TracEon;
 
 namespace {
 
+#ifndef _WIN32
+struct RemoteSigpipeIgnore {
+    RemoteSigpipeIgnore() {
+        (void)::signal(SIGPIPE, SIG_IGN);
+    }
+} g_remote_sigpipe_ignore;
+#endif
+
+static int configureTestSocket(int fd) {
+    if (fd >= 0) {
+#if defined(SO_NOSIGPIPE)
+        int one = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    }
+    return fd;
+}
+
 // Bind an ephemeral loopback socket, read back the OS-assigned port, close
 // it, and return that port. Best-effort "nothing is listening here" probe
 // for connect-refused tests (tiny race window; the caller retries).
 uint16_t unusedPort() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int fd = configureTestSocket(::socket(AF_INET, SOCK_STREAM, 0));
     if (fd < 0) throw std::runtime_error("unusedPort: socket() failed");
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -54,7 +73,7 @@ uint16_t unusedPort() {
 // Raw TCP connect to 127.0.0.1:port for protocol-violation tests. Returns
 // -1 (after closing) on any failure instead of throwing.
 static int connectRaw(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int fd = configureTestSocket(::socket(AF_INET, SOCK_STREAM, 0));
     if (fd < 0) return -1;
     sockaddr_in a{};
     a.sin_family = AF_INET;
@@ -78,6 +97,8 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
     SECTION("writeAll obeys its total deadline under backpressure") {
         int sv[2];
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        configureTestSocket(sv[0]);
+        configureTestSocket(sv[1]);
         int small = 4096;
         REQUIRE(::setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
         const std::vector<char> body(2u * 1024u * 1024u, 'X');
@@ -92,12 +113,15 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
     SECTION("readFrame uses one absolute deadline across header and payload") {
         int sv[2];
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        configureTestSocket(sv[0]);
+        configureTestSocket(sv[1]);
         const auto wire = proto::encodeFrame(proto::MsgType::Get,
                                               std::vector<char>(32, 'X'));
-        std::jthread trickle([&] {
+        std::jthread trickle([&](std::stop_token st) {
             (void)::send(sv[1], wire.data(), proto::kFrameHeaderSize, MSG_NOSIGNAL);
-            for (size_t i = proto::kFrameHeaderSize; i < wire.size(); ++i) {
+            for (size_t i = proto::kFrameHeaderSize; i < wire.size() && !st.stop_requested(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                if (st.stop_requested()) break;
                 if (::send(sv[1], wire.data() + i, 1, MSG_NOSIGNAL) != 1) break;
             }
             ::close(sv[1]);
@@ -105,6 +129,7 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         const auto start = std::chrono::steady_clock::now();
         REQUIRE_THROWS_AS(proto::readFrame(sv[0], 70), std::runtime_error);
         REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+        trickle.request_stop();
         ::close(sv[0]);
         trickle.join();
     }
@@ -113,6 +138,8 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         {
             int sv[2];
             REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            configureTestSocket(sv[0]);
+            configureTestSocket(sv[1]);
             std::vector<char> wire;
             proto::append_le64(wire, proto::kMaxMessageSize);
             REQUIRE(::write(sv[1], wire.data(), wire.size()) == static_cast<ssize_t>(wire.size()));
@@ -128,6 +155,8 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         {
             int sv[2];
             REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            configureTestSocket(sv[0]);
+            configureTestSocket(sv[1]);
             std::vector<char> wire;
             proto::append_le64(wire, proto::kMaxMessageSize);
             proto::append_u8(wire, static_cast<uint8_t>(proto::MsgType::Get));
@@ -181,7 +210,7 @@ TEST_CASE("remote client closes after transport, protocol, or CRC failure",
           "[remote][client][failure]") {
     using FaultResponse = std::optional<std::pair<proto::MsgType, std::vector<char>>>;
     auto exercise = [](FaultResponse response, bool fastq = false, bool handshake_fault = false, bool batch = false) {
-        int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        int listener = configureTestSocket(::socket(AF_INET, SOCK_STREAM, 0));
         REQUIRE(listener >= 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -194,7 +223,13 @@ TEST_CASE("remote client closes after transport, protocol, or CRC failure",
         const uint16_t port = ntohs(addr.sin_port);
 
         std::jthread peer([listener, response = std::move(response), fastq, handshake_fault, batch] {
-            const int fd = ::accept(listener, nullptr, nullptr);
+            struct pollfd p{listener, POLLIN, 0};
+            int pr = ::poll(&p, 1, 5000);
+            if (pr <= 0 || !(p.revents & POLLIN)) {
+                ::close(listener);
+                return;
+            }
+            const int fd = configureTestSocket(::accept(listener, nullptr, nullptr));
             if (fd >= 0) {
                 try {
                     auto hello = proto::readFrame(fd, 5000);
@@ -658,7 +693,7 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
     }
 
     SECTION("close waits for a proven in-flight request, with bounded I/O") {
-        int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        int listener = configureTestSocket(::socket(AF_INET, SOCK_STREAM, 0));
         REQUIRE(listener >= 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -672,8 +707,15 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         std::atomic<bool> request_seen{false};
         std::atomic<bool> peer_ok{true};
         std::jthread peer([&] {
-            const int fd = ::accept(listener, nullptr, nullptr);
-            if (fd < 0) { peer_ok.store(false); return; }
+            struct pollfd p{listener, POLLIN, 0};
+            int pr = ::poll(&p, 1, 5000);
+            if (pr <= 0 || !(p.revents & POLLIN)) {
+                peer_ok.store(false);
+                ::close(listener);
+                return;
+            }
+            const int fd = configureTestSocket(::accept(listener, nullptr, nullptr));
+            if (fd < 0) { peer_ok.store(false); ::close(listener); return; }
             try {
                 auto hello = proto::readFrame(fd, 1000);
                 if (!hello || hello->type != proto::MsgType::Hello ||
@@ -719,7 +761,9 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
             catch (const std::logic_error&) { queued_rejected.store(true); }
             catch (...) {}
         });
-        while (!queued_started.load(std::memory_order_acquire))
+        const auto q_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!queued_started.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < q_deadline)
             std::this_thread::yield();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         client.close(); // publishes closing, then drains only the admitted request

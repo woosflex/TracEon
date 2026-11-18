@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
+#include <csignal>
 
 namespace TracEon {
 
@@ -43,6 +44,9 @@ TraceonClient::TraceonClient(std::string host, uint16_t port,
                              std::string expected_snapshot, uint8_t protocol_version)
     : operation_timeout_ms_(recv_timeout_ms > 0 ? recv_timeout_ms
                                            : proto::kReadTimeoutMs) {
+#ifndef _WIN32
+    (void)::signal(SIGPIPE, SIG_IGN);
+#endif
     if (protocol_version != 1 && protocol_version != proto::kProtocolVersion)
         throw std::invalid_argument("TraceonClient: supported protocol versions are 1 and 2");
     if (!expected_snapshot.empty() &&
