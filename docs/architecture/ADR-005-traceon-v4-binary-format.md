@@ -124,3 +124,11 @@ count (u64, native endian) | per record:
 - Per-record checksums (4 B/record ≈ 26 MB for a 6.5M-record WGS cache;
   localization without recovery did not justify the size/complexity).
 - Legacy readers kept for migration (rejected: clean-break decision, Q5).
+
+## 3.0.0-dev migration amendment
+
+[ADR-007](ADR-007-traceon-v5-portable-format.md) supersedes v4 for writes.
+The v4 reader remains for migration but now requires the declared LZ4 frame to
+end at physical EOF and rejects duplicate identifiers. This tightens the
+original v4 read policy; v4 native-endian payloads remain portable only across
+compatible legacy platforms.

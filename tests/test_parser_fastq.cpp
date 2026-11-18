@@ -648,14 +648,10 @@ TEST_CASE("FASTQ '@' in quality — single-threaded (<10MB)",
 // Bug B regression: FASTQ newline-run collapse breaks the 4-line cycle
 // ═══════════════════════════════════════════════════════════════════════════
 // The parse loops used to collapse RUNS of newlines after each line. That is
-// wrong for positional FASTQ when a line is EMPTY: an empty quality line
-// ('@e0\nAAA\n+\n\n@e1\n...') made qual_start land on '@e1' (record e0
-// stored with the wrong quality, then the cycle broke and every later record
-// was dropped), and an empty sequence line ('@e1\n\n+\n...') made seq_start
-// land on '+' (mis-parse, cycle break, whole file lost). Zero-length reads
-// are valid FASTQ (fastp/cutadapt with --length-required 0 emit them). Every
-// boundary now consumes exactly ONE line terminator ('\n', with the optional
-// preceding '\r' already part of the previous line).
+// Positional FASTQ requires all four lines to be retained distinctly. A
+// zero-length read is structurally valid when both sequence and quality are
+// empty. A non-empty sequence with empty quality is rejected because the
+// lengths differ; the cache must remain empty rather than publish a prefix.
 
 TEST_CASE("FASTQ — empty quality line — single-threaded (LF)",
           "[strategy][fastq][bugB]") {
@@ -665,12 +661,9 @@ TEST_CASE("FASTQ — empty quality line — single-threaded (LF)",
         std::ofstream out(path, std::ios::binary);
         out << "@e0\nAAA\n+\n\n@e1\nTTT\n+\nIII\n";
     }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 2); // was: 1 (e1 dropped)
-    REQUIRE(strategy.getSequence("e0") == "AAA");
-    REQUIRE(strategy.getQuality("e0").empty()); // was: quality = "@e1"
-    REQUIRE(strategy.getSequence("e1") == "TTT");
-    REQUIRE(strategy.getQuality("e1") == "III");
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
     fs::remove(path);
 }
 
@@ -683,12 +676,9 @@ TEST_CASE("FASTQ — empty quality line — single-threaded (CRLF)",
         std::ofstream out(path, std::ios::binary);
         out << "@e0\r\nAAA\r\n+\r\n\r\n@e1\r\nTTT\r\n+\r\nIII\r\n";
     }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 2);
-    REQUIRE(strategy.getSequence("e0") == "AAA");
-    REQUIRE(strategy.getQuality("e0").empty());
-    REQUIRE(strategy.getSequence("e1") == "TTT");
-    REQUIRE(strategy.getQuality("e1") == "III");
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
     fs::remove(path);
 }
 
@@ -696,9 +686,8 @@ TEST_CASE("FASTQ — empty quality line — single-threaded (CRLF)",
 TEST_CASE("FASTQ — empty sequence line (zero-length read) — single-threaded",
           "[strategy][fastq][bugB]") {
     // Zero-length read e1 ('@e1\n\n+\n\n') sits between two normal records.
-    // Empty-seq records are not stored (existing invariant), but the cycle
-    // must continue so e2 survives (was: cycle broke at the '+' check and
-    // the whole file was lost).
+    // The zero-length record remains addressable by identifier; sequence-only
+    // retrieval is empty and therefore must be disambiguated with hasSequence().
     TracEon::SmartStrategy strategy;
     std::string path = "bugB_st_emptyseq.fastq";
     {
@@ -706,10 +695,14 @@ TEST_CASE("FASTQ — empty sequence line (zero-length read) — single-threaded"
         out << "@e0\nAAA\n+\nIII\n@e1\n\n+\n\n@e2\nTTT\n+\nJJJ\n";
     }
     strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 2); // e0 + e2 (e1 dropped)
+    REQUIRE(strategy.getFileCacheSize() == 3);
     REQUIRE(strategy.getSequence("e0") == "AAA");
     REQUIRE(strategy.getQuality("e0") == "III");
-    REQUIRE_FALSE(strategy.hasSequence("e1"));
+    REQUIRE(strategy.hasSequence("e1"));
+    REQUIRE(strategy.getSequence("e1").empty());
+    REQUIRE(strategy.getQuality("e1").empty());
+    const auto keys = strategy.getAllKeys();
+    REQUIRE(std::find(keys.begin(), keys.end(), "e1") != keys.end());
     REQUIRE(strategy.getSequence("e2") == "TTT");
     REQUIRE(strategy.getQuality("e2") == "JJJ");
     fs::remove(path);
@@ -738,24 +731,9 @@ TEST_CASE("FASTQ — empty quality line — multithreaded (>10MB, LF)",
     REQUIRE(fs::file_size(path) > 10u * 1024u * 1024u);
 
     TracEon::SmartStrategy strategy;
-    strategy.loadFile(path);
-
-    REQUIRE(strategy.getFileCacheSize() == N); // was: ~4.4k (loss after first empty qual)
-    // First record has empty quality (i=0): must be stored with qual=''.
-    REQUIRE(strategy.getSequence("read0").size() == SEQ_LEN);
-    REQUIRE(strategy.getQuality("read0").empty());
-    // Record after an empty-quality record must carry its OWN quality.
-    REQUIRE(strategy.getSequence("read1").size() == SEQ_LEN);
-    REQUIRE(strategy.getQuality("read1") == std::string(SEQ_LEN, 'I'));
-    REQUIRE(strategy.getQuality("read997").empty());
-    REQUIRE(strategy.getQuality("read998") == std::string(SEQ_LEN, 'I'));
-    REQUIRE(strategy.getQuality("read1994").empty());
-    REQUIRE(strategy.getQuality("read1995") == std::string(SEQ_LEN, 'I'));
-    // Last record intact.
-    const std::string last = "read" + std::to_string(N - 1);
-    REQUIRE(strategy.hasSequence(last));
-    REQUIRE(strategy.getSequence(last).size() == SEQ_LEN);
-    REQUIRE(strategy.getQuality(last) == std::string(SEQ_LEN, 'I'));
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
 
     fs::remove(path);
 }
@@ -783,17 +761,9 @@ TEST_CASE("FASTQ — empty quality line — multithreaded (>10MB, CRLF)",
     REQUIRE(fs::file_size(path) > 10u * 1024u * 1024u);
 
     TracEon::SmartStrategy strategy;
-    strategy.loadFile(path);
-
-    REQUIRE(strategy.getFileCacheSize() == N);
-    REQUIRE(strategy.getQuality("read0").empty());
-    REQUIRE(strategy.getQuality("read1") == std::string(SEQ_LEN, 'I'));
-    REQUIRE(strategy.getQuality("read997").empty());
-    REQUIRE(strategy.getQuality("read998") == std::string(SEQ_LEN, 'I'));
-    REQUIRE(strategy.getSequence("read0").size() == SEQ_LEN);
-    const std::string last = "read" + std::to_string(N - 1);
-    REQUIRE(strategy.hasSequence(last));
-    REQUIRE(strategy.getQuality(last) == std::string(SEQ_LEN, 'I'));
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
 
     fs::remove(path);
 }
@@ -824,16 +794,16 @@ TEST_CASE("FASTQ — empty sequence line (zero-length reads) — multithreaded (
     TracEon::SmartStrategy strategy;
     strategy.loadFile(path);
 
-    // Zero-length reads are not stored (existing invariant), but the cycle
-    // must NOT break: all non-empty records survive (was: whole file lost
-    // from the first zero-length read onward).
-    size_t empty_count = 0;
-    for (size_t i = 0; i < N; ++i) if (i % EMPTY_EVERY == 0) ++empty_count;
-    REQUIRE(strategy.getFileCacheSize() == N - empty_count);
-    REQUIRE_FALSE(strategy.hasSequence("read0"));      // zero-length
+    // Every structurally complete record remains addressable, including an
+    // empty sequence/quality pair.
+    REQUIRE(strategy.getFileCacheSize() == N);
+    REQUIRE(strategy.hasSequence("read0"));
+    REQUIRE(strategy.getSequence("read0").empty());
+    REQUIRE(strategy.getQuality("read0").empty());
     REQUIRE(strategy.getSequence("read1").size() == SEQ_LEN);
     REQUIRE(strategy.getQuality("read1") == std::string(SEQ_LEN, 'I'));
-    REQUIRE_FALSE(strategy.hasSequence("read1001"));   // zero-length
+    REQUIRE(strategy.hasSequence("read1001"));
+    REQUIRE(strategy.getSequence("read1001").empty());
     REQUIRE(strategy.getSequence("read1002").size() == SEQ_LEN);
     REQUIRE(strategy.getSequence("read1000").size() == SEQ_LEN);
     const std::string last = "read" + std::to_string(N - 1);
@@ -841,5 +811,100 @@ TEST_CASE("FASTQ — empty sequence line (zero-length reads) — multithreaded (
     REQUIRE(strategy.getSequence(last).size() == SEQ_LEN);
     REQUIRE(strategy.getQuality(last) == std::string(SEQ_LEN, 'I'));
 
+    fs::remove(path);
+}
+
+TEST_CASE("Malformed FASTQ never publishes a valid prefix in plain or GZIP paths",
+          "[strategy][fastq][integrity]") {
+    const std::string small = "@ok\nACGT\n+\nIIII\n@bad\nTGCA\n";
+    std::string large;
+    large.reserve(12u * 1024u * 1024u);
+    const std::string seq(200, 'A');
+    const std::string qual(200, 'I');
+    for (size_t i = 0; large.size() <= 11u * 1024u * 1024u; ++i)
+        large += "@r" + std::to_string(i) + "\n" + seq + "\n+\n" + qual + "\n";
+    large += "@bad\nTGCA\n";
+
+    for (const auto& [label, content] :
+         std::vector<std::pair<std::string, std::string>>{{"serial", small}, {"multithreaded", large}}) {
+        for (bool gzip : {false, true}) {
+            INFO(label << (gzip ? " gzip" : " plain"));
+            const std::string path = "malformed_" + label + (gzip ? ".fastq.gz" : ".fastq");
+            if (gzip)
+                (void)compress_to_gzip_bytes(content, path);
+            else {
+                std::ofstream out(path, std::ios::binary);
+                out << content;
+            }
+            TracEon::SmartStrategy strategy;
+            REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+            REQUIRE(strategy.getFileCacheSize() == 0);
+            REQUIRE_FALSE(strategy.hasSequence("ok"));
+            REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
+            fs::remove(path);
+        }
+    }
+}
+
+TEST_CASE("FASTQ format inference preserves framing for empty and mixed payloads",
+          "[strategy][fastq][format]") {
+    SECTION("all-empty FASTQ uses the approved protein FASTQ fallback and survives v5") {
+        const std::string path = "empty_payloads.fastq";
+        const std::string cache = "empty_payloads.traceon";
+        { std::ofstream out(path); out << "@e1\n\n+\n\n@e2\n\n+\n\n"; }
+        TracEon::SmartStrategy strategy;
+        strategy.loadFile(path);
+        REQUIRE(strategy.getFileCacheSize() == 2);
+        REQUIRE(strategy.hasSequence("e1"));
+        REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::PROTEIN_FASTQ);
+        strategy.saveBinary(cache);
+        TracEon::SmartStrategy restored;
+        restored.loadBinary(cache);
+        REQUIRE(restored.getDetectedFormat() == TracEon::FileFormat::PROTEIN_FASTQ);
+        REQUIRE(restored.hasSequence("e2"));
+        fs::remove(path); fs::remove(cache);
+    }
+    SECTION("a later non-empty record supplies alphabet evidence") {
+        const std::string path = "zero_first_mixed.fastq";
+        { std::ofstream out(path); out << "@empty\n\n+\n\n@dna\nACGT\n+\n!!!!\n"; }
+        TracEon::SmartStrategy strategy;
+        strategy.loadFile(path);
+        REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTQ);
+        fs::remove(path);
+    }
+}
+
+TEST_CASE("FASTQ chunk boundaries follow framing, not payload characters", "[audit][fastq]") {
+    const std::string path = "audit_boundaries.fastq";
+    const std::string sequence(150, '+'), quality(150, '@');
+    constexpr size_t count = 40000;
+    {
+        std::ofstream out(path);
+        for (size_t i = 0; i < count; ++i)
+            out << "@r" << i << '\n' << sequence << "\n+\n" << quality << '\n';
+    }
+    for (auto mode : {TracEon::IndexMode::GENOME, TracEon::IndexMode::NGS}) {
+        TracEon::SmartStrategy cache(mode);
+        cache.loadFile(path);
+        REQUIRE(cache.getFileCacheSize() == count);
+        for (size_t i = 0; i < count; ++i) {
+            const auto key = "r" + std::to_string(i);
+            REQUIRE(cache.getView(key) == sequence);
+            REQUIRE(cache.getQuality(key) == quality);
+        }
+    }
+    fs::remove(path);
+}
+
+TEST_CASE("FASTQ strips only the CR belonging to a CRLF terminator", "[audit][fastq]") {
+    const std::string path = "audit_cr.fastq";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "@r\r\nA\r\r\n+\r\nI\r\r\n";
+    }
+    TracEon::SmartStrategy cache;
+    cache.loadFile(path);
+    REQUIRE(cache.getView("r") == "A\r");
+    REQUIRE(cache.getQuality("r") == "I\r");
     fs::remove(path);
 }

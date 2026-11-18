@@ -58,17 +58,12 @@
  * kmerindex_reserve() fail with return 0 and last_error "index is frozen".
  * Read operations (get, size) remain valid and safe after freezing.
  *
- * THREAD SAFETY: the freeze flag is an atomic<bool> with release/acquire
- * ordering. get() publishes the freeze with a RELEASE store; insert()/
- * reserve() check it with an ACQUIRE load before mutating. Concurrent
- * lookups from multiple threads (minimap2 mapping workers) may therefore
- * race with insert/reserve attempts on the flag itself without UB, and
- * any insert that observes the freeze is guaranteed to see every map
- * write published before it. Concurrent get()/size() on a frozen index
- * are safe (no mutation, no shared mutable state). The build phase
- * (insert/reserve) must itself be single-threaded or otherwise externally
- * serialized -- the freeze only guards the read/write transition, not
- * concurrent mutators.
+ * THREAD SAFETY: build-phase insert/reserve calls are internally serialized
+ * with the first get() that freezes the index. A mutator admitted first
+ * completes before freeze publication; later mutators fail as frozen.
+ * Concurrent get()/size() on a frozen index are safe and lock-free. Destroy
+ * is not synchronized: callers must externally quiesce every operation and
+ * retained interior pointer before kmerindex_destroy().
  */
 
 #include <stdint.h>

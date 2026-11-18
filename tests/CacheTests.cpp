@@ -420,4 +420,24 @@ TEST_CASE("Cache facade: clearCache / getAllKeys / getQuality / getDetectedForma
         TracEon::Cache cache;
         REQUIRE(cache.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
     }
+
+    SECTION("Query methods accept std::string_view transparently") {
+        TracEon::Cache cache;
+        cache.set("r1", "ACGTACGT");
+        std::string_view key_view = "r1";
+        REQUIRE(cache.hasSequence(key_view));
+        REQUIRE(cache.getView(key_view) == "ACGTACGT");
+        REQUIRE(cache.get(key_view) == "ACGTACGT");
+        REQUIRE(cache.getQuality(key_view).empty());
+        auto rec = cache.getFastqRecord(key_view);
+        REQUIRE(rec.has_value());
+        REQUIRE(rec->sequence == "ACGTACGT");
+        REQUIRE(rec->quality.empty());
+
+        auto view_rec = cache.getRecordView(key_view);
+        REQUIRE(view_rec.has_value());
+        REQUIRE(view_rec->sequence == "ACGTACGT");
+        REQUIRE(view_rec->quality.empty());
+        REQUIRE_FALSE(cache.getRecordView("nonexistent").has_value());
+    }
 }

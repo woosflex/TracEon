@@ -1,9 +1,8 @@
-// gen_v4_corpus.cpp — regenerates the `.traceon` v4 seed corpus for
-// fuzz_v4_loader: a valid GENOME + a valid NGS round-trip cache plus every
-// malformed variant from tests/test_binary_cache.cpp (legacy magic, bad
-// flags/mode, truncations, wrong lengths, mutated CRC, count bombs).
+// gen_v4_corpus.cpp — regenerates the `.traceon` v4-migration/v5 seed corpus.
+// Real v5 files go through SmartStrategy::saveBinary(); crafted v4 GENOME and
+// NGS files retain migration coverage alongside malformed variants.
 //
-// The valid files go through the real SmartStrategy::saveBinary() path; the
+// The v5 files go through the real SmartStrategy::saveBinary() path; the
 // crafted variants are built with the same helpers the tests use (LZ4 Frame
 // via LZ4F_compressFrame + whole-payload CRC32C via the project's Crc32c.h).
 //
@@ -99,29 +98,113 @@ std::vector<char> build_v4_blob(uint8_t mode, const std::vector<char>& payload,
     return blob;
 }
 
+void write_v5_payload(std::vector<char>& buf,
+                      const std::vector<std::tuple<std::string, std::string, std::string>>& records) {
+    append_le64(buf, records.size());
+    for (const auto& [id, seq, qual] : records) {
+        for (const auto* field : {&id, &seq, &qual}) {
+            append_le32(buf, static_cast<uint32_t>(field->size()));
+            buf.insert(buf.end(), field->begin(), field->end());
+        }
+    }
+}
+
+std::vector<char> build_v5_blob(uint8_t mode, uint8_t format,
+                                const std::vector<char>& payload, bool mapped = false) {
+    const auto frame = mapped ? payload : lz4f_compress(payload);
+    std::vector<char> blob{'T','R','O',static_cast<char>(0x05),
+                           static_cast<char>(mapped ? 0x00 : 0x01), static_cast<char>(mode),
+                           static_cast<char>(format)};
+    append_le64(blob, payload.size());
+    append_le64(blob, frame.size());
+    TracEon::Crc32c crc;
+    crc.update(payload.data(), payload.size());
+    crc.update(blob.data(), 23);
+    append_le32(blob, crc.finalize());
+    blob.insert(blob.end(), frame.begin(), frame.end());
+    return blob;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const std::string dir = (argc > 1) ? argv[1] : "fuzz/corpus/v4_loader";
 
-    // ── Valid round-trip caches via the real saveBinary() path ──────────────
+    // ── Valid v5 round-trip caches via the real saveBinary() path ──────────
     {
         TracEon::SmartStrategy s;
         s.addEntry("chr1", "ACGTACGTACGTACGT", "");
         s.addEntry("chr2", "TTTTGGGGCCCCAAAA", "");
-        s.saveBinary(dir + "/v4_valid_genome.traceon");
+        s.saveBinary(dir + "/v5_valid_genome.traceon");
+        s.saveBinary(dir + "/v5_mapped_genome.traceon", TracEon::CacheStorage::Mapped);
     }
     {
         TracEon::SmartStrategy s(TracEon::IndexMode::NGS);
         s.addEntry("read1", "ACGT", "IIII");
         s.addEntry("read2", "TGCA", "####");
-        s.saveBinary(dir + "/v4_valid_ngs.traceon");
+        s.saveBinary(dir + "/v5_valid_ngs.traceon");
+        s.saveBinary(dir + "/v5_mapped_ngs.traceon", TracEon::CacheStorage::Mapped);
     }
 
-    // ── Crafted malformed variants (mirroring tests/test_binary_cache.cpp) ──
+    // Directed v5 seeds with valid CRCs reach payload validation.
+    std::vector<char> v5_one;
+    write_v5_payload(v5_one, {{"seq1", "ACGT", ""}});
+    write_blob(dir + "/v5_invalid_format.traceon", build_v5_blob(0, 0x7f, v5_one));
+    std::vector<char> v5_dup;
+    write_v5_payload(v5_dup, {{"dup", "ACGT", ""}, {"dup", "TGCA", ""}});
+    write_blob(dir + "/v5_duplicate_ids.traceon", build_v5_blob(0, 0x00, v5_dup));
+    write_blob(dir + "/v5_mapped_duplicates.traceon", build_v5_blob(0, 0x00, v5_dup, true));
+    write_blob(dir + "/v5_duplicate_ids_ngs.traceon", build_v5_blob(1, 0x03, v5_dup));
+    auto trailing_payload = v5_one;
+    trailing_payload.push_back('X');
+    write_blob(dir + "/v5_payload_trailing.traceon", build_v5_blob(0, 0x00, trailing_payload));
+    std::vector<char> count_boundary(8, static_cast<char>(0xff));
+    write_blob(dir + "/v5_count_boundary.traceon", build_v5_blob(0, 0x00, count_boundary));
+    std::vector<char> length_boundary;
+    append_le64(length_boundary, 1);
+    append_le32(length_boundary, 0xffffffffu);
+    write_blob(dir + "/v5_length_boundary.traceon", build_v5_blob(0, 0x00, length_boundary));
+    auto v5_truncated = build_v5_blob(0, 0x00, v5_one);
+    v5_truncated.resize(v5_truncated.size() - 1);
+    write_blob(dir + "/v5_truncated_frame.traceon", v5_truncated);
+
+    // ── Valid migration seeds in the real legacy v4 layouts ───────────────
     std::vector<char> payload;
     write_genome_payload(payload, {{"seq1", "ACGT", ""}});
-    const auto frame = lz4f_compress(payload);
+    std::vector<char> v4_dup;
+    write_genome_payload(v4_dup, {{"dup", "ACGT", ""}, {"dup", "TGCA", ""}});
+    write_blob(dir + "/v4_duplicate_ids.traceon",
+               build_v4_blob(0, v4_dup, lz4f_compress(v4_dup)));
+    std::vector<char> v4_ngs_dup;
+    append_le64(v4_ngs_dup, 2);
+    for (uint64_t legacy_hash : {uint64_t{1}, uint64_t{2}}) {
+        append_le64(v4_ngs_dup, legacy_hash);
+        for (const std::string& field : {std::string("dup"), std::string("ACGT"), std::string("IIII")}) {
+            append_le32(v4_ngs_dup, static_cast<uint32_t>(field.size()));
+            v4_ngs_dup.insert(v4_ngs_dup.end(), field.begin(), field.end());
+        }
+    }
+    write_blob(dir + "/v4_duplicate_ids_ngs.traceon",
+               build_v4_blob(1, v4_ngs_dup, lz4f_compress(v4_ngs_dup)));
+    auto frame = lz4f_compress(payload);
+    write_blob(dir + "/v4_valid_genome.traceon", build_v4_blob(0, payload, frame));
+    std::vector<char> ngs_payload;
+    const uint64_t one = 1;
+    ngs_payload.insert(ngs_payload.end(), reinterpret_cast<const char*>(&one),
+                       reinterpret_cast<const char*>(&one) + sizeof(one));
+    const uint64_t legacy_hash = 0x123456789abcdef0ULL;
+    ngs_payload.insert(ngs_payload.end(), reinterpret_cast<const char*>(&legacy_hash),
+                       reinterpret_cast<const char*>(&legacy_hash) + sizeof(legacy_hash));
+    for (const std::string field : {std::string("read1"), std::string("ACGT"), std::string("IIII")}) {
+        const uint32_t len = static_cast<uint32_t>(field.size());
+        ngs_payload.insert(ngs_payload.end(), reinterpret_cast<const char*>(&len),
+                           reinterpret_cast<const char*>(&len) + sizeof(len));
+        ngs_payload.insert(ngs_payload.end(), field.begin(), field.end());
+    }
+    write_blob(dir + "/v4_valid_ngs.traceon",
+               build_v4_blob(1, ngs_payload, lz4f_compress(ngs_payload)));
+
+    // ── Crafted malformed variants (mirroring tests/test_binary_cache.cpp) ──
 
     // Legacy v1/v2/v3 magic.
     for (uint8_t ver : {0x01, 0x02, 0x03}) {
@@ -149,8 +232,8 @@ int main(int argc, char** argv) {
         write_blob(dir + "/v4_old_mmap.traceon", old);
     }
 
-    // Truncations of a valid file: header end (26), a few bytes into the
-    // frame, mid-frame, one byte short of the end.
+    // Truncations of a valid v5 file: header end (27), a few bytes into the
+    // frame, mid-frame, and one byte short of the end.
     {
         TracEon::SmartStrategy s;
         s.addEntry("a", "ACGT", "");
@@ -163,9 +246,9 @@ int main(int argc, char** argv) {
         in.read(bytes.data(), static_cast<std::streamsize>(sz));
         in.close();
         std::remove((dir + "/_tmp_valid.traceon").c_str());
-        const size_t cuts[] = {26, 30, sz / 2, sz - 1};
+        const size_t cuts[] = {27, 31, sz / 2, sz - 1};
         for (size_t i = 0; i < 4; ++i)
-            write_blob(dir + "/v4_trunc_" + std::to_string(i) + ".traceon",
+            write_blob(dir + "/v5_trunc_" + std::to_string(i) + ".traceon",
                        std::vector<char>(bytes.begin(),
                                          bytes.begin() + static_cast<long>(cuts[i])));
     }
@@ -231,6 +314,6 @@ int main(int argc, char** argv) {
         write_blob(dir + "/v4_bad_count_2_junk.traceon", build_v4_blob(0, p, lz4f_compress(p)));
     }
 
-    std::cout << "v4 corpus written under " << dir << std::endl;
+    std::cout << "v4 migration + v5 corpus written under " << dir << std::endl;
     return 0;
 }

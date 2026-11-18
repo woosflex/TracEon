@@ -1,4 +1,6 @@
 #include "TestHelpers.h"
+#include "../src/ZlibWindow.h"
+#include <limits>
 
 // test_gzip.cpp — GZIP domain (truncation, trailing garbage,
 // Z_BUF_ERROR, parallel member decode, zip-bomb guard).
@@ -295,10 +297,9 @@ TEST_CASE("GZIP — trailing garbage rejected via gzoffset (<1MB file, large tai
           "[strategy][gzip][bugC][errors]") {
     // A small valid member followed by a tail larger than zlib-ng's internal
     // 128 KiB read buffer: gzoffset() then reports a position short of the
-    // file size and the file is rejected. (Tails ≤ 128 KiB are absorbed by
-    // that buffer during the final read and are indistinguishable from a
-    // clean EOF through the gzread() API — a documented limitation; files
-    // ≥ 1 MiB get exact coverage from scanGzipStreams().)
+    // file size and the file is rejected. All sizes also receive the exact
+    // raw-inflate member scan; this case retains coverage for the gzoffset
+    // defense in depth.
     std::string data = ">chr1\nACGTACGT\n>chr2\nTTTTGGGG\n";
     std::string gz = "bugC_tail_gzoffset.gz";
     {
@@ -318,6 +319,50 @@ TEST_CASE("GZIP — trailing garbage rejected via gzoffset (<1MB file, large tai
     fs::remove(gz);
 }
 
+
+TEST_CASE("GZIP — one-byte trailing junk rejected below 1 MiB",
+          "[strategy][gzip][integrity][small]") {
+    const std::string gz = "gzip_small_one_byte_junk.fa.gz";
+    gzFile f = gzopen(gz.c_str(), "wb");
+    REQUIRE(f != nullptr);
+    const std::string data = ">id\nACGT\n";
+    REQUIRE(gzwrite(f, data.data(), static_cast<unsigned>(data.size())) > 0);
+    REQUIRE(gzclose(f) == Z_OK);
+    { std::ofstream out(gz, std::ios::binary | std::ios::app); out.put('X'); }
+    REQUIRE(fs::file_size(gz) < 1024u * 1024u);
+
+    TracEon::SmartStrategy strategy;
+    REQUIRE_THROWS_AS(strategy.loadFile(gz), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getArenaBytes() == 0);
+    fs::remove(gz);
+}
+
+TEST_CASE("GZIP — junk between valid members rejected below 1 MiB",
+          "[strategy][gzip][integrity][small]") {
+    const std::string first = "gzip_small_first.fa.gz";
+    const std::string second = "gzip_small_second.fa.gz";
+    auto write_member = [](const std::string& path, const std::string& data) {
+        gzFile f = gzopen(path.c_str(), "wb");
+        REQUIRE(f != nullptr);
+        REQUIRE(gzwrite(f, data.data(), static_cast<unsigned>(data.size())) > 0);
+        REQUIRE(gzclose(f) == Z_OK);
+    };
+    write_member(first, ">one\nACGT\n");
+    write_member(second, ">two\nTGCA\n");
+    std::ifstream in(second, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+    { std::ofstream out(first, std::ios::binary | std::ios::app);
+      out.put('X'); out.write(bytes.data(), static_cast<std::streamsize>(bytes.size())); }
+    REQUIRE(fs::file_size(first) < 1024u * 1024u);
+
+    TracEon::SmartStrategy strategy;
+    REQUIRE_THROWS_AS(strategy.loadFile(first), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getArenaBytes() == 0);
+    fs::remove(first);
+    fs::remove(second);
+}
 
 TEST_CASE("GZIP — trailing garbage rejected via scan (≥1MB single member)",
           "[strategy][gzip][bugC][errors]") {
@@ -571,4 +616,21 @@ TEST_CASE("GZIP — highly-compressible single-stream file still grows and loads
     REQUIRE(seq.size() == SEQ_LEN);
     REQUIRE(std::all_of(seq.begin(), seq.end(), [](char c) { return c == 'A'; }));
     fs::remove(gz);
+}
+
+TEST_CASE("GZIP zlib windows and growth arithmetic remain size_t-safe",
+          "[strategy][gzip][window]") {
+    using TracEon::detail::nextGzipCapacity;
+    using TracEon::detail::zlibWindowSize;
+    const size_t uint_max = std::numeric_limits<unsigned int>::max();
+    REQUIRE(zlibWindowSize(17) == 17u);
+    REQUIRE(zlibWindowSize(uint_max + size_t{17}) ==
+            std::numeric_limits<unsigned int>::max());
+
+    size_t next = 0;
+    REQUIRE(nextGzipCapacity(1024, 4096, next));
+    REQUIRE(next == 2048);
+    REQUIRE_FALSE(nextGzipCapacity(4096, 4096, next));
+    REQUIRE_FALSE(nextGzipCapacity(std::numeric_limits<size_t>::max(),
+                                   std::numeric_limits<size_t>::max(), next));
 }

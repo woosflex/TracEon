@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(TracEonConsumer LANGUAGES CXX)
+find_package(TracEon 3 REQUIRED COMPONENTS core kmer)
+# A shared consumer also exercises PIC and transitive static-codec linking.
+add_library(consumer SHARED consumer.cpp)
+set_target_properties(consumer PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_link_libraries(consumer PRIVATE TracEon::core TracEon::kmer)
+if(TARGET TracEon::remote)
+    target_link_libraries(consumer PRIVATE TracEon::remote)
+    target_compile_definitions(consumer PRIVATE WITH_REMOTE)
+endif()
+add_executable(check_consumer main.cpp)
+target_link_libraries(check_consumer PRIVATE consumer)

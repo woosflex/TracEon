@@ -26,7 +26,7 @@ inline int kmer_base_code(char c) {
 //   - the window contains a non-ACGT base.
 // On success `out` receives the packed 2-bit-per-base code.
 inline bool encode_kmer(std::string_view seq, int k, uint64_t& out) {
-    if (k <= 0 || k > 32 || (int)seq.size() < k) return false;
+    if (k <= 0 || k > 32 || seq.size() < static_cast<size_t>(k)) return false;
     uint64_t code = 0;
     for (int i = 0; i < k; ++i) {
         int b = kmer_base_code(seq[i]);

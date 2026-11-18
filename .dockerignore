@@ -2,7 +2,7 @@
 # remote_bench + traceon_make_cache is copied (see docker/Dockerfile).
 
 .git
-build/
+build*/
 outputs/
 
 # Large benchmark datasets / generated artifacts (not needed to build).

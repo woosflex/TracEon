@@ -59,13 +59,11 @@ Sign off every commit with `Signed-off-by: Your Name <you@example.com>` (use
 - **Tests:** New features must include unit tests (Catch2, in `tests/`).
   Run from `build/`: `ctest` (or `./unit_tests`).
 - **Style:** Modern C++20 (RAII, `std::string_view`, no raw `new` in core paths).
-- **Performance / invariants:** If you touch core logic, run the regression check:
-  ```bash
-  python benchmarks/check_regression.py build/result.txt
-  ```
-  and confirm you haven't broken an architectural invariant (see the
-  `docs/architecture/` ADRs): zero-copy reads, immutable-after-load, lock-free
-  read path, pre-reserved maps.
+- **Performance / invariants:** For performance-sensitive changes, use the
+  controlled, repeated comparisons described in `PERFORMANCE.md`. Hosted CI
+  checks correctness and benchmark accounting; it does not enforce historical
+  absolute throughput thresholds. Preserve the lifetime and immutability
+  contracts documented in `docs/architecture/`.
 
 ## Commit Conventions
 
@@ -78,7 +76,7 @@ Sign off every commit with `Signed-off-by: Your Name <you@example.com>` (use
 ## Pull Request Checklist
 
 - [ ] Tests added/updated and passing (`ctest`)
-- [ ] Regression check run if core logic changed
+- [ ] Performance-sensitive changes include repeated measurements per `PERFORMANCE.md`
 - [ ] Docs/ADRs updated if behavior or architecture changed
 - [ ] Commit(s) signed off (`git commit -s`)
 - [ ] Branch rebased/tidied; avoid force-pushing after review begins

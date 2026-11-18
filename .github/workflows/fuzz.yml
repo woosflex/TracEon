@@ -41,6 +41,7 @@ jobs:
         cmake -B build-fuzz \
           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
           -DCMAKE_CXX_COMPILER=clang++ \
+          -DTRACEON_BUILD_SERVER=OFF \
           -DTRACEON_BUILD_FUZZERS=ON
 
     - name: Build fuzz targets
@@ -60,14 +61,15 @@ jobs:
         import os
 
         def gen_fastq(path, records, seq_len=150):
-            seq = "ACGT" * (seq_len // 4)
+            seq = ("ACGT" * ((seq_len + 3) // 4))[:seq_len]
             qual = "I" * seq_len
+            assert len(seq) == len(qual) == seq_len
             with open(path, "w") as f:
                 for i in range(records):
                     f.write(f"@mt_record_{i}\n{seq}\n+\n{qual}\n")
 
         def gen_fasta(path, records, seq_len=4000):
-            seq = "ACGT" * (seq_len // 4)
+            seq = ("ACGT" * ((seq_len + 3) // 4))[:seq_len]
             with open(path, "w") as f:
                 for i in range(records):
                     f.write(f">mt_record_{i}\n{seq}\n")

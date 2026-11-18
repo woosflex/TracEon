@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <atomic>
 #include <functional>
+#include <optional>
 
 namespace TracEon {
 
@@ -27,8 +28,8 @@ enum class FileFormat : uint8_t {
 struct SequenceView {
     // NOTE:
     // - The Map Key (std::string_view) is NON-OWNING: it points into either
-    //   the text_arena_ buffer (parse and binary v4 restore) or manual_store_
-    //   (addEntry()). Both backing stores are stable for the map's lifetime
+    //   the text_arena_ buffer, retained v5 mapping, or manual_store_
+    //   (addEntry()). These backing stores are stable for the map's lifetime
     //   (arena is immutable-after-load; deque push_back never invalidates).
     //   No std::string is constructed on any insert path.
     // - SequenceView.id, sequence, and quality are NON-OWNING views pointing
@@ -43,9 +44,19 @@ struct SequenceView {
 // allocation on the insert path) with transparent lookup (find by
 // string_view / const char* / std::string, no allocation on the read path).
 using GenomeIndex = StringViewHashMap<SequenceView>;
-using NGSIndex = HashMap<uint64_t, SequenceView>;
+
+// Keep NGS as a distinct variant alternative while retaining full identifiers
+// as keys. unordered_dense resolves hash collisions with equality, so distinct
+// identifiers can coexist; unlike the former uint64_t-only map, correctness no
+// longer depends on an implementation-specific hash being collision-free.
+struct NGSStringHash : TransparentStringHash {};
+using NGSIndex = ankerl::unordered_dense::map<
+    std::string_view, SequenceView, NGSStringHash, std::equal_to<>>;
 
 enum class IndexMode { GENOME, NGS };
+
+// Mapped stores portable payload bytes directly; Lz4 minimizes disk storage.
+enum class CacheStorage { Lz4, Mapped };
 
 class SmartStrategy {
 public:
@@ -89,11 +100,15 @@ public:
     void loadGzipFile(const std::string& filepath);
 
     /**
-     * @brief Load a binary cache file (.traceon v4 only).
+     * @brief Restore a `.traceon` v4/v5 cache into decoded or mapped storage.
      *
-     * v2.0.0 removed the v1/v2/v3 readers — the v4 format ("TRO\x04", LZ4
-     * Frame + whole-payload CRC32C) is the ONLY readable binary format. Old
-     * caches are rejected with a clear "regenerate" error.
+     * v5 is the canonical portable format: explicit little-endian payload
+     * fields, full identifiers in both modes, exact detected-format metadata,
+     * and LZ4 Frame + whole-payload CRC32C. v4 remains readable for migration;
+     * v1/v2/v3 are rejected. The mapped compressed file is released after
+     * full decompression and validation, before publication. v5 codec 0 instead
+     * retains a read-only payload mapping. Its backing file must remain immutable;
+     * replace it atomically, never modify or truncate it while readers exist.
      * @throws std::runtime_error on malformed/implausible cache files: wrong
      *         magic or version, unsupported codec/mode, truncated payloads or
      *         frames, wrong logical length, checksum mismatch, record counts
@@ -102,16 +117,17 @@ public:
      */
     void loadBinary(const std::string& filepath);
     /**
-     * @brief Write the current cache as a v4 binary cache file.
+     * @brief Write the current cache as a canonical v5 binary cache file.
      *
-     * v4 = "TRO\x04" header (codec flags, index mode, logical length, frame
-     * length, CRC32C) + a streamed LZ4 Frame. The CRC32C checksum is computed
-     * incrementally over the uncompressed payload as it passes through the
-     * compressor — no second full-payload pass.
+     * v5 = "TRO\x05" header (codec flags, index mode, detected format,
+     * logical length, frame length, CRC32C) + a portable little-endian payload
+     * in a streamed LZ4 Frame. The checksum is computed incrementally.
      * @throws std::runtime_error if the file cannot be written or LZ4 Frame
      *         compression fails.
      */
     void saveBinary(const std::string& filepath) const;
+    // Explicit storage choice; the one-argument overload retains LZ4 behavior.
+    void saveBinary(const std::string& filepath, CacheStorage storage) const;
 
     // --- Manual Entry Support ---
     /**
@@ -124,10 +140,15 @@ public:
     void addEntry(const std::string& id, const std::string& seq, const std::string& qual);
 
     /**
-     * @brief Zero-copy view of a sequence's data.
+     * @brief Borrowed view of a sequence payload.
      *
-     * @return A std::string_view pointing directly into the immutable arena
-     *         (text_arena_/manual_store_/mmap), or an empty view if not found.
+     * Header descriptions, FASTQ plus-line metadata, and quality scores are
+     * not returned here. Use getQuality()/the Cache FASTQ record API for an
+     * owned quality payload.
+     *
+     * @return A std::string_view pointing into immutable text_arena_ or
+     *         manual_store_ storage. Empty means either not found or a valid
+     *         zero-length FASTQ sequence; use hasSequence() to distinguish.
      *
      * @warning LIFECYCLE CONTRACT (reader quiescence — see ADR-001 and the
      *          README "Lifecycle contract" section): the returned view is
@@ -144,10 +165,11 @@ public:
      *       in clearInternal() if a getView() lookup overlaps a teardown — a
      *       diagnostic for coordinated misuse, not a synchronization mechanism.
      */
-    std::string_view getView(const std::string_view& sequence_id) const;
-    std::string getSequence(const std::string& sequence_id) const;
-    std::string getQuality(const std::string& sequence_id) const;
-    bool hasSequence(const std::string& sequence_id) const;
+    std::optional<SequenceView> findRecord(std::string_view sequence_id) const;
+    std::string_view getView(std::string_view sequence_id) const;
+    std::string getSequence(std::string_view sequence_id) const;
+    std::string getQuality(std::string_view sequence_id) const;
+    bool hasSequence(std::string_view sequence_id) const;
     
     size_t getFileCacheSize() const;
     std::vector<std::string> getAllKeys() const;
@@ -261,13 +283,11 @@ private:
      */
     alignas(64) std::atomic<bool> data_loaded_{false};
 
-    void determine_format_from_cache();
+    void determine_format_from_cache(std::optional<bool> structural_fastq = std::nullopt);
     bool isNucleotideSequence(std::string_view data) const;
     bool hasRNA(std::string_view data) const;
-    // Hash an NGS record id into its map key (GENOME keys use the raw view).
-    uint64_t hash_key(std::string_view key) const;
-
     void clearInternal();
+    void validateInputArena(bool is_fastq) const;
 
     /**
      * @brief Set by load paths (loadFile/loadGzipFile/loadBinary) so
@@ -284,7 +304,7 @@ private:
     void serializePayload(const std::function<void(const char*, size_t)>& sink) const;
 
     /**
-     * @brief Serialized (uncompressed) payload size, used to size the v4
+     * @brief Serialized (uncompressed) payload size, used to size the v5
      * header before streaming starts. Backed by serialized_size_estimate_,
      * which is updated incrementally at every record insertion rather than
      * recomputed by walking the whole map here.

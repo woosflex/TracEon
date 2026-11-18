@@ -1,13 +1,34 @@
 # TracEon Benchmarking Suite
 
-**Applies to:** TracEon v2.3.0 "Harpe"
+**Current direction:** TracEon 3.0.0-dev shared immutable service
 **Purpose:** Performance validation and regression testing  
-**Last Updated:** 2026-09-06
+**Last Updated:** 2026-09-21
 
 This directory contains tools for benchmarking TracEon against synthetic and real-world genomic datasets, comparing against state-of-the-art tools (BioPython, PyFastX, SeqKit).
 
-The latest locally reproduced TracEon-only results are in the
-[v2.3.0 benchmark report](v2.3.0_benchmark_report.md).
+The current [indexed-access study](../docs/indexed-mapping-study.md) uses the
+installed CLI and an unchanged mapper. The [workflow guide](../docs/research-workflow.md)
+contains the command and measurement boundaries. These preliminary comparisons
+report trade-offs; they do not establish a general mapping speedup.
+
+- `indexed_mapping_study.py`: one snapshot-pinned server, independent workers,
+  samtools indexed baseline, exact FASTA/FASTQ and SAM checks, fixed CPU affinity.
+  Optional `--batch-size 64` adds a third arm. Measured repetitions must cover
+  complete arm-order permutations (multiples of six with batching, two without);
+  the default is six. Earlier five-repeat reports used the archived older harness.
+- `service_resources.py`: sustained churn/overload/idle/slow-reader/disconnect
+  checks with raw PSS/thread/descriptor samples; see the
+  [resource report](../docs/service-resource-study.md).
+- `query_profile.py`: profile an existing validated cache with independent
+  native clients; `--batch-size 64` measures requests containing 64 IDs.
+  Request count, warmup count, latency, and native ops/s remain in request units.
+  Batch latency includes key construction and owned-result destruction. Never
+  label a batch percentile divided by its size as individual-record tail latency.
+- `shared_mapping_pilot.py`: the earlier shared-server versus seqtk/restore pilot.
+  Its reusable group timing now blocks in wait4 with independent memory sampling.
+
+The older [v2.3.0 report](v2.3.0_benchmark_report.md) and instructions below are
+retained for provenance and local diagnostics, not as current comparative evidence.
 
 ---
 
@@ -297,37 +318,14 @@ done | grep "WGS " | sort -n -k 7 | sed -n '3p'  # Median result
 
 ## 🔄 Regression Testing (CI/CD)
 
-### Automated Performance Checks
+### Automated correctness checks
 
-**GitHub Actions example:**
-```yaml
-name: Performance Regression
+The query benchmark workflow runs `tests/test_remote_profile.py` against Release
+builds of `traceon` and `remote_bench`. It checks payload accounting, request
+sample counts, and invalid-input handling, including batched queries.
 
-on: [pull_request]
-
-jobs:
-  benchmark:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Install Dependencies
-        run: pip install psutil tqdm
-      
-      - name: Build TracEon
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target traceon_driver -j
-      
-      - name: Run Regression Check
-        run: |
-          ./build/traceon_driver lookup build/test.bin 100000 read_ 30000 > build/result.txt
-          python benchmarks/check_regression.py build/result.txt
-```
-
-**Exit codes:**
-- `0`: Throughput meets the configured threshold
-- `1`: Invalid input or throughput below the configured threshold
+Hosted-runner timings do not define a portable throughput threshold. Use the
+controlled repeated-study protocol in `PERFORMANCE.md` for comparative claims.
 
 ---
 
@@ -346,10 +344,8 @@ jobs:
 - Tests against production data (E. coli, C. elegans, human chr21)
 - Validates correctness, not just performance
 
-**`check_regression.py`** (CI/CD integration)
-- Parses a `Throughput:` value from a benchmark result file
-- Enforces the configured absolute threshold (currently the 100 MB category)
-- Returns pass/fail exit codes for automated testing
+`check_regression.py` is retired and exits with an explanation; historical
+absolute thresholds must not gate current releases.
 
 ### Configuration
 

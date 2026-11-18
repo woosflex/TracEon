@@ -5,7 +5,7 @@
  *
  * Implements the CRC-32C variant used by SCTP/iSCSI/ext4 (reflected in/out,
  * polynomial 0x1EDC6F41, init 0xFFFFFFFF, final XOR 0xFFFFFFFF) as the
- * `.traceon` v4 whole-payload integrity checksum. Three implementations:
+ * `.traceon` v4/v5 whole-payload integrity checksum. Three implementations:
  *
  *   - crc32c_x86_run   — x86 SSE4.2 CRC32 instruction (`_mm_crc32_u*`),
  *                        compiled only when TRACEON_HAS_AVX2 is defined
@@ -184,7 +184,7 @@ crc32c_x86_run(const uint8_t* data, size_t len, uint32_t crc) noexcept {
  * CRC-32C value (init 0xFFFFFFFF, final XOR 0xFFFFFFFF). One-shot callers
  * can use the free function crc32c().
  *
- * This is the checksum used by the `.traceon` v4 binary format: it covers
+ * This is the checksum used by the `.traceon` v4/v5 binary formats: it covers
  * the canonical header fields (everything up to but excluding the checksum
  * field itself) plus the ENTIRE uncompressed logical payload. On the
  * save/load paths the accumulator is updated as chunks pass through the

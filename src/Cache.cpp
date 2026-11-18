@@ -8,25 +8,30 @@ namespace TracEon {
 
     // --- Data Access ---
 
-    std::string Cache::get(const std::string& key) {
+    std::string Cache::get(std::string_view key) {
         return m_strategy->getSequence(key);
     }
 
-    std::string_view Cache::getView(const std::string& key) {
+    std::string_view Cache::getView(std::string_view key) {
         return m_strategy->getView(key);
     }
 
-    std::optional<DecodedFastqRecord> Cache::getFastqRecord(const std::string& key) {
-        if (m_strategy->hasSequence(key)) {
-            return DecodedFastqRecord{
-                m_strategy->getSequence(key),
-                m_strategy->getQuality(key)
-            };
-        }
-        return std::nullopt;
+    std::optional<FastqRecordView> Cache::getRecordView(std::string_view key) {
+        auto rec = m_strategy->findRecord(key);
+        if (!rec) return std::nullopt;
+        return FastqRecordView{rec->sequence, rec->quality};
     }
 
-    bool Cache::hasSequence(const std::string& key) {
+    std::optional<DecodedFastqRecord> Cache::getFastqRecord(std::string_view key) {
+        auto rec = m_strategy->findRecord(key);
+        if (!rec) return std::nullopt;
+        return DecodedFastqRecord{
+            std::string(rec->sequence),
+            std::string(rec->quality)
+        };
+    }
+
+    bool Cache::hasSequence(std::string_view key) {
         return m_strategy->hasSequence(key);
     }
 
@@ -40,6 +45,10 @@ namespace TracEon {
 
     void Cache::save(const std::string& filepath) {
         m_strategy->saveBinary(filepath);
+    }
+
+    void Cache::save(const std::string& filepath, CacheStorage storage) {
+        m_strategy->saveBinary(filepath, storage);
     }
 
     void Cache::restore(const std::string& filepath) {
@@ -66,7 +75,7 @@ namespace TracEon {
         return m_strategy->getIndexMode();
     }
 
-    std::string Cache::getQuality(const std::string& key) const {
+    std::string Cache::getQuality(std::string_view key) const {
         return m_strategy->getQuality(key);
     }
 

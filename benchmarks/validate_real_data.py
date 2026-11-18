@@ -14,6 +14,7 @@ Features:
 import os
 import sys
 import subprocess
+import tempfile
 import time
 import gzip
 import shutil
@@ -431,63 +432,58 @@ def prepare_dataset(ds: Dict[str, Any], skip_existing: bool = True) -> Optional[
 def run_traceon_test(binary: Path, filepath: Path, 
                      lookups: int = DEFAULT_LOOKUPS) -> Optional[Dict[str, Any]]:
     """Run TracEon load/save/lookup test on a dataset."""
-    bin_path = filepath.with_suffix('.traceon')
-    results = {}
+    with tempfile.TemporaryDirectory(prefix="traceon-validation-") as tmpdir:
+        bin_path = Path(tmpdir) / "cache.traceon"
+        results = {}
     
-    try:
-        # Test 1: Load (with GZIP decompression)
-        print(f"\n{Colors.CYAN}[1/3] Testing LOAD (GZIP decompression)...{Colors.ENDC}")
-        cmd = [str(binary), "load", str(filepath)]
-        t0 = time.time()
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, 
-                                        text=True, timeout=300)
-        load_time = time.time() - t0
-        results['load_time'] = load_time
-        print_success(f"Load completed in {load_time:.3f}s")
+        try:
+            # Test 1: Load (with GZIP decompression)
+            print(f"\n{Colors.CYAN}[1/3] Testing LOAD (GZIP decompression)...{Colors.ENDC}")
+            cmd = [str(binary), "load", str(filepath)]
+            t0 = time.time()
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
+                                            text=True, timeout=300)
+            load_time = time.time() - t0
+            results['load_time'] = load_time
+            print_success(f"Load completed in {load_time:.3f}s")
         
-        # Test 2: Save (binary cache)
-        print(f"\n{Colors.CYAN}[2/3] Testing SAVE (binary cache)...{Colors.ENDC}")
-        cmd = [str(binary), "save", str(filepath), str(bin_path)]
-        t0 = time.time()
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=300)
-        save_time = time.time() - t0
-        results['save_time'] = save_time
-        bin_size = get_file_size_mb(bin_path)
-        results['binary_size_mb'] = bin_size
-        print_success(f"Save completed in {save_time:.3f}s")
-        print_info(f"Binary cache size: {bin_size:.2f} MB")
+            # Test 2: Save (binary cache)
+            print(f"\n{Colors.CYAN}[2/3] Testing SAVE (binary cache)...{Colors.ENDC}")
+            cmd = [str(binary), "save", str(filepath), str(bin_path)]
+            t0 = time.time()
+            subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=300)
+            save_time = time.time() - t0
+            results['save_time'] = save_time
+            bin_size = get_file_size_mb(bin_path)
+            results['binary_size_mb'] = bin_size
+            print_success(f"Save completed in {save_time:.3f}s")
+            print_info(f"Binary cache size: {bin_size:.2f} MB")
         
-        # Test 3: Lookup (random access)
-        print(f"\n{Colors.CYAN}[3/3] Testing LOOKUP ({lookups:,} random queries)...{Colors.ENDC}")
-        cmd = [str(binary), "lookup", str(bin_path), str(lookups), "dummy", "0"]
-        output = subprocess.check_output(cmd, text=True, timeout=300)
-        throughput = 0
-        for line in output.splitlines():
-            if "Throughput:" in line:
-                throughput_str = line.split(":")[1].strip().split()[0]
-                throughput = float(throughput_str.replace(",", ""))
-                break
-        results['throughput'] = throughput
-        print_success(f"Throughput: {throughput:,.0f} OPS/s")
+            # Test 3: Lookup (random access)
+            print(f"\n{Colors.CYAN}[3/3] Testing LOOKUP ({lookups:,} random queries)...{Colors.ENDC}")
+            cmd = [str(binary), "lookup", str(bin_path), str(lookups), "dummy", "0"]
+            output = subprocess.check_output(cmd, text=True, timeout=300)
+            throughput = 0
+            for line in output.splitlines():
+                if "Throughput:" in line:
+                    throughput_str = line.split(":")[1].strip().split()[0]
+                    throughput = float(throughput_str.replace(",", ""))
+                    break
+            results['throughput'] = throughput
+            print_success(f"Throughput: {throughput:,.0f} OPS/s")
         
-        return results
+            return results
         
-    except subprocess.CalledProcessError as e:
-        print_error(f"Command failed: {e.output if hasattr(e, 'output') else str(e)}")
-        return None
-    except subprocess.TimeoutExpired:
-        print_error("Command timed out")
-        return None
-    except Exception as e:
-        print_error(f"Test failed: {e}")
-        return None
-    finally:
-        # Cleanup binary cache
-        if bin_path.exists():
-            try:
-                bin_path.unlink()
-            except Exception as e:
-                logger.debug(f"Failed to remove binary: {e}")
+        except subprocess.CalledProcessError as e:
+            print_error(f"Command failed: {e.output if hasattr(e, 'output') else str(e)}")
+            return None
+        except subprocess.TimeoutExpired:
+            print_error("Command timed out")
+            return None
+        except Exception as e:
+            print_error(f"Test failed: {e}")
+            return None
+
 
 def print_results_table(all_results: Dict[str, Optional[Dict[str, Any]]]):
     """Print formatted results table."""

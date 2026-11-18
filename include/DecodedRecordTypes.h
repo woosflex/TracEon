@@ -12,6 +12,12 @@ namespace TracEon {
         std::string quality;
     };
 
+    // Non-owning view of a record (sequence and quality views).
+    struct FastqRecordView {
+        std::string_view sequence;
+        std::string_view quality;
+    };
+
 } // namespace TracEon
 
 #endif //TRACEON_DECODEDRECORDTYPES_H

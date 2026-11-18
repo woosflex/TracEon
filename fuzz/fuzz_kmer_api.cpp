@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     size_t pos = 0;
@@ -32,28 +33,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // Pre-reserve a bounded derived capacity; failure is legal (returns 0).
     (void)kmerindex_reserve(h, static_cast<size_t>(next64() % 65536));
 
-    size_t ops = (size == 0) ? 4 : (1 + size / 16);
-    if (ops > 2048) ops = 2048;
+    // Always exercise a populated index, including collision and hit paths.
+    const uint64_t first_key = next64();
+    const uint64_t first_value = next64();
+    const bool inserted = kmerindex_insert(h, first_key, first_value) == 1;
+    if (inserted && kmerindex_insert(h, first_key ^ 1, first_value) != 0) std::abort();
+
+    size_t ops = std::min<size_t>(1 + size / 17, 2048);
+    bool frozen = false;
     for (size_t i = 0; i < ops; ++i) {
+        const uint8_t operation = next_byte();
         const uint64_t key = next64();
         const uint64_t val = next64();
-        switch (i & 3) {
-        case 0: // get with the key just derived (get() freezes the index)
-        {
+        switch (operation & 3) {
+        case 0: {
             uint64_t matched = 0;
-            const uint64_t* p = kmerindex_get(h, key, &matched);
-            if (p) { volatile uint64_t sink = *p; (void)sink; }
+            (void)kmerindex_get(h, key, &matched);
+            frozen = true;
             break;
         }
-        case 1: // NULL output-pointer guard (legal error, never a crash)
+        case 1:
             (void)kmerindex_get(h, key, nullptr);
             break;
-        default: // plain insert (may fail once frozen — legal)
-            (void)kmerindex_insert(h, key, val);
+        default: {
+            const int status = kmerindex_insert(h, key, val);
+            if (frozen && status == 1) std::abort();
             break;
         }
-        (void)kmerindex_last_error(h); // thread-local diagnostic, never NULL
+        }
+        (void)kmerindex_last_error(h);
     }
+    uint64_t matched = 0;
+    const uint64_t* value = kmerindex_get(h, first_key ^ 1, &matched);
+    if (inserted && (!value || *value != first_value || matched != first_key)) std::abort();
+    if (kmerindex_reserve(h, 100) != 0 || kmerindex_insert(h, first_key + 2, 0) != 0)
+        std::abort();
+    if (inserted && *value != first_value) std::abort();
 
     (void)kmerindex_size(h);
 

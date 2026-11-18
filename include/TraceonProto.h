@@ -24,15 +24,21 @@
  *     HELLO 0x01  body: "TRO-RPC" (7 bytes) + protocol version (u8)
  *     GET   0x02  body: record key bytes (raw string)
  *     BYE   0x05  body: (empty)
+ *     GET_FASTQ 0x06 (v2 only) body: record key bytes
  *
  *   Server -> Client
  *     OK       0x81  body: status(u8) | plen(u32 LE) | payload[plen] | crc32c(u32 LE)
  *     ERROR    0x82  body: status(u8) | mlen(u32 LE) | message[mlen]
  *
+ * v1 HELLO OK payload is empty. v2 HELLO OK payload contains SnapshotInfo
+ * (encodeSnapshot below). GET_FASTQ OK payload is sequence_len(u32 LE),
+ * quality_len(u32 LE), sequence bytes, quality bytes; lengths must match.
+ * See ADR-008 for content identity and explicit v1 compatibility.
+ *
  * Integrity
  * ---------
  * Every OK-type response carries a trailing CRC32C (Castagnoli, via
- * include/Crc32c.h — the same checksum family as the v4 binary cache format).
+ * include/Crc32c.h — the same checksum family as the v4/v5 cache formats).
  * The CRC covers everything in the message body up to (but excluding) the
  * checksum field itself. The client recomputes and compares; a mismatch is a
  * connection error (the client throws and closes). ERROR frames are not CRC'd
@@ -63,13 +69,15 @@
 #include <vector>
 #include <stdexcept>
 #include <chrono>
+#include <limits>
 
 #include "Crc32c.h"
+#include "DecodedRecordTypes.h"
 
 namespace TracEon::proto {
 
 // ── Constants ────────────────────────────────────────────────────────────────
-inline constexpr uint8_t  kProtocolVersion = 1;
+inline constexpr uint8_t  kProtocolVersion = 2;
 inline constexpr size_t   kMaxMessageSize  = 64u * 1024u * 1024u; // 64 MiB cap
 inline constexpr size_t   kFrameHeaderSize = sizeof(uint64_t);    // 8-byte prefix
 inline constexpr std::string_view kMagic = "TRO-RPC";
@@ -79,6 +87,8 @@ enum class MsgType : uint8_t {
     Hello    = 0x01,
     Get      = 0x02,
     Bye      = 0x05,
+    GetFastq = 0x06, // v2 only; 0x03/0x04 remain reserved
+    GetBatch = 0x07, // v2 + kBatch capability
     Ok       = 0x81,
     Error    = 0x82,
 };
@@ -96,6 +106,20 @@ struct Frame {
     MsgType      type;
     std::vector<char> body;
 };
+
+inline constexpr uint32_t kSequence = 1;
+inline constexpr uint32_t kFastq = 2;
+inline constexpr uint32_t kBatch = 4;
+inline constexpr size_t kMaxBatchRecords = 256;
+struct SnapshotInfo {
+    uint32_t capabilities = kSequence;
+    uint64_t records = 0;
+    std::string id; // 64 lowercase hex digits: canonical content SHA-256
+};
+
+inline bool validSnapshotId(std::string_view id) {
+    return id.size() == 64 && id.find_first_not_of("0123456789abcdef") == id.npos;
+}
 
 // ── Little-endian serialization helpers ─────────────────────────────────────
 inline void append_u8(std::vector<char>& v, uint8_t x) { v.push_back(static_cast<char>(x)); }
@@ -120,6 +144,111 @@ inline uint64_t read_le64(const char* p) {
     return x;
 }
 
+// v2 HELLO OK payload: version(u8), capabilities(u32), count(u64), SHA-256(32 bytes).
+inline std::vector<char> encodeSnapshot(const SnapshotInfo& info) {
+    if (!validSnapshotId(info.id)) throw std::invalid_argument("invalid snapshot SHA-256");
+    std::vector<char> payload;
+    append_u8(payload, kProtocolVersion);
+    append_le32(payload, info.capabilities);
+    append_le64(payload, info.records);
+    auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    for (size_t i = 0; i < info.id.size(); i += 2)
+        append_u8(payload, static_cast<uint8_t>((nibble(info.id[i]) << 4) | nibble(info.id[i + 1])));
+    return payload;
+}
+
+inline SnapshotInfo decodeSnapshot(std::string_view payload) {
+    if (payload.size() != 45 || static_cast<uint8_t>(payload[0]) != kProtocolVersion)
+        throw std::runtime_error("traceon protocol: malformed v2 snapshot metadata");
+    SnapshotInfo info;
+    info.capabilities = read_le32(payload.data() + 1);
+    info.records = read_le64(payload.data() + 5);
+    if (!(info.capabilities & kSequence))
+        throw std::runtime_error("traceon protocol: missing sequence capability");
+    constexpr char hex[] = "0123456789abcdef";
+    for (size_t i = 13; i < payload.size(); ++i) {
+        const auto byte = static_cast<uint8_t>(payload[i]);
+        info.id += hex[byte >> 4];
+        info.id += hex[byte & 15];
+    }
+    return info;
+}
+
+// Batch request: fastq(u8), count(u32), repeated key_len(u32) + key bytes.
+inline std::vector<char> encodeBatchRequest(const std::vector<std::string>& keys, bool fastq) {
+    if (keys.empty() || keys.size() > kMaxBatchRecords)
+        throw std::invalid_argument("batch requires 1 to 256 keys");
+    size_t size = 5;
+    for (const auto& key : keys) {
+        const size_t remaining = kMaxMessageSize - 1 - size;
+        if (remaining < 4 || key.size() > remaining - 4)
+            throw std::length_error("batch request exceeds frame limit");
+        size += 4 + key.size();
+    }
+    std::vector<char> body;
+    body.reserve(size);
+    append_u8(body, fastq);
+    append_le32(body, static_cast<uint32_t>(keys.size()));
+    for (const auto& key : keys) {
+        append_le32(body, static_cast<uint32_t>(key.size()));
+        body.insert(body.end(), key.begin(), key.end());
+    }
+    return body;
+}
+
+inline std::pair<bool, std::vector<std::string_view>> decodeBatchRequest(const std::vector<char>& body) {
+    if (body.size() < 5 || static_cast<uint8_t>(body[0]) > 1)
+        throw std::runtime_error("malformed batch request");
+    const auto count = read_le32(body.data() + 1);
+    if (count == 0 || count > kMaxBatchRecords)
+        throw std::runtime_error("batch requires 1 to 256 keys");
+    std::vector<std::string_view> keys;
+    keys.reserve(count);
+    size_t offset = 5;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (body.size() - offset < 4) throw std::runtime_error("truncated batch key length");
+        const size_t size = read_le32(body.data() + offset);
+        offset += 4;
+        if (size > body.size() - offset) throw std::runtime_error("truncated batch key");
+        keys.emplace_back(body.data() + offset, size);
+        offset += size;
+    }
+    if (offset != body.size()) throw std::runtime_error("trailing batch request bytes");
+    return {body[0] != 0, std::move(keys)};
+}
+
+// Batch OK payload: count(u32), then status(u8), seq_len(u32), qual_len(u32),
+// sequence and quality per record. Missing entries carry status=NOT_FOUND and zero lengths.
+inline std::vector<std::optional<DecodedFastqRecord>> decodeBatchPayload(
+        std::string_view payload, size_t expected_count, bool fastq) {
+    if (expected_count == 0 || expected_count > kMaxBatchRecords || payload.size() < 4 ||
+        read_le32(payload.data()) != expected_count)
+        throw std::runtime_error("batch response count mismatch");
+    std::vector<std::optional<DecodedFastqRecord>> records;
+    records.reserve(expected_count);
+    size_t offset = 4;
+    for (size_t i = 0; i < expected_count; ++i) {
+        if (payload.size() - offset < 9) throw std::runtime_error("truncated batch record");
+        const auto status = static_cast<uint8_t>(payload[offset]);
+        const size_t seq_size = read_le32(payload.data() + offset + 1);
+        const size_t qual_size = read_le32(payload.data() + offset + 5);
+        offset += 9;
+        if (status == kNotFound) {
+            if (seq_size || qual_size) throw std::runtime_error("missing batch record has payload");
+            records.emplace_back(std::nullopt);
+            continue;
+        }
+        if (status != kOk || (fastq ? seq_size != qual_size : qual_size != 0) ||
+            seq_size > payload.size() - offset || qual_size > payload.size() - offset - seq_size)
+            throw std::runtime_error("invalid batch record status or lengths");
+        records.emplace_back(DecodedFastqRecord{std::string(payload.substr(offset, seq_size)),
+                                               std::string(payload.substr(offset + seq_size, qual_size))});
+        offset += seq_size + qual_size;
+    }
+    if (offset != payload.size()) throw std::runtime_error("trailing batch response bytes");
+    return records;
+}
+
 // ── Frame encode / decode (pure, testable without a socket) ─────────────────
 /** Encode a frame to the full wire representation (prefix + type + body). */
 inline std::vector<char> encodeFrame(MsgType type, const std::vector<char>& body) {
@@ -142,6 +271,8 @@ inline std::vector<char> encodeFrame(MsgType type, const std::vector<char>& body
  * The CRC covers status + plen + payload (everything before the checksum).
  */
 inline std::vector<char> encodeOk(uint8_t status, const std::vector<char>& payload) {
+    if (payload.size() > kMaxMessageSize - 10)
+        throw std::length_error("OK payload exceeds frame limit");
     std::vector<char> body;
     body.reserve(1 + 4 + payload.size() + 4);
     append_u8(body, status);
@@ -206,80 +337,129 @@ inline std::pair<uint8_t, std::string> decodeError(const std::vector<char>& body
 // ── POSIX socket helpers (Linux/macOS; v2.3.0 scope) ─────────────────────────
 #ifndef _WIN32
 
-inline constexpr int kReadTimeoutMs = 30000; // default per-read idle timeout
+inline constexpr int kReadTimeoutMs = 30000; // default complete-operation deadline
+using IoClock = std::chrono::steady_clock;
+using IoDeadline = IoClock::time_point;
 
-/**
- * Read exactly n bytes from fd. Blocks until n bytes are available, EOF, or
- * `timeout_ms` elapses with no progress. Returns false on EOF/error/timeout
- * (caller distinguishes via consumed count when partial progress happened).
- */
-inline bool readFull(int fd, char* buf, size_t n, int timeout_ms = kReadTimeoutMs) {
+inline IoDeadline deadlineAfter(int timeout_ms) {
+    return IoClock::now() + std::chrono::milliseconds(timeout_ms);
+}
+
+inline int remainingMillis(IoDeadline deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - IoClock::now()).count();
+    if (remaining <= 0) return 0;
+    return remaining > std::numeric_limits<int>::max()
+        ? std::numeric_limits<int>::max() : static_cast<int>(remaining);
+}
+
+/** Read exactly n bytes before one caller-owned absolute deadline. */
+inline bool readFullUntil(int fd, char* buf, size_t n, IoDeadline deadline) {
     size_t got = 0;
     while (got < n) {
+        const int remaining = remainingMillis(deadline);
+        if (remaining == 0) return false;
         struct pollfd p{fd, POLLIN, 0};
-        int pr = ::poll(&p, 1, timeout_ms);
-        if (pr == 0) return false;                      // idle timeout
+        const int pr = ::poll(&p, 1, remaining);
+        if (pr == 0) return false;
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        ssize_t r = ::recv(fd, buf + got, n - got, 0);
-        if (r == 0) return false;                       // EOF
+        const ssize_t r = ::recv(fd, buf + got, n - got, MSG_DONTWAIT);
+        if (r == 0) return false;
         if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;                               // connection error
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return false;
         }
         got += static_cast<size_t>(r);
     }
     return true;
 }
 
-/** Write all bytes; returns false on error. Suppresses SIGPIPE. */
-inline bool writeAll(int fd, const char* buf, size_t n) {
+inline bool readFull(int fd, char* buf, size_t n, int timeout_ms = kReadTimeoutMs) {
+    return readFullUntil(fd, buf, n, deadlineAfter(timeout_ms));
+}
+
+/** Write all bytes before one caller-owned absolute deadline. */
+inline bool writeAllUntil(int fd, const char* buf, size_t n, IoDeadline deadline) {
     size_t sent = 0;
     while (sent < n) {
-#if defined(MSG_NOSIGNAL)
-        ssize_t w = ::send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
-#else
-        ssize_t w = ::send(fd, buf + sent, n - sent, 0);
-#endif
-        if (w < 0) {
+        const int remaining = remainingMillis(deadline);
+        if (remaining == 0) return false;
+        struct pollfd p{fd, POLLOUT, 0};
+        const int pr = ::poll(&p, 1, remaining);
+        if (pr == 0) return false;
+        if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
         }
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+#if defined(MSG_NOSIGNAL)
+        const int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
+#else
+        const int flags = MSG_DONTWAIT;
+#endif
+        const ssize_t w = ::send(fd, buf + sent, n - sent, flags);
+        if (w < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return false;
+        }
+        if (w == 0) return false;
         sent += static_cast<size_t>(w);
     }
     return true;
 }
 
-/**
- * Read one frame from fd. Returns std::nullopt on clean EOF at a frame
- * boundary (peer closed between frames). Throws std::runtime_error on
- * protocol violations (truncated header/payload, oversize payload) and
- * returns nullopt on idle timeout/connection error (readFull failure).
- */
-inline std::optional<Frame> readFrame(int fd, int timeout_ms = kReadTimeoutMs) {
+inline bool writeAll(int fd, const char* buf, size_t n,
+                     int timeout_ms = kReadTimeoutMs) {
+    return writeAllUntil(fd, buf, n, deadlineAfter(timeout_ms));
+}
+
+inline std::optional<Frame> readFrameUntil(int fd, IoDeadline deadline) {
     char hdr[kFrameHeaderSize];
-    if (!readFull(fd, hdr, sizeof(hdr), timeout_ms)) return std::nullopt;
+    if (!readFullUntil(fd, hdr, sizeof(hdr), deadline)) return std::nullopt;
     const uint64_t payload_len = read_le64(hdr);
     if (payload_len == 0 || payload_len > kMaxMessageSize) {
         throw std::runtime_error("traceon protocol: implausible payload length "
                                  "(0 or > 64 MiB)");
     }
-    std::vector<char> payload(payload_len); // bounded by kMaxMessageSize
-    if (!readFull(fd, payload.data(), payload.size(), timeout_ms)) {
+    char type_byte;
+    if (!readFullUntil(fd, &type_byte, 1, deadline))
         throw std::runtime_error("traceon protocol: truncated frame payload");
-    }
     Frame f;
-    f.type = static_cast<MsgType>(static_cast<uint8_t>(payload[0]));
-    f.body.assign(payload.begin() + 1, payload.end());
+    f.type = static_cast<MsgType>(static_cast<uint8_t>(type_byte));
+    size_t remaining = payload_len - 1;
+    // Read body in bounded chunks so untrusted length headers cannot force 64 MiB allocations upfront.
+    char chunk[65536];
+    while (remaining > 0) {
+        const size_t to_read = std::min(sizeof(chunk), remaining);
+        if (!readFullUntil(fd, chunk, to_read, deadline))
+            throw std::runtime_error("traceon protocol: truncated frame payload");
+        if (f.body.size() + to_read > f.body.capacity()) {
+            const size_t needed = f.body.size() + to_read;
+            const size_t target = std::min(payload_len - 1, std::max(needed, f.body.capacity() * 2));
+            f.body.reserve(target);
+        }
+        f.body.insert(f.body.end(), chunk, chunk + to_read);
+        remaining -= to_read;
+    }
     return f;
 }
 
-/** Write one frame to fd; returns false on error. */
-inline bool writeFrame(int fd, MsgType type, const std::vector<char>& body) {
+inline std::optional<Frame> readFrame(int fd, int timeout_ms = kReadTimeoutMs) {
+    return readFrameUntil(fd, deadlineAfter(timeout_ms));
+}
+
+inline bool writeFrameUntil(int fd, MsgType type, const std::vector<char>& body,
+                            IoDeadline deadline) {
     const std::vector<char> wire = encodeFrame(type, body);
-    return writeAll(fd, wire.data(), wire.size());
+    return writeAllUntil(fd, wire.data(), wire.size(), deadline);
+}
+
+inline bool writeFrame(int fd, MsgType type, const std::vector<char>& body,
+                       int timeout_ms = kReadTimeoutMs) {
+    return writeFrameUntil(fd, type, body, deadlineAfter(timeout_ms));
 }
 
 #endif // !_WIN32

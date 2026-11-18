@@ -65,12 +65,13 @@ import random
 import shutil
 import subprocess
 import gzip
+import tempfile
 
 # === CONFIGURATION ===
 TRACEON_BINARY = "../build/traceon_driver"
 SEQKIT = "seqkit"
 REAL_DATA_DIR = "../real_data"
-TMP_DIR = ".valuechain_tmp"
+TMP_DIR = None  # Set only inside the run-owned TemporaryDirectory.
 
 M_RUNS = 5
 LOOKUPS_FASTQ = 50_000          # task spec: 50k lookups/run on FASTQ
@@ -105,8 +106,7 @@ fname, n, prefix, m = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4
 db = pyfastx.Fastq(fname) if 'fastq' in fname else pyfastx.Fasta(fname)
 random.seed(42)
 for _ in range(n):
-    try: _ = str(db[f"{prefix}{random.randint(0, m-1)}"])
-    except: pass
+    _ = str(db[f"{prefix}{random.randint(0, m-1)}"])
 """
 
 PYFASTX_LOOKUP_REALIDS_SCRIPT = """
@@ -116,18 +116,17 @@ db = pyfastx.Fasta(fname)
 ids = list(db.keys())
 random.seed(42)
 for _ in range(n):
-    try: _ = str(db[random.choice(ids)])
-    except: pass
+    _ = str(db[random.choice(ids)])
 """
 
 
 # === UTILITIES ===
-def run_timed(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
+def run_timed(cmd, stdout=subprocess.DEVNULL, stderr=None):
     """Fresh subprocess, wall-clock. Returns (seconds, stdout_text).
     Wall-clock is used uniformly for every tool (seqkit, traceon_driver,
     python), so process-spawn overhead affects all rows the same way."""
     t0 = time.time()
-    r = subprocess.run(cmd, stdout=stdout, stderr=stderr, text=True)
+    r = subprocess.run(cmd, stdout=stdout, stderr=stderr, text=True, check=True)
     return time.time() - t0, (r.stdout or "")
 
 
@@ -179,21 +178,6 @@ def gen_ids_file(path, ids, n, seed=42):
     with open(path, "w") as f:
         for _ in range(n):
             f.write(rnd.choice(ids) + "\n")
-
-
-def cleanup():
-    if os.path.isdir(TMP_DIR):
-        shutil.rmtree(TMP_DIR, ignore_errors=True)
-    for d in [REAL_DATA_DIR, "."]:
-        if not os.path.isdir(d):
-            continue
-        for suf in [".fai", ".gzi", ".fxi", ".traceon_bench_tmp"]:
-            for f in os.listdir(d):
-                if f.endswith(suf):
-                    try:
-                        os.remove(os.path.join(d, f))
-                    except OSError:
-                        pass
 
 
 # === SECTION A: fair parse comparison ===
@@ -248,6 +232,8 @@ def section_a():
 
 # === SECTION B: end-to-end repeated-use workflow ===
 def fastq_e2e(fname, fmt):
+    # PyFastX creates adjacent indexes. Give it only run-owned copies.
+    fname = shutil.copy2(fname, TMP_DIR)
     print("\n" + "-" * 118)
     n_seqs, _ = count_records_and_avglen(fname, fmt)
     print(f"B. END-TO-END (FASTQ): {fname} — {n_seqs:,} records, "
@@ -312,7 +298,7 @@ def fastq_e2e(fname, fmt):
 
 def fasta_e2e(fname, fmt):
     print("\n" + "-" * 118)
-    path = os.path.join(REAL_DATA_DIR, fname)
+    path = shutil.copy2(os.path.join(REAL_DATA_DIR, fname), TMP_DIR)
     n_seqs, _ = count_records_and_avglen(path, fmt)
     print(f"B. END-TO-END (FASTA): {fname} — {n_seqs:,} contigs, "
           f"{LOOKUPS_FASTA:,} lookups/run x {M_RUNS} runs (scaled down from 50k: "
@@ -398,13 +384,10 @@ def main():
     if not os.path.exists(TRACEON_BINARY):
         print("Compile driver first! (expected ../build/traceon_driver)")
         sys.exit(1)
-    if not os.path.isdir(TMP_DIR):
-        os.makedirs(TMP_DIR)
-    try:
+    global TMP_DIR
+    with tempfile.TemporaryDirectory(prefix="traceon-valuechain-") as TMP_DIR:
         section_a()
         section_b()
-    finally:
-        cleanup()
 
 
 if __name__ == "__main__":

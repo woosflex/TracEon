@@ -8,7 +8,7 @@ bytes.
 
 | Target            | Code under test                                                                 |
 |-------------------|----------------------------------------------------------------------------------|
-| `fuzz_v4_loader`  | `.traceon` v4 binary loader — `SmartStrategy::loadBinary` / `Cache::restore`     |
+| `fuzz_v4_loader`  | `.traceon` v4 migration + v5 loader — `SmartStrategy::loadBinary` / `Cache::restore` |
 | `fuzz_gzip_loader`| GZIP load path — `loadGzipFile` + `loadFile` extension/magic detection           |
 | `fuzz_fastq`      | FASTQ text parsing (`loadFile`, GENOME + NGS modes)                              |
 | `fuzz_fasta`      | FASTA text parsing + in-place `normalizeFastaArena` (GENOME + NGS modes)         |
@@ -66,9 +66,9 @@ CI: `.github/workflows/fuzz.yml` — push/PR to main + weekly schedule.
 
 ## Seed corpus (`fuzz/corpus/<target>/`)
 
-Reproducible: `fuzz/tools/gen_corpus.py` regenerates every non-v4 seed and
-`fuzz/tools/gen_v4_corpus.cpp` regenerates the v4 loader seeds (it crafts
-LZ4-compressed payloads + CRC32C, so it links the project's lz4:
+Reproducible: `fuzz/tools/gen_corpus.py` regenerates non-binary seeds and
+`fuzz/tools/gen_v4_corpus.cpp` regenerates v4 migration and v5 loader seeds. It crafts
+LZ4-compressed payloads plus CRC32C, so it links the project's LZ4 library:
 
 ```bash
 ANKERL=$(find build build-fuzz -path '*ankerl_unordered_dense-src/include' 2>/dev/null | head -1)
@@ -81,12 +81,13 @@ g++ -std=c++20 -O2 -I include -I third_party/lz4/lib -I "$ANKERL" \
 
 Contents per target:
 
-- **v4_loader/** — valid GENOME + NGS round-trip caches, plus the crafted
-  malformed variants from `tests/test_binary_cache.cpp`: legacy v1/v2/v3
-  magic, unknown version, bad codec flags, invalid mode, truncated header /
-  frame / tail, wrong logical length (2^64-1, <8), 2^64-1 frame length,
-  mutated CRC / header bytes, count bombs (5e8, 3-with-1-record,
-  2-with-junk), old `MMAP` format, empty frame.
+- **v4_loader/** — valid v4 migration and v5 GENOME/NGS caches; CRC-valid
+  duplicate-ID seeds for both modes/versions; and directed malformed v5 seeds
+  for invalid format, count/length boundaries, payload trailing bytes, and
+  truncation. Legacy malformed seeds cover v1/v2/v3 magic, unknown version,
+  codec/mode errors, wrong lengths, checksum changes, count bombs, old `MMAP`,
+  and empty frames. The historical target/directory name is retained for CI
+  compatibility; the target exercises the binary-cache loader.
 - **gzip_loader/** — valid small gzip FASTQ + FASTA, truncated member,
   trailing garbage, concatenated valid+truncated, non-gzip text, binary
   garbage, empty file.

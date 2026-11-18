@@ -105,7 +105,7 @@ TEST_CASE("FASTA last record without trailing newline", "[strategy][fasta][notra
     {
         std::ofstream out(test_file_path, std::ios::binary);
         out << ">seq1\nACGTACGTACGTACGT\n"
-               "        >seq2\nGGGGCCCC";  // <-- no trailing newline
+               ">seq2\nGGGGCCCC";  // <-- no trailing newline
         out.close();
     }
     strategy.loadFile(test_file_path);
@@ -641,69 +641,47 @@ TEST_CASE("Pre-reserved MT FASTA — last record without trailing newline",
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Bug A regression: normalizeFastaArena must not truncate the file
+// Bug A regression: validation must reject malformed boundaries before
+// normalizeFastaArena can truncate or reinterpret the file.
 // ═══════════════════════════════════════════════════════════════════════════
-// normalizeFastaArena() used to write the sequence-terminating '\n'
-// UNCONDITIONALLY after copying each record's sequence. When a sequence run
-// ends exactly at the next '>' marker, that write clobbers the next record's
-// '>' and the outer loop breaks there — silently dropping every later
-// record. Two well-formed triggers: (a) a sequence that abuts the next
-// header with no newline, and (b) a header-only (empty-sequence) record,
-// which is valid FASTA as produced by seqkit seq -m / bioawk filters. The
-// terminator is now emitted only when the sequence produced output bytes
-// (and, for the EOF-without-newline case, written into the +1 resize slot).
 
-TEST_CASE("FASTA — sequence abuts next header (no newline) — all records preserved",
-          "[strategy][fasta][bugA]") {
-    // '>a\nACGT>b\nTTTT\n>c\nGGGG\n' — the sequence of record 'a' ends
-    // exactly at the '>' of record 'b' with no newline between them.
+TEST_CASE("FASTA — a header marker must begin a line",
+          "[strategy][fasta][integrity]") {
     TracEon::SmartStrategy strategy;
-    std::string path = "bugA_abut.fasta";
-    {
-        std::ofstream out(path, std::ios::binary);
-        out << ">a\nACGT>b\nTTTT\n>c\nGGGG\n";
-    }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 3); // was: 1 (b and c silently dropped)
-    REQUIRE(strategy.getSequence("a") == "ACGT");
-    REQUIRE(strategy.getSequence("b") == "TTTT");
-    REQUIRE(strategy.getSequence("c") == "GGGG");
+    const std::string path = "bugA_abut.fasta";
+    { std::ofstream out(path, std::ios::binary); out << ">a\nACGT>b\nTTTT\n"; }
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getArenaBytes() == 0);
     fs::remove(path);
 }
 
 
-TEST_CASE("FASTA — header-only record (valid empty sequence) — later records preserved",
-          "[strategy][fasta][bugA]") {
-    // '>a\n>b\nACGT\n' — record 'a' has no sequence (empty-seq records are
-    // dropped by the parser by design), but record 'b' must survive. The old
-    // code overwrote the '>' of 'b' and truncated the whole file after 'a'.
+TEST_CASE("FASTA — header-only record rejects the entire input",
+          "[strategy][fasta][integrity]") {
     TracEon::SmartStrategy strategy;
     std::string path = "bugA_headonly.fasta";
     {
         std::ofstream out(path, std::ios::binary);
         out << ">a\n>b\nACGT\n";
     }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 1); // was: 0 (whole file truncated)
-    REQUIRE_FALSE(strategy.hasSequence("a"));  // empty sequence → not stored
-    REQUIRE(strategy.hasSequence("b"));
-    REQUIRE(strategy.getSequence("b") == "ACGT");
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
     fs::remove(path);
 }
 
 
-TEST_CASE("FASTA — header-only record at start — later records preserved",
-          "[strategy][fasta][bugA]") {
+TEST_CASE("FASTA — header-only first record rejects later prefix",
+          "[strategy][fasta][integrity]") {
     TracEon::SmartStrategy strategy;
     std::string path = "bugA_headonly_start.fasta";
     {
         std::ofstream out(path, std::ios::binary);
         out << ">empty\n>full\nACGT\n>more\nTTTT\n";
     }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 2);
-    REQUIRE(strategy.getSequence("full") == "ACGT");
-    REQUIRE(strategy.getSequence("more") == "TTTT");
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
     fs::remove(path);
 }
 
@@ -725,7 +703,7 @@ TEST_CASE("FASTA — multi-line sequence normalization (control)",
 }
 
 
-TEST_CASE("FASTA — EOF without trailing newline (control + abutting header)",
+TEST_CASE("FASTA — EOF without trailing newline (control)",
           "[strategy][fasta][bugA]") {
     TracEon::SmartStrategy strategy;
     std::string path = "bugA_eof.fasta";
@@ -739,23 +717,10 @@ TEST_CASE("FASTA — EOF without trailing newline (control + abutting header)",
     REQUIRE(strategy.getFileCacheSize() == 1);
     REQUIRE(strategy.getSequence("a") == "ACGT");
     fs::remove(path);
-
-    // Abutting header AND EOF-without-newline combined: record 'b' is last
-    // and has no trailing newline.
-    std::string path2 = "bugA_abut_eof.fasta";
-    {
-        std::ofstream out2(path2, std::ios::binary);
-        out2 << ">a\nACGT>b\nTTTT";
-    }
-    strategy.loadFile(path2);
-    REQUIRE(strategy.getFileCacheSize() == 2);
-    REQUIRE(strategy.getSequence("a") == "ACGT");
-    REQUIRE(strategy.getSequence("b") == "TTTT");
-    fs::remove(path2);
 }
 
 
-TEST_CASE("FASTA — CRLF with header-only and abutting-header records",
+TEST_CASE("FASTA — CRLF records and header-only rejection",
           "[strategy][fasta][bugA][crlf]") {
     TracEon::SmartStrategy strategy;
     std::string path = "bugA_crlf.fasta";
@@ -776,24 +741,109 @@ TEST_CASE("FASTA — CRLF with header-only and abutting-header records",
         std::ofstream out2(path2, std::ios::binary);
         out2 << ">x\r\n>y\r\nACGT\r\n";
     }
-    strategy.loadFile(path2);
-    REQUIRE(strategy.getFileCacheSize() == 1);
-    REQUIRE(strategy.getSequence("y") == "ACGT");
+    REQUIRE_THROWS_AS(strategy.loadFile(path2), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
     fs::remove(path2);
 }
 
 
-TEST_CASE("FASTA — header-only record at EOF (no crash, no phantom record)",
-          "[strategy][fasta][bugA]") {
+TEST_CASE("FASTA — header-only record at EOF rejects valid prefix",
+          "[strategy][fasta][integrity]") {
     TracEon::SmartStrategy strategy;
     std::string path = "bugA_headonly_eof.fasta";
     {
         std::ofstream out(path, std::ios::binary);
         out << ">a\nACGT\n>b\n"; // 'b' is header-only at EOF
     }
-    strategy.loadFile(path);
-    REQUIRE(strategy.getFileCacheSize() == 1);
-    REQUIRE(strategy.getSequence("a") == "ACGT");
-    REQUIRE_FALSE(strategy.hasSequence("b"));
+    REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+    REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
+    fs::remove(path);
+}
+
+TEST_CASE("Strict FASTA header grammar is identical for serial/MT and plain/GZIP",
+          "[strategy][fasta][integrity][grammar]") {
+    const std::string seq(1000, 'A');
+    auto expand = [&](const std::string& first) {
+        std::string data = first;
+        for (size_t i = 0; data.size() <= 11u * 1024u * 1024u; ++i)
+            data += ">r" + std::to_string(i) + "\n" + seq + "\n";
+        return data;
+    };
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"leading-space", " \t>bad\nACGT\n"},
+        {"header-space", "> bad\nACGT\n"},
+    };
+    for (const auto& [kind, small] : cases) {
+        for (const auto& [size_name, content] :
+             std::vector<std::pair<std::string, std::string>>{{"serial", small}, {"mt", expand(small)}}) {
+            for (bool gzip : {false, true}) {
+                INFO(kind << ' ' << size_name << (gzip ? " gzip" : " plain"));
+                const std::string path = "strict_fasta_" + kind + '_' + size_name +
+                    (gzip ? ".fa.gz" : ".fa");
+                if (gzip) (void)compress_to_gzip_bytes(content, path);
+                else { std::ofstream out(path, std::ios::binary); out << content; }
+                TracEon::SmartStrategy strategy;
+                REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+                REQUIRE(strategy.getFileCacheSize() == 0);
+                REQUIRE(strategy.getArenaBytes() == 0);
+                REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
+                const std::string valid = "strict_fasta_reuse.fa";
+                { std::ofstream out(valid, std::ios::binary); out << ">ok\nACGT\n"; }
+                REQUIRE_NOTHROW(strategy.loadFile(valid));
+                REQUIRE(strategy.hasSequence("ok"));
+                fs::remove(valid);
+                fs::remove(path);
+            }
+        }
+    }
+}
+
+TEST_CASE("Trailing FASTA header rejects the entire plain or GZIP input",
+          "[strategy][fasta][integrity]") {
+    const std::string small = ">ok\nACGT\n>bad\n";
+    std::string large;
+    large.reserve(12u * 1024u * 1024u);
+    const std::string seq(1000, 'A');
+    for (size_t i = 0; large.size() <= 11u * 1024u * 1024u; ++i)
+        large += ">r" + std::to_string(i) + "\n" + seq + "\n";
+    large += ">bad\n";
+
+    for (const auto& [label, content] :
+         std::vector<std::pair<std::string, std::string>>{{"serial", small}, {"multithreaded", large}}) {
+        for (bool gzip : {false, true}) {
+            INFO(label << (gzip ? " gzip" : " plain"));
+            const std::string path = "trailing_header_" + label + (gzip ? ".fasta.gz" : ".fasta");
+            if (gzip)
+                (void)compress_to_gzip_bytes(content, path);
+            else {
+                std::ofstream out(path, std::ios::binary);
+                out << content;
+            }
+            TracEon::SmartStrategy strategy;
+            REQUIRE_THROWS_AS(strategy.loadFile(path), std::runtime_error);
+            REQUIRE(strategy.getFileCacheSize() == 0);
+            REQUIRE_FALSE(strategy.hasSequence("ok"));
+            REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
+            fs::remove(path);
+        }
+    }
+}
+
+TEST_CASE("FASTA rejects empty CR-delimited identifiers and preserves payload CR bytes", "[audit][fasta]") {
+    const std::string path = "audit_cr.fasta";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << ">\rdescription\nACGT\n";
+    }
+    TracEon::SmartStrategy cache;
+    REQUIRE_THROWS(cache.loadFile(path));
+    REQUIRE(cache.getFileCacheSize() == 0);
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << ">r\r\n\rACGT\r\r\n";
+    }
+    cache.loadFile(path);
+    REQUIRE(cache.getView("r") == "\rACGT\r");
     fs::remove(path);
 }

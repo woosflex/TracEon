@@ -1,7 +1,7 @@
 /**
  * @file TracEon.h
- * @brief TracEon: High-Performance Genomic Data Cache
- * @version 2.3.0
+ * @brief TracEon genomic snapshot cache
+ * @version 3.0.0-dev
  * @date 2026
  * 
  * @section DESCRIPTION
@@ -9,11 +9,10 @@
  * with zero-copy architecture and lock-free concurrency.
  * 
  * @section FEATURES
- * - Zero-copy string views (no allocation overhead)
- * - Lock-free concurrent reads (no mutex/RMW on the read path; ~9.6x at 14 threads, see README)
- * - `.traceon` v4 binary cache (LZ4 Frame + whole-payload CRC32C, streamed)
- * - Multithreaded parsing (8-core scaling)
- * - 40M+ OPS/s random access on modern hardware
+ * - Borrowed string views for local sequence-payload access
+ * - Immutable-phase concurrent reads without a read-side mutex
+ * - `.traceon` v5 portable binary cache (v4 migration reader; LZ4 Frame + CRC32C)
+ * - Multithreaded parsing for supported large inputs
  * 
  * @section USAGE
  * @code{.cpp}
@@ -21,10 +20,10 @@
  * 
  * TracEon::Cache cache;
  * cache.loadFile("genome.fastq");          // Parse text file
- * cache.save("genome.bin");                // Save binary cache (v4)
+ * cache.save("genome.bin");                // Save portable binary cache (v5)
  * 
  * // Later session:
- * cache.restore("genome.bin");             // Instant load via mmap
+ * cache.restore("genome.bin");             // Decompress, validate, then publish
  * std::string_view seq = cache.getView("read_001"); // Zero-copy access
  * @endcode
  * 
@@ -35,9 +34,9 @@
  * begins — stop using views from a snapshot before clearing/reloading. See
  * docs/architecture/ADR-001-lock-free-reads.md.
  *
- * @section MIGRATION (1.x -> 2.0.0)
- * - `.traceon` binary caches are v4 only; v1/v2/v3 files are rejected and
- *   must be regenerated with 2.0.0 (cache.save()).
+ * @section MIGRATION
+ * - `save()` writes portable v5; `restore()` reads v4 and v5. v1/v2/v3 are
+ *   rejected and must be regenerated.
  * - Corrupt/truncated GZIP input throws std::runtime_error.
  * - set()/addEntry() after a load throws std::logic_error.
  * - No ABI stability is promised across 1.x -> 2.x; recompile consumers.
@@ -52,7 +51,7 @@
  * - Cache: High-level API wrapper
  * - SmartStrategy: Core engine (arena allocation, lock-free reads)
  * - MapDefs: ankerl::unordered_dense with transparent wyhash-style hashing
- * - Crc32c: CRC-32C with SSE4.2/AArch64/table dispatch (v4 checksum)
+ * - Crc32c: CRC-32C with SSE4.2/AArch64/table dispatch (v4/v5 checksum)
  * 
  * For architectural details, see docs/architecture/ADR-001-lock-free-reads.md
  */
@@ -75,11 +74,10 @@
 namespace TracEon {
     /**
      * @brief Library version string
-     * Format: MAJOR.MINOR.PATCH
-     * Codename: Harpe (v2.3.0) — the v2.2.0 "Gáe Bolg" codename is retired.
+     * Development identifier. The latest published release remains v2.3.0.
      */
-    constexpr const char* VERSION = "2.3.0";
-    constexpr const char* CODENAME = "Harpe";
+    constexpr const char* VERSION = "3.0.0-dev";
+    constexpr const char* CODENAME = "Unreleased";
 }
 
 #endif // TRACEON_H

@@ -11,7 +11,7 @@ TEST_CASE("FASTQ File Loading", "[fastq]") {
         {
             std::ofstream out(test_file_path);
             out << "@seq1\nGATTACA\n+\n@@@DDDD\n"
-                << "@seq2\nCGCGCGCGCGCGCGCGCGCGCGCGCGCG\n+\nHHHIIIIIIIIIIIIIIIIIIIIIII\n";
+                << "@seq2\nCGCGCGCGCGCGCGCGCGCGCGCGCGCG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
         }
 
         TracEon::Cache cache;
@@ -27,7 +27,7 @@ TEST_CASE("FASTQ File Loading", "[fastq]") {
         auto record2 = cache.getFastqRecord("seq2");
         REQUIRE(record2.has_value());
         REQUIRE(record2->sequence == "CGCGCGCGCGCGCGCGCGCGCGCGCGCG");
-        REQUIRE(record2->quality == "HHHIIIIIIIIIIIIIIIIIIIIIII");
+        REQUIRE(record2->quality == "IIIIIIIIIIIIIIIIIIIIIIIIIIII");
 
         std::filesystem::remove(test_file_path);
     }

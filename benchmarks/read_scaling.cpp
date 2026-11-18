@@ -13,9 +13,8 @@
 //     walk the index in lockstep (no artificial line-collision phase lock).
 //   * Each worker thread loops COUNT times over its shuffled key set. All
 //     workers are released simultaneously through a start barrier, then each
-//     measures its own wall time. Aggregate ops/s = total lookups / max
-//     per-thread elapsed (the coordinator's wall window from barrier release
-//     to the last thread's finish).
+//     measures its own latency. Aggregate ops/s uses the coordinator's wall
+//     window from release of all ready workers to the last worker's finish.
 //
 // Honest framing for this host (Intel Core Ultra 5 125H, 14 cores / 18
 // threads, single NUMA node, L3 = 18 MiB): with the default 100,000 records
@@ -35,6 +34,9 @@
 // vs 1 thread -> median per-thread latency -> hit rate).
 
 #include "SmartStrategy.h"
+#include "BenchmarkUtils.h"
+#include <limits>
+#include <exception>
 
 #include <algorithm>
 #include <atomic>
@@ -73,30 +75,35 @@ Options parseArgs(int argc, char** argv) {
             arg = arg.substr(0, eq);
         }
         auto val = [&]() -> std::string {
-            if (!inline_val.empty()) return inline_val;
+            if (eq != std::string::npos) return inline_val;
             if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); std::exit(2); }
             return std::string(argv[++i]);
         };
-        if (arg == "--records") o.records = std::strtoull(val().c_str(), nullptr, 10);
-        else if (arg == "--keys") o.keys = std::strtoull(val().c_str(), nullptr, 10);
-        else if (arg == "--count") o.count = std::strtoull(val().c_str(), nullptr, 10);
-        else if (arg == "--warmup") o.warmup = std::strtoull(val().c_str(), nullptr, 10);
-        else if (arg == "--reps") o.reps = std::strtoull(val().c_str(), nullptr, 10);
-        else if (arg == "--seed") o.seed = std::strtoull(val().c_str(), nullptr, 10);
+        if (arg == "--records") o.records = benchmarkUnsigned(val(), arg);
+        else if (arg == "--keys") o.keys = benchmarkUnsigned(val(), arg);
+        else if (arg == "--count") o.count = benchmarkUnsigned(val(), arg);
+        else if (arg == "--warmup") o.warmup = benchmarkUnsigned(val(), arg);
+        else if (arg == "--reps") o.reps = benchmarkUnsigned(val(), arg);
+        else if (arg == "--seed") o.seed = benchmarkUnsigned(val(), arg);
         else if (arg == "--threads") {
             o.threads.clear();
             const std::string s = val();
             size_t pos = 0;
             while (pos < s.size()) {
                 size_t comma = s.find(',', pos);
-                o.threads.push_back(std::atoi(s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos).c_str()));
+                const auto n = benchmarkUnsigned(s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos), arg);
+                if (n == 0 || n > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+                    throw std::invalid_argument("--threads entries must be positive int values");
+                o.threads.push_back(static_cast<int>(n));
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
-            if (o.threads.empty() || o.threads[0] < 1) { std::fprintf(stderr, "--threads needs >= 1 positive values\n"); std::exit(2); }
+            if (o.threads.empty() || s.back() == ',') { std::fprintf(stderr, "--threads needs >= 1 positive values\n"); std::exit(2); }
         }
         else { std::fprintf(stderr, "unknown option: %s\n", arg.c_str()); std::exit(2); }
     }
+    if (o.records == 0 || o.count == 0 || o.reps == 0)
+        throw std::invalid_argument("--records, --count and --reps must be positive");
     return o;
 }
 
@@ -142,37 +149,55 @@ std::vector<WorkerStats> runThreads(int nthreads,
                                     const TracEon::SmartStrategy& cache,
                                     const std::vector<std::string>& keys,
                                     uint64_t count, uint64_t warmup,
-                                    uint64_t seed) {
+                                    uint64_t seed, double& wall) {
     std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
     std::vector<WorkerStats> stats(nthreads);
-    std::vector<std::thread> pool;
+    std::vector<std::exception_ptr> errors(nthreads);
+    std::vector<Clock::time_point> finished(nthreads);
+    std::vector<std::jthread> pool;
     pool.reserve(static_cast<size_t>(nthreads));
 
     for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t]() {
-            // Private shuffled traversal order: per-thread RNG so threads do
-            // not walk the index in lockstep (seed = base seed + t).
-            std::vector<size_t> order(keys.size());
-            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-            std::mt19937_64 rng(seed + static_cast<uint64_t>(t));
-            std::shuffle(order.begin(), order.end(), rng);
+        pool.emplace_back([&, t](std::stop_token stop) {
+            bool announced = false;
+            try {
+                // Private shuffled traversal order: per-thread RNG so threads do
+                // not walk the index in lockstep (seed = base seed + t).
+                std::vector<size_t> order(keys.size());
+                for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+                std::mt19937_64 rng(seed + static_cast<uint64_t>(t));
+                std::shuffle(order.begin(), order.end(), rng);
 
-            // Untimed warmup: touch every key, populate TLB/caches.
-            for (uint64_t w = 0; w < warmup; ++w) (void)runPass(cache, keys, order, 1);
+                // Untimed warmup: touch every key, populate TLB/caches.
+                for (uint64_t w = 0; w < warmup; ++w) (void)runPass(cache, keys, order, 1);
 
-            // Spin on the start barrier so all threads begin within nanoseconds
-            // of each other (no coordinator drift in the measured window).
-            while (!go.load(std::memory_order_acquire)) { /* spin */ }
+                // Release only after every worker has completed warmup.
+                announced = true;
+                ready.fetch_add(1, std::memory_order_release);
+                while (!go.load(std::memory_order_acquire)) {
+                    if (stop.stop_requested()) return;
+                    std::this_thread::yield();
+                }
 
-            const auto t0 = Clock::now();
-            WorkerStats s = runPass(cache, keys, order, count);
-            const auto t1 = Clock::now();
-            s.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-            stats[static_cast<size_t>(t)] = s;
+                const auto t0 = Clock::now();
+                WorkerStats s = runPass(cache, keys, order, count);
+                const auto t1 = Clock::now();
+                s.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+                stats[static_cast<size_t>(t)] = s;
+                finished[static_cast<size_t>(t)] = t1;
+            } catch (...) {
+                errors[static_cast<size_t>(t)] = std::current_exception();
+                if (!announced) ready.fetch_add(1, std::memory_order_release);
+            }
         });
     }
+    while (ready.load(std::memory_order_acquire) != nthreads) std::this_thread::yield();
+    const auto start = Clock::now();
     go.store(true, std::memory_order_release);
     for (auto& th : pool) th.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    wall = std::chrono::duration<double>(*std::max_element(finished.begin(), finished.end()) - start).count();
     return stats;
 }
 
@@ -233,15 +258,14 @@ int runBenchmark(const Options& o) {
     for (size_t ti = 0; ti < o.threads.size(); ++ti) {
         const int nthreads = o.threads[ti];
         for (uint64_t r = 0; r < o.reps; ++r) {
-            std::vector<WorkerStats> st = runThreads(nthreads, cache, keys, o.count, o.warmup, o.seed);
+            double wall = 0;
+            std::vector<WorkerStats> st = runThreads(nthreads, cache, keys, o.count, o.warmup, o.seed, wall);
             const uint64_t total_lookups = o.count * nkeys * static_cast<uint64_t>(nthreads);
             const uint64_t total_hits = [&]{ uint64_t h = 0; for (auto& s : st) h += s.hits; return h; }();
             const uint64_t total_sink = [&]{ uint64_t s = 0; for (auto& w : st) s += w.sink; return s; }();
 
-            double wall = 0.0;
             std::vector<double> per_thread_us;
             for (auto& s : st) {
-                wall = std::max(wall, s.elapsed_s);
                 per_thread_us.push_back((s.lookups > 0)
                     ? s.elapsed_s / static_cast<double>(s.lookups) * 1e6 : 0.0);
             }
@@ -270,10 +294,9 @@ int runBenchmark(const Options& o) {
     }
     bool base_was_extra = false;
     if (base <= 0.0) {
-        std::vector<WorkerStats> st = runThreads(1, cache, keys, o.count, o.warmup, o.seed);
+        double wall = 0;
+        runThreads(1, cache, keys, o.count, o.warmup, o.seed, wall);
         const uint64_t tl = o.count * nkeys;
-        double wall = 0.0;
-        for (auto& s : st) wall = std::max(wall, s.elapsed_s);
         base = static_cast<double>(tl) / wall;
         base_was_extra = true;
     }
@@ -299,6 +322,9 @@ int runBenchmark(const Options& o) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const Options o = parseArgs(argc, argv);
-    return runBenchmark(o);
+    try { return runBenchmark(parseArgs(argc, argv)); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "read_scaling: %s\n", e.what());
+        return 1;
+    }
 }

@@ -389,3 +389,27 @@ TEST_CASE("Duplicate key set() — first wins, save/restore consistent (NGS)",
     }
     fs::remove(bin);
 }
+
+#include "../src/Parallel.h"
+#include "../src/ZlibWindow.h"
+
+TEST_CASE("Parallel work joins siblings before propagating errors", "[audit][parallel]") {
+    std::atomic<int> completed{0};
+    REQUIRE_THROWS_AS(TracEon::detail::parallelFor(0, 8, [&](size_t i) {
+        if (i == 0) throw std::bad_alloc();
+        ++completed;
+    }), std::bad_alloc);
+    REQUIRE(completed == 7);
+}
+
+TEST_CASE("GZIP budget admission is atomic across workers", "[audit][gzip]") {
+    std::atomic<size_t> reserved{60};
+    std::atomic<int> admitted{0};
+    TracEon::detail::parallelFor(0, 16, [&](size_t) {
+        if (TracEon::detail::reserveGzipBytes(reserved, 30, 100)) ++admitted;
+    });
+    REQUIRE(admitted == 1);
+    REQUIRE(reserved == 90);
+    REQUIRE_FALSE(TracEon::detail::reserveGzipBytes(reserved, SIZE_MAX, 100));
+    REQUIRE(reserved == 90);
+}

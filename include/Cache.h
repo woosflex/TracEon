@@ -30,11 +30,15 @@ namespace TracEon {
          * @brief Retrieve a sequence by ID (Legacy API).
          * @return A copy of the sequence string, or empty string if not found.
          */
-        std::string get(const std::string& key);
+        std::string get(std::string_view key);
 
         /**
-         * @brief Retrieve a zero-copy view of a sequence (High Performance).
+         * @brief Retrieve a borrowed view of the sequence payload.
          * @return A std::string_view pointing directly to the immutable arena.
+         *         FASTA/FASTQ header descriptions and FASTQ plus-line metadata
+         *         are not retained; this method never returns quality scores.
+         *         Empty also represents a valid zero-length FASTQ sequence;
+         *         use hasSequence() when absence must be distinguished.
          *
          * @warning LIFECYCLE CONTRACT (reader quiescence — see ADR-001 and the
          *          README "Lifecycle contract" section): the returned view is
@@ -47,17 +51,24 @@ namespace TracEon {
          *          The write-side mutex serializes writers only; it does NOT
          *          protect a view after the call returns.
          */
-        std::string_view getView(const std::string& key);
+        std::string_view getView(std::string_view key);
 
         /**
-         * @brief Retrieve both sequence and quality scores.
+         * @brief Retrieve non-owning sequence and quality views for a record in a single lookup.
+         * For FASTA records, quality is empty.
          */
-        std::optional<DecodedFastqRecord> getFastqRecord(const std::string& key);
+        std::optional<FastqRecordView> getRecordView(std::string_view key);
+
+        /**
+         * @brief Retrieve owned sequence and quality payloads for a FASTQ ID.
+         * Header descriptions and plus-line metadata are not retained.
+         */
+        std::optional<DecodedFastqRecord> getFastqRecord(std::string_view key);
 
         /**
          * @brief Check if a key exists without retrieving data.
          */
-        bool hasSequence(const std::string& key);
+        bool hasSequence(std::string_view key);
 
         // --- I/O Operations ---
         
@@ -91,22 +102,30 @@ namespace TracEon {
         void loadGzipFile(const std::string& filepath);
         
         /**
-         * @brief Save the current index to a binary cache file (v4 format).
+         * @brief Save the current index to a portable v5 binary cache file.
          *
-         * v2.0.0 format: "TRO\x04" header (codec flags, index mode, logical
-         * length, frame length, CRC32C) + streamed LZ4 Frame. The CRC32C
-         * checksum is computed incrementally over the uncompressed payload as
-         * it passes through the compressor — no second full-payload pass.
+         * v5 uses explicit little-endian fields, stores full identifiers (not
+         * implementation-specific hash values), preserves detected format, and
+         * wraps the payload in an integrity-checked streamed LZ4 Frame.
          * @note Entries added via set() are included in the serialized payload.
          * @throws std::runtime_error if the file cannot be written.
          */
         void save(const std::string& filepath);
+
+        // Explicit mapped persistence shares read-only payload pages across processes.
+        // The backing file must remain immutable; replace it atomically, never in place.
+        // restore() detects storage automatically. The one-argument save stays LZ4.
+        void save(const std::string& filepath, CacheStorage storage);
         
         /**
-         * @brief Instantaneously map a binary cache file into memory (v4 only).
+         * @brief Restore a v4 or v5 binary cache with validated decoded or mapped storage.
          *
-         * v1/v2/v3 caches are REJECTED ("unsupported cache version;
-         * regenerate with v2.0.0") — v4 is the only readable format.
+         * LZ4 files are mapped temporarily, then fully decoded and validated.
+         * v5 mapped payloads retain the read-only mapping after validation.
+         * Never modify/truncate an open mapped file; replace it atomically.
+         * Both paths rebuild a private index before publication. v5 is canonical and
+         * portable; v4 remains readable for migration. v1/v2/v3 are rejected.
+         * Physical bytes after the declared frame are rejected.
          * @throws std::runtime_error on malformed/implausible cache files:
          *         wrong magic/version, unsupported codec/mode, truncated data,
          *         wrong logical length, checksum mismatch, implausible size/
@@ -139,8 +158,8 @@ namespace TracEon {
         size_t size() const;
 
         /**
-         * @brief Bytes held by the loaded snapshot's arena stores (text
-         * arena + manual-entry bytes). Forwarded to SmartStrategy::getArenaBytes().
+         * @brief Backing bytes: text arena + manual entries + retained mapped
+         * file (including its header). This is not private RSS or PSS. Forwarded to SmartStrategy::getArenaBytes().
          * Used by the remote STATS message (v2.3.0 remote access).
          */
         size_t getArenaBytes() const;
@@ -152,7 +171,7 @@ namespace TracEon {
          * @return A copy of the quality line, or empty string if not found /
          *         FASTA (no quality stored).
          */
-        std::string getQuality(const std::string& key) const;
+        std::string getQuality(std::string_view key) const;
 
         /**
          * @brief Enumerate all keys currently in the cache (copies).

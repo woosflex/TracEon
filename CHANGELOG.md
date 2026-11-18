@@ -7,9 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [3.0.0-dev] — Unreleased
+
+The latest published release remains v2.3.0. This development line contains
+breaking API/protocol and default cache-write changes; no release date is set.
+Historical performance numbers later in this file are retained as release-note
+provenance only and are not current validated comparative evidence.
 
 ### Changed
+
+- Restored the local record-cache focus: prepare once, open locally, query across
+  independent processes. The TCP service remains optional.
+- Added `CacheStorage::Mapped` to `Cache::save` / `SmartStrategy::saveBinary`,
+  and `--mapped` to both cache builders. Portable v5 codec 0 stores immutable
+  uncompressed payloads, retains a read-only mapping, and shares payload pages
+  across independent readers. It uses the existing CRC32C, checked record
+  parser, duplicate rejection, and atomic writer; indexes remain private.
+  One-argument saves still use LZ4. Earlier v5 readers reject the new codec.
+- `getArenaBytes()` includes retained mapped-file bytes (including the header);
+  it reports backing storage, not private RSS or PSS.
+
+- zlib-ng host-native instructions are now opt-in rather than forcibly enabled.
+  Release and Docker configurations explicitly disable them for redistribution.
+- Added opt-in protocol v2 batch retrieval (`getBatch`, CLI `--batch-size`),
+  bounded to 256 IDs and the existing 64 MiB frame limit. Batches preserve
+  ordering, duplicates, per-ID misses, FASTQ qualities, and operation deadlines.
+- Remote benchmark clients can query from ID lists without restoring a cache.
+  The Docker remote client uses this path and no longer mounts the dataset.
+- Added relocatable CMake installation/export of core, remote, and experimental
+  k-mer libraries, headers, tools, and private static-codec dependencies/licenses.
+  `BUILD_TESTING=OFF` skips Catch2; core-only builds install the cache builder
+  without OpenSSL. A downstream shared-library consumer exercises the installation.
+- Protocol v2 adds canonical SHA-256 snapshot identity, capability/record-count
+  metadata, constructor/CLI identity pinning, and complete FASTQ retrieval.
+  The server retains v1 sequence access; new clients need explicit v1 mode for
+  old servers. `traceon info` reports the served snapshot; `query --fastq` returns
+  sequence and quality. Remote builds now require OpenSSL Crypto for startup hashing.
+- Added the supported POSIX `traceon build`, `serve`, and `query` commands.
+  Query workers use the resident service without loading a local cache copy.
+- Server admission now defaults to 64 retained connections, configurable in
+  the CLI and constructor. Excess connections close before HELLO. The configured
+  server deadline now applies to writes as well as reads, and oversized response
+  payloads are rejected before copying them into protocol buffers.
+- Cache saves use a synchronized temporary file and atomic POSIX replacement;
+  parent-directory synchronization follows replacement. Pre-commit failures
+  preserve the prior cache. Post-commit directory-sync failures explicitly report
+  uncertain durability. Symlink/device destinations are rejected.
 
 - **Breaking (C API):** removed the unused `kmerindex_freeze`,
   `kmerindex_iter_begin`, and `kmerindex_iter_next` exports from the k-mer
@@ -19,14 +62,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed symbol. No in-tree callers existed.
 - **Breaking (remote protocol):** removed the unused `HAS` / `STATS` /
   `OK_STATS` messages and the `kInternal` / `kCrcMismatch` status codes.
-  Only the HELLO/GET/BYE read path remains; see ADR-006 for the recorded
-  design and the post-ADR removal note.
+  The HELLO/GET/BYE read path remains compatible; v2 adds GET_FASTQ at a new
+  opcode. See ADR-006 for the historical design and ADR-008 for v2.
 - Removed other dead public API surface and development-only artifacts from
   the repository (KmerIndex.h, KmerReferenceIndex.h, unused benchmarks).
 - Hardened remote connection cleanup and added regression coverage for remote
   lifecycle and shutdown paths.
 - Kept the v2.3.0 benchmark report as historical provenance; current-checkout
   validation is reported separately until the next release is tagged.
+- **Breaking (input validation):** supported four-line FASTQ now requires equal
+  sequence/quality lengths, and FASTA rejects header-only records. Structural
+  failures are detected before indexing so a valid prefix is never published.
+  **Erratum:** this repair is new to 3.0.0-dev; malformed-prefix publication
+  persisted through development commit `9b6349e` and was not fixed in v2.0.0.
+- **Breaking (binary writes):** `save()` writes portable v5 with little-endian
+  payload fields, exact detected format, and full identifiers in both modes.
+  The reader retains v4 migration support and rejects physical trailing bytes.
+- NGS indexing now retains full identifier keys, removing correctness and
+  persistence dependence on implementation-specific `std::hash` values.
+- `clearCache()` resets detected format; failed restore no longer changes the
+  mode of a later text load.
+- Serialized k-mer freeze/mutation admission and client close/request I/O;
+  failed remote protocol/CRC operations now close the client connection.
 
 ## [2.3.0] - 2026-08-20
 

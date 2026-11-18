@@ -363,3 +363,115 @@ TEST_CASE("C API: concurrent get after freeze is race-free; inserts fail",
     }
     kmerindex_destroy(h);
 }
+
+TEST_CASE("C API: create and destroy clear stale thread-local diagnostics",
+          "[kmer][capi][diagnostic]") {
+    REQUIRE(kmerindex_size(nullptr) == 0);
+    REQUIRE_FALSE(std::string(kmerindex_last_error(nullptr)).empty());
+    kmerindex_t* h = kmerindex_create();
+    REQUIRE(h != nullptr);
+    REQUIRE(std::string(kmerindex_last_error(h)).empty());
+    REQUIRE(kmerindex_reserve(nullptr, 1) == 0);
+    REQUIRE_FALSE(std::string(kmerindex_last_error(nullptr)).empty());
+    kmerindex_destroy(h);
+    REQUIRE(std::string(kmerindex_last_error(nullptr)).empty());
+}
+
+TEST_CASE("C API: serialized build completes before deterministic freeze",
+          "[kmer][capi][thread][freeze]") {
+    kmerindex_t* h = kmerindex_create();
+    REQUIRE(h != nullptr);
+    REQUIRE(kmerindex_reserve(h, 10000) == 1);
+    constexpr uint64_t writers_n = 4, per_writer = 2000;
+    std::atomic<bool> build_ok{true};
+    std::vector<std::jthread> writers;
+    for (uint64_t t = 0; t < writers_n; ++t) {
+        writers.emplace_back([&, t] {
+            for (uint64_t i = 0; i < per_writer; ++i) {
+                if (kmerindex_insert(h, ((1 + t * per_writer + i) << 1), i) != 1)
+                    build_ok.store(false);
+            }
+        });
+    }
+    for (auto& writer : writers) writer.join();
+    REQUIRE(build_ok.load());
+    REQUIRE(kmerindex_size(h) == writers_n * per_writer);
+
+    uint64_t matched = 0;
+    REQUIRE(kmerindex_get(h, 2, &matched) != nullptr); // deterministic freeze point
+    const size_t frozen_size = kmerindex_size(h);
+    std::atomic<bool> post_freeze_ok{true};
+    std::vector<std::jthread> readers;
+    for (uint64_t t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t] {
+            for (uint64_t i = 0; i < 1000; ++i) {
+                if (kmerindex_size(h) != frozen_size ||
+                    kmerindex_insert(h, ((100000 + t * 1000 + i) << 1), i) != 0)
+                    post_freeze_ok.store(false);
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    REQUIRE(post_freeze_ok.load());
+    REQUIRE(kmerindex_size(h) == frozen_size);
+    kmerindex_destroy(h);
+}
+
+TEST_CASE("C API: mutation racing first lookup is serialized at freeze",
+          "[kmer][capi][thread][freeze]") {
+    for (int round = 0; round < 500; ++round) {
+        kmerindex_t* h = kmerindex_create();
+        REQUIRE(h != nullptr);
+        REQUIRE(kmerindex_insert(h, 2, 11) == 1);
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        int insert_result = -2;
+        const uint64_t* found = nullptr;
+        uint64_t matched = 0;
+        std::jthread mutator([&] {
+            ready.fetch_add(1);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            insert_result = kmerindex_insert(h, 4, 22);
+        });
+        std::jthread freezer([&] {
+            ready.fetch_add(1);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            found = kmerindex_get(h, 2, &matched);
+        });
+        while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        go.store(true, std::memory_order_release);
+        mutator.join(); freezer.join();
+        REQUIRE(found != nullptr);
+        REQUIRE(*found == 11);
+        REQUIRE((insert_result == 0 || insert_result == 1));
+        const size_t expected = insert_result == 1 ? 2u : 1u;
+        std::atomic<bool> sizes_ok{true};
+        std::jthread size_a([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
+        std::jthread size_b([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
+        size_a.join(); size_b.join();
+        REQUIRE(sizes_ok.load());
+        REQUIRE(kmerindex_insert(h, 6, 33) == 0);
+        kmerindex_destroy(h);
+    }
+}
+
+#ifndef _WIN32
+#include <sys/mman.h>
+TEST_CASE("K-mer accepts a size_t view larger than INT_MAX", "[audit][kmer][oom]") {
+    if (sizeof(size_t) < 8) SKIP("requires a 64-bit address space");
+    const size_t length = size_t{1} << 31;
+    void* region = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) SKIP("large virtual mapping unavailable");
+    struct Mapping {
+        void* data;
+        size_t size;
+        ~Mapping() { munmap(data, size); }
+    } mapping{region, length};
+    auto* bytes = static_cast<char*>(region);
+    bytes[0] = 'A';
+    uint64_t encoded = 99;
+    REQUIRE(TracEon::encode_kmer(std::string_view(bytes, length), 1, encoded));
+    REQUIRE(encoded == 0);
+}
+#endif

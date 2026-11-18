@@ -47,7 +47,7 @@ namespace TracEon {
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(TRACEON_HAS_NEON)
 [[nodiscard]] inline const char* simd_find_char_neon(const char* ptr, const char* end, char c) noexcept {
     const uint8x16_t needle = vdupq_n_u8(static_cast<uint8_t>(c));
-    while (ptr + 16 <= end) {
+    while (end - ptr >= 16) {
         uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(ptr));
         uint8x16_t eq = vceqq_u8(chunk, needle);
         uint64x2_t eq64 = vreinterpretq_u64_u8(eq);
@@ -68,7 +68,7 @@ namespace TracEon {
 #if defined(TRACEON_HAS_AVX2) && (defined(__GNUC__) || defined(__clang__))
 [[nodiscard]] __attribute__((target("avx2"))) inline const char* simd_find_char_avx2(const char* ptr, const char* end, char c) noexcept {
     const __m256i needle = _mm256_set1_epi8(c);
-    while (ptr + 32 <= end) {
+    while (end - ptr >= 32) {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
         __m256i eq = _mm256_cmpeq_epi8(chunk, needle);
         unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(eq));

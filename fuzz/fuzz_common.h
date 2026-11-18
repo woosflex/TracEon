@@ -63,7 +63,7 @@ inline void ensure_tmp_dir() {
 #endif
 }
 
-// Write `data` into a fresh file in the scratch dir. Returns the path.
+// Reuse one input file per suffix; libFuzzer invokes cases serially per process. Returns the path.
 // `suffix` (e.g. ".gz") lets targets control the temp name for
 // extension-based format detection in loadFile().
 // Aborts only on harness-level failure (unwritable temp dir) — never on
@@ -71,8 +71,7 @@ inline void ensure_tmp_dir() {
 inline std::string write_input_to_tmp(const uint8_t* data, size_t size,
                                       const char* suffix = "") {
     ensure_tmp_dir();
-    static unsigned long counter = 0;
-    std::string path = tmp_dir() + "/in" + std::to_string(counter++) + suffix;
+    std::string path = tmp_dir() + "/input" + suffix;
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) std::abort(); // harness bug: cannot create scratch file
     if (size > 0 && std::fwrite(data, 1, size, f) != size) {

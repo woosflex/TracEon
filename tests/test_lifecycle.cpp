@@ -73,9 +73,11 @@ TEST_CASE("clearCache() then reload — no dangling views", "[strategy]") {
     TracEon::SmartStrategy strategy;
     strategy.loadFile(fasta_path);
     REQUIRE(strategy.getFileCacheSize() == 2);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::DNA_FASTA);
 
     strategy.clearCache();
     REQUIRE(strategy.getFileCacheSize() == 0);
+    REQUIRE(strategy.getDetectedFormat() == TracEon::FileFormat::UNKNOWN);
     REQUIRE_FALSE(strategy.hasSequence("seq1"));
 
     // Reload the same file — old text_arena_ is gone; new arena must be used

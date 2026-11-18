@@ -9,6 +9,7 @@
 /build/
 /build-asan/
 /build-ubsan/
+/build-core-package/
 
 # Sanitizer/runtime scratch
 /asan-runtime/
@@ -37,6 +38,7 @@
 *.bin
 *.log
 *.txt
+!CMakeLists.txt
 *.json
 
 # But the fuzz seed corpus is committed source (even its *.bin seeds)

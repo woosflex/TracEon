@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <new>
 #include <type_traits>
+#include <mutex>
 
 // Custom hash/equality replicating minimap2's exact khash instantiation
 // for its minimizer table (index.c: idx_hash/idx_eq) -- bit 0 of the key
@@ -40,6 +41,10 @@ struct kmerindex_t {
     // freeze. `mutable` because get() takes a const handle (a read) but
     // still transitions the index phase.
     mutable std::atomic<bool> frozen{false};
+    // Serializes only the build-to-read transition and build-phase mutations.
+    // Once frozen is observed true, lookups skip this mutex and the map is
+    // immutable, preserving lock-free concurrent reads.
+    mutable std::mutex phase_mu;
 };
 
 namespace {
@@ -79,7 +84,9 @@ extern "C" {
 
 kmerindex_t* kmerindex_create(void) noexcept {
     try {
-        return new kmerindex_t();
+        kmerindex_t* h = new kmerindex_t();
+        clear_error();
+        return h;
     } catch (const std::bad_alloc&) {
         set_error("kmerindex_create: allocation failed");
         return nullptr;
@@ -93,6 +100,7 @@ void kmerindex_destroy(kmerindex_t* h) noexcept {
     // Destructors here are noexcept (map/vector teardown cannot throw);
     // delete of nullptr is a no-op.
     delete h;
+    clear_error();
 }
 
 int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
@@ -100,27 +108,18 @@ int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
         set_error("kmerindex_reserve: null handle");
         return 0;
     }
-    // ACQUIRE: observe a freeze published by get() (its RELEASE store). If
-    // the index is frozen, fail BEFORE touching the map -- no mutation may
-    // race with the concurrent readers.
-    if (h->frozen.load(std::memory_order_acquire)) {
-        set_error("kmerindex_reserve: index is frozen");
-        return 0;
-    }
-    // Deterministic pre-check (GitHub issue #9): ankerl::unordered_dense
-    // 4.4.0 reserve() CLAMPS to max_size() instead of throwing, so a
-    // request above max_size() (~2^32 entries for this uint32 value_idx)
-    // silently succeeds on machines where the huge allocation lands -- the
-    // C boundary would return 1 instead of the documented 0. Reject such
-    // sizes here, BEFORE any allocation, so the contract is
-    // platform-independent. The try/catch below still handles GENUINE
-    // allocation failures (bad_alloc / length_error) for sizes at or
-    // below max_size() under real memory pressure.
-    if (n > h->map.max_size()) {
-        set_error("kmerindex_reserve: requested size too large");
-        return 0;
-    }
     try {
+        // Admission and mutation share the transition mutex with the first
+        // get(). The lock itself is inside the noexcept translation boundary.
+        std::lock_guard<std::mutex> phase_lock(h->phase_mu);
+        if (h->frozen.load(std::memory_order_acquire)) {
+            set_error("kmerindex_reserve: index is frozen");
+            return 0;
+        }
+        if (n > h->map.max_size()) {
+            set_error("kmerindex_reserve: requested size too large");
+            return 0;
+        }
         h->map.reserve(n);
         clear_error();
         return 1;
@@ -131,7 +130,7 @@ int kmerindex_reserve(kmerindex_t* h, size_t n) noexcept {
         set_error("kmerindex_reserve: allocation failed");
         return 0;
     } catch (...) {
-        set_error("kmerindex_reserve: unknown error");
+        set_error("kmerindex_reserve: synchronization or unknown failure");
         return 0;
     }
 }
@@ -141,8 +140,19 @@ size_t kmerindex_size(const kmerindex_t* h) noexcept {
         set_error("kmerindex_size: null handle");
         return 0;
     }
-    clear_error();
-    return h->map.size();
+    try {
+        if (!h->frozen.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> phase_lock(h->phase_mu);
+            const size_t result = h->map.size();
+            clear_error();
+            return result;
+        }
+        clear_error();
+        return h->map.size();
+    } catch (...) {
+        set_error("kmerindex_size: synchronization or unknown failure");
+        return 0;
+    }
 }
 
 int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) noexcept {
@@ -150,14 +160,12 @@ int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) noexcep
         set_error("kmerindex_insert: null handle");
         return 0;
     }
-    // ACQUIRE: observe a freeze published by get() (its RELEASE store). If
-    // the index is frozen, fail BEFORE touching the map -- no mutation may
-    // race with the concurrent readers.
-    if (h->frozen.load(std::memory_order_acquire)) {
-        set_error("kmerindex_insert: index is frozen");
-        return 0;
-    }
     try {
+        std::lock_guard<std::mutex> phase_lock(h->phase_mu);
+        if (h->frozen.load(std::memory_order_acquire)) {
+            set_error("kmerindex_insert: index is frozen");
+            return 0;
+        }
         auto [it, inserted] = h->map.try_emplace(final_key, value);
         if (!inserted) {
             // `inserted` here is the map's own try_emplace bool (0/1 only,
@@ -176,7 +184,7 @@ int kmerindex_insert(kmerindex_t* h, uint64_t final_key, uint64_t value) noexcep
         set_error("kmerindex_insert: allocation failed");
         return -1;
     } catch (...) {
-        set_error("kmerindex_insert: unknown error");
+        set_error("kmerindex_insert: synchronization or unknown failure");
         return -1;
     }
 }
@@ -192,12 +200,13 @@ const uint64_t* kmerindex_get(const kmerindex_t* h, uint64_t query_key,
         return nullptr;
     }
     try {
-        // Freeze BEFORE lookup: the returned pointer is an interior pointer
-        // that must remain stable; no inserts may happen from this point on.
-        // RELEASE store: any insert that later ACQUIRE-loads the flag and
-        // fails has happened-after this point, so the interior pointer it
-        // might otherwise have invalidated can never dangle.
-        h->frozen.store(true, std::memory_order_release);
+        // The first lookup closes the build phase under the same mutex used by
+        // every mutator. Later lookups observe frozen with acquire semantics
+        // and remain lock-free because the map can no longer change.
+        if (!h->frozen.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> phase_lock(h->phase_mu);
+            h->frozen.store(true, std::memory_order_release);
+        }
         auto it = h->map.find(query_key);
         if (it == h->map.end()) {
             clear_error();

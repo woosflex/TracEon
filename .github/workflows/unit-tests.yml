@@ -7,6 +7,25 @@ on:
     branches: [ "main" ]
 
 jobs:
+  release-package:
+    name: Release build and installed consumer
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+    - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - run: cmake --build build -j4
+    - run: ctest --test-dir build --output-on-failure
+    - name: Core-only package without OpenSSL or tests
+      run: |
+        cmake -S . -B build-core -DBUILD_TESTING=OFF -DTRACEON_BUILD_SERVER=OFF \
+          -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE -DCMAKE_BUILD_TYPE=Release \
+          -DFETCHCONTENT_SOURCE_DIR_ZLIB-NG="$PWD/build/_deps/zlib-ng-src" \
+          -DFETCHCONTENT_SOURCE_DIR_ANKERL_UNORDERED_DENSE="$PWD/build/_deps/ankerl_unordered_dense-src"
+        cmake --build build-core -j4
+        python3 tests/test_install.py "$(command -v cmake)" "$PWD/build-core" \
+          "$PWD/tests/downstream" "$(command -v c++)" Release
+
   test:
     name: Run Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -17,6 +36,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install remote hashing dependency (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+    - name: Locate remote hashing dependency (macOS)
+      if: runner.os == 'macOS'
+      run: echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
     - name: Configure CMake with TSan
       run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
@@ -40,3 +67,8 @@ jobs:
         ./test_binary_cache "~[oom]"
         ./test_lifecycle "~[oom]"
         ./test_api_misc "~[oom]"
+        ./test_remote "~[oom]"
+        ./kmer_c_compile_test
+        ./test_save_allocations
+        python3 ../tests/test_service_cli.py ./traceon
+        python3 ../tests/audit_checks.py --build-dir .

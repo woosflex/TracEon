@@ -1,37 +1,16 @@
-name: Create Release and Build Binaries
+name: Build and verify release packages
 
-# This workflow runs when a new tag is pushed (e.g., v1.0.0, v1.0.1)
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  workflow_dispatch:
 
-# Add permissions for the GITHUB_TOKEN to create a release and write assets
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  # This job creates the GitHub Release once.
-  create_release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-
   build:
-    name: Build on ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
-    needs: create_release # This job runs only after the release has been created.
+    name: Package ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -42,48 +21,53 @@ jobs:
           - { os: windows-11-arm, arch: "arm64" }
           - { os: macos-15-intel, arch: "x86_64" }
           - { os: macos-latest, arch: "arm64" }
-
     runs-on: ${{ matrix.platform.os }}
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Configure CMake
-        # Force Release build type
-        run: cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build Driver
-        # Explicitly target traceon_driver
-        run: cmake --build ${{ github.workspace }}/build --config Release --target traceon_driver
-
-      # --- Packaging for Windows ---
-      - name: Prepare Artifacts (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          # MSVC Release binaries are typically in /Release subdirectory
-          Compress-Archive -Path ${{ github.workspace }}/build/Release/traceon_driver.exe -DestinationPath ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
-        shell: pwsh
-
-      # --- Packaging for Linux/macOS ---
-      - name: Prepare Artifacts (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          # Unix binaries are typically in the build root
-          tar -czvf ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz -C ${{ github.workspace }}/build traceon_driver
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Locate OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWITH_NATIVE_INSTRUCTIONS=OFF
+      - name: Build all default targets
+        run: cmake --build build --config Release -j4
+      - name: Test including installed consumer
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install package
+        run: cmake --install build --config Release --component TracEon --prefix package
+      - name: Check packaging and archive manifests
+        run: python3 tests/test_package_release.py
+      - name: Archive installed files and provenance
         shell: bash
+        env:
+          PACKAGE_OS: ${{ runner.os }}
+          PACKAGE_ARCH: ${{ matrix.platform.arch }}
+        run: python3 tools/package_release.py package artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traceon-${{ runner.os }}-${{ matrix.platform.arch }}
+          path: artifacts/*
+          if-no-files-found: error
 
-      # --- Upload Assets ---
-      - name: Upload Release Asset (Windows)
-        if: runner.os == 'Windows'
-        uses: softprops/action-gh-release@v2
+  draft_release:
+    name: Attach verified packages to draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: ${{ github.workspace }}/traceon-windows-${{ matrix.platform.arch }}.zip
-
-      - name: Upload Release Asset (Linux/macOS)
-        if: runner.os != 'Windows'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: ${{ github.workspace }}/traceon-${{ runner.os }}-${{ matrix.platform.arch }}.tar.gz
+          name: Release ${{ github.ref_name }}
+          draft: true
+          files: artifacts/*
+          fail_on_unmatched_files: true

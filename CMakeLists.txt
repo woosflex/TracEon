@@ -2,7 +2,9 @@
 cmake_minimum_required(VERSION 3.20)
 
 # This is us! Our project's name is TracEon.
-project(TracEon)
+project(TracEon VERSION 3.0.0 LANGUAGES C CXX)
+include(GNUInstallDirs)
+include(CTest)
 
 # We're using C++20 for all the nice modern features.
 set(CMAKE_CXX_STANDARD 20)
@@ -16,20 +18,24 @@ include(FetchContent)
 FetchContent_Declare(
         zlib-ng
         GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
-        GIT_TAG        2.2.2
+        # zlib-ng 2.2.2, pinned to an immutable commit for reproducibility.
+        GIT_TAG        c939498c7f2a1d645833a98251365e2c814fd736
 )
 set(ZLIB_COMPAT ON CACHE BOOL "Build zlib-ng with the zlib-compatible API" FORCE)
-set(WITH_NATIVE_INSTRUCTIONS ON CACHE BOOL "Enable native zlib-ng optimizations" FORCE)
+option(WITH_NATIVE_INSTRUCTIONS "Tune zlib-ng for this build host (non-portable)" OFF)
 set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "Disable bundled zlib-ng tests" FORCE)
 set(ZLIBNG_ENABLE_TESTS OFF CACHE BOOL "Disable bundled zlib-ng tests" FORCE)
 set(WITH_GTEST OFF CACHE BOOL "Disable zlib-ng GoogleTest targets" FORCE)
+set(SKIP_INSTALL_ALL ON) # Install the pinned static dependency privately with TracEon.
 FetchContent_MakeAvailable(zlib-ng)
+unset(SKIP_INSTALL_ALL)
 
 # --- ankerl::unordered_dense (header-only, MIT license) ---
 FetchContent_Declare(
         ankerl_unordered_dense
         GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
-        GIT_TAG        v4.4.0
+        # Immutable commit used by the audited candidate (API-compatible with v4.4.0).
+        GIT_TAG        231e48c9426bd21c273669e5fdcd042c146975cf
 )
 FetchContent_MakeAvailable(ankerl_unordered_dense)
 
@@ -49,16 +55,20 @@ set(CORE_SOURCES
 # the core, not vice versa).
 option(TRACEON_BUILD_SERVER "Build TracEon remote read access (POSIX sockets)" ON)
 if(TRACEON_BUILD_SERVER AND NOT WIN32)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     set(REMOTE_SOURCES
             src/TraceonServer.cpp
             src/TraceonClient.cpp
     )
     add_library(traceon_remote STATIC ${REMOTE_SOURCES})
     target_include_directories(traceon_remote PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
-    )
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/TracEon>)
+    target_compile_features(traceon_remote PUBLIC cxx_std_20)
+    set_target_properties(traceon_remote PROPERTIES EXPORT_NAME remote POSITION_INDEPENDENT_CODE ON)
+    add_library(TracEon::remote ALIAS traceon_remote)
     target_link_libraries(traceon_remote PUBLIC traceon_core Threads::Threads)
+    target_link_libraries(traceon_remote PRIVATE OpenSSL::Crypto)
     # The socket helpers in TraceonProto.h need the POSIX feature-test macros
     # at compile time (GCC 16's -include cstdint pulls libc headers in before
     # any in-file #define would take effect).
@@ -79,12 +89,13 @@ add_library(traceon_core STATIC ${CORE_SOURCES})
 # Include directories (UPDATED PATHS)
 # traceon_core users need 'include/'
 # traceon_core implementation needs 'third_party/lz4/lib' and 'third_party/'
-target_include_directories(traceon_core PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
-    ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
-    ${ankerl_unordered_dense_SOURCE_DIR}/include # ankerl::unordered_dense
-)
+target_include_directories(traceon_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${ankerl_unordered_dense_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/TracEon>)
+target_compile_features(traceon_core PUBLIC cxx_std_20)
+set_target_properties(traceon_core PROPERTIES EXPORT_NAME core POSITION_INDEPENDENT_CODE ON)
+add_library(TracEon::core ALIAS traceon_core)
 
 # GCC 16.1.1+ removed implicit <cstdint> includes; robin_hood.h needs UINT64_C
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
@@ -92,7 +103,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_G
 endif()
 
 # Link traceon_core to both zlib and lz4
-target_link_libraries(traceon_core PUBLIC zlibstatic lz4_static)
+target_link_libraries(traceon_core PUBLIC zlibstatic lz4_static Threads::Threads)
 
 # ── Architecture-aware runtime dispatch macros (Fat Binary) ───────────────
 # Detect host processor and enable compile-time macros that allow the code to
@@ -125,15 +136,25 @@ if(TRACEON_BUILD_SERVER AND NOT WIN32)
     target_link_libraries(remote_bench PRIVATE traceon_remote Threads::Threads)
     target_compile_definitions(remote_bench PRIVATE _GNU_SOURCE)
 
-    # Cache builder: turns a FASTA/FASTQ into a v4 .traceon cache (Docker
-    # testbed + manual flows).
-    add_executable(traceon_make_cache tools/traceon_make_cache.cpp)
-    target_link_libraries(traceon_make_cache PRIVATE traceon_core)
+    add_executable(traceon tools/traceon.cpp)
+    target_link_libraries(traceon PRIVATE traceon_remote)
 endif()
+
+# Cache construction also works in core-only builds.
+add_executable(traceon_make_cache tools/traceon_make_cache.cpp)
+target_link_libraries(traceon_make_cache PRIVATE traceon_core)
 
 # --- Benchmark Driver ---
 add_executable(traceon_driver traceon_driver.cpp)
 target_link_libraries(traceon_driver PRIVATE traceon_core)
+
+# Opt-in FASTA subset adapter for the mapping feasibility experiment.
+add_executable(traceon_subset EXCLUDE_FROM_ALL benchmarks/traceon_subset.cpp)
+target_link_libraries(traceon_subset PRIVATE traceon_core)
+if(TARGET traceon_remote)
+    target_link_libraries(traceon_subset PRIVATE traceon_remote)
+    target_compile_definitions(traceon_subset PRIVATE TRACEON_SUBSET_REMOTE)
+endif()
 
 # ── Read-scaling benchmark (v2.3.0 "Harpe", slice 2) ────────────────────────
 # Standalone benchmark target: lock-free getView() read throughput vs thread
@@ -152,12 +173,36 @@ target_link_libraries(read_scaling PRIVATE traceon_core Threads::Threads)
 add_executable(example_usage examples/simple_usage.cpp)
 target_link_libraries(example_usage PRIVATE traceon_core)
 
+# ── K-mer experimental targets (OUT of the core umbrella) ──────────────────
+# traceon_kmer is deliberately NOT part of CORE_SOURCES, does not appear in
+# the public umbrella header (TracEon.h), and is not linked into
+# traceon_core. It is an opt-in, separately built static library covering
+# the C shim for the minimap2-style minimizer table
+# (src/kmerindex_c_api.cpp) plus the header-only k-mer encoder
+# (KmerEncoding.h).
+add_library(traceon_kmer STATIC src/kmerindex_c_api.cpp)
+# Consumers need include/ for kmerindex_c_api.h + the header-only k-mer
+# headers; ankerl is an implementation detail of the shim only.
+target_include_directories(traceon_kmer PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/TracEon>
+)
+target_include_directories(traceon_kmer PRIVATE
+    ${ankerl_unordered_dense_SOURCE_DIR}/include # ankerl::unordered_dense
+)
+
+target_compile_features(traceon_kmer PUBLIC cxx_std_20)
+set_target_properties(traceon_kmer PROPERTIES EXPORT_NAME kmer POSITION_INDEPENDENT_CODE ON)
+add_library(TracEon::kmer ALIAS traceon_kmer)
+
+if(BUILD_TESTING)
 # --- Test Setup using Catch2 ---
 include(FetchContent)
 FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG        v3.6.0 
+        # Immutable commit used by the audited candidate (Catch2 3.6 series).
+        GIT_TAG        4e8d92bf02f7d1c8006a0e7a5ecabd8e62d98502
 )
 FetchContent_MakeAvailable(Catch2)
 
@@ -166,7 +211,6 @@ enable_testing()
 add_executable(unit_tests ${TEST_SOURCES})
 target_link_libraries(unit_tests PRIVATE traceon_core Catch2::Catch2WithMain)
 
-include(CTest)
 add_test(NAME TracEonTests COMMAND unit_tests)
 
 # ── Per-domain split test executables ────────────────────────────────────────
@@ -191,6 +235,8 @@ foreach(t ${SPLIT_TEST_TARGETS})
     target_link_libraries(${t} PRIVATE traceon_core Catch2::Catch2WithMain)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+target_compile_definitions(test_binary_cache PRIVATE
+    TRACEON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Remote domain tests need the remote lib (server/client classes).
 if(TRACEON_BUILD_SERVER AND NOT WIN32)
@@ -199,24 +245,6 @@ if(TRACEON_BUILD_SERVER AND NOT WIN32)
     target_compile_definitions(test_remote PRIVATE _GNU_SOURCE)
     add_test(NAME test_remote COMMAND test_remote)
 endif()
-
-# ── K-mer experimental targets (OUT of the core umbrella) ──────────────────
-# traceon_kmer is deliberately NOT part of CORE_SOURCES, does not appear in
-# the public umbrella header (TracEon.h), and is not linked into
-# traceon_core. It is an opt-in, separately built static library covering
-# the C shim for the minimap2-style minimizer table
-# (src/kmerindex_c_api.cpp) plus the header-only k-mer encoder
-# (KmerEncoding.h).
-add_library(traceon_kmer STATIC src/kmerindex_c_api.cpp)
-# Consumers need include/ for kmerindex_c_api.h + the header-only k-mer
-# headers; ankerl is an implementation detail of the shim only.
-target_include_directories(traceon_kmer PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR} # For third_party/robin_hood.h inclusion
-)
-target_include_directories(traceon_kmer PRIVATE
-    ${ankerl_unordered_dense_SOURCE_DIR}/include # ankerl::unordered_dense
-)
 
 # ── K-mer unit tests (Catch2) ───────────────────────────────────────────────
 add_executable(kmer_tests tests/kmer_tests.cpp)
@@ -234,6 +262,66 @@ target_link_libraries(kmer_c_compile_test PRIVATE traceon_kmer)
 # drive the link with the C++ driver to pull in libstdc++.
 set_target_properties(kmer_c_compile_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME KmerCCompileTest COMMAND kmer_c_compile_test)
+
+# Focused regressions from the correctness audit.
+add_executable(test_save_allocations tests/test_save_allocations.cpp)
+target_link_libraries(test_save_allocations PRIVATE traceon_core)
+add_test(NAME test_save_allocations COMMAND test_save_allocations)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    foreach(check indexed_mapping_study summarize_paired)
+        add_test(NAME ${check} COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${check}.py)
+    endforeach()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set_target_properties(traceon_subset PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME mapping_baseline COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mapping_baseline.py)
+        add_test(NAME subset_mapping_pilot COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_subset_mapping_pilot.py
+            $<TARGET_FILE:traceon_make_cache> $<TARGET_FILE:traceon_subset>)
+        if(TARGET remote_bench)
+            add_test(NAME shared_mapping_pilot COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_shared_mapping_pilot.py
+                $<TARGET_FILE:traceon_make_cache> $<TARGET_FILE:traceon_subset>
+                $<TARGET_FILE:remote_bench>)
+        endif()
+    endif()
+    if(TARGET traceon)
+        add_test(NAME service_cli COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_service_cli.py $<TARGET_FILE:traceon>)
+        add_test(NAME service_cli_mapped COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_service_cli.py $<TARGET_FILE:traceon> --mapped)
+        add_test(NAME remote_profile COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_remote_profile.py
+            $<TARGET_FILE:traceon> $<TARGET_FILE:remote_bench>)
+    endif()
+    set(AUDIT_CHECK_ARGS --build-dir ${CMAKE_CURRENT_BINARY_DIR})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CXX_FLAGS MATCHES "sanitize")
+        add_library(atomic_file_faults SHARED tests/atomic_file_faults.c)
+        target_link_libraries(atomic_file_faults PRIVATE ${CMAKE_DL_LIBS})
+        if(TARGET traceon_make_cache)
+            add_test(NAME atomic_save COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_atomic_save.py
+                $<TARGET_FILE:traceon_make_cache> $<TARGET_FILE:traceon_driver>
+                $<TARGET_FILE:atomic_file_faults>)
+            add_test(NAME atomic_save_mapped COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_atomic_save.py
+                $<TARGET_FILE:traceon_make_cache> $<TARGET_FILE:traceon_driver>
+                $<TARGET_FILE:atomic_file_faults> --mapped)
+        endif()
+        add_library(thread_failure_inject SHARED tests/thread_failure_inject.c)
+        target_link_libraries(thread_failure_inject PRIVATE ${CMAKE_DL_LIBS})
+        list(APPEND AUDIT_CHECK_ARGS --thread-shim $<TARGET_FILE:thread_failure_inject>)
+    endif()
+    add_test(NAME audit_checks COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/audit_checks.py ${AUDIT_CHECK_ARGS})
+endif()
+
+endif() # BUILD_TESTING
+
+include(cmake/Install.cmake)
 
 # ── Fuzzing targets (libFuzzer / OSS-Fuzz style) ─────────────────────────────
 # Off by default: fuzz/*.cpp are NOT compiled at all on normal builds (they

@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+if(@TRACEON_REMOTE_INSTALLED@)
+    find_dependency(OpenSSL COMPONENTS Crypto)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/TracEonTargets.cmake")
+set(TracEon_core_FOUND TRUE)
+set(TracEon_kmer_FOUND TRUE)
+set(TracEon_remote_FOUND @TRACEON_REMOTE_INSTALLED@)
+check_required_components(TracEon)

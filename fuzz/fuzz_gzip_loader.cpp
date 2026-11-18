@@ -45,20 +45,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // decompressed in the harness; the loader remains the authoritative path.
     if (size > 8ull * 1024 * 1024) return 0;
     const std::string path = traceon_fuzz::write_input_to_tmp(data, size, ".gz");
-    // Alternate entry points: the explicit loadGzipFile() and the
-    // auto-detecting loadFile() (routes by extension, then by magic bytes).
-    const bool via_load_file = (size > 0) && ((data[0] & 1) != 0);
-    try {
-        if (via_load_file) {
-            TracEon::Cache cache;
-            cache.loadFile(path);
-        } else {
-            TracEon::SmartStrategy s;
-            s.loadGzipFile(path);
-            exercise_reads(s);
+    for (bool via_load_file : {false, true}) {
+        try {
+            if (via_load_file) {
+                TracEon::Cache cache;
+                cache.loadFile(path);
+            } else {
+                TracEon::SmartStrategy s;
+                s.loadGzipFile(path);
+                exercise_reads(s);
+            }
+        } catch (const std::exception&) {
+            // Expected rejection for malformed/truncated gzip input.
         }
-    } catch (const std::exception&) {
-        // Expected rejection for malformed/truncated gzip input.
     }
     return 0;
 }

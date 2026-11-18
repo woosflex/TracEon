@@ -14,6 +14,7 @@
 #include "SmartStrategy.h"
 #include "Cache.h"
 #include "fuzz_common.h"
+#include "TextOracle.h"
 
 #include <cstdint>
 #include <string>
@@ -38,16 +39,15 @@ void exercise_reads(TracEon::SmartStrategy& s) {
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     const std::string path = traceon_fuzz::write_input_to_tmp(data, size);
-    // Alternate GENOME / NGS index modes: both map types have their own
-    // parse + read paths.
-    const bool ngs_mode = (size > 0) && ((data[0] & 1) != 0);
-    try {
-        TracEon::SmartStrategy s(ngs_mode ? TracEon::IndexMode::NGS
-                                          : TracEon::IndexMode::GENOME);
-        s.loadFile(path);
-        exercise_reads(s);
-    } catch (const std::exception&) {
-        // Expected for malformed/truncated input.
+    for (auto mode : {TracEon::IndexMode::GENOME, TracEon::IndexMode::NGS}) {
+        try {
+            TracEon::SmartStrategy s(mode);
+            s.loadFile(path);
+            exercise_reads(s);
+            verifyText(data, size, s);
+        } catch (const std::exception&) {
+            // Expected for malformed/truncated input.
+        }
     }
     return 0;
 }

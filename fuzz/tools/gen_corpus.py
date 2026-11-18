@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Regenerate the non-v4 TracEon fuzz seed corpus.
+"""Regenerate the non-binary TracEon fuzz seed corpus.
 
-Reproduces every seed under fuzz/corpus/ EXCEPT the v4 loader seeds (which
-need real LZ4-Frame compression + CRC32C — see gen_v4_corpus.cpp).
+Reproduces every seed except the v4-migration/v5 loader seeds (which need
+real LZ4-Frame compression + CRC32C — see gen_v4_corpus.cpp).
 
 Usage:  python3 fuzz/tools/gen_corpus.py [corpus_root]
 Default corpus_root: fuzz/corpus (run from the repo root).

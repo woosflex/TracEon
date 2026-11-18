@@ -12,7 +12,7 @@
  * mutates it: every request is dispatched through the cache's lock-free,
  * zero-copy read path (getView()/hasSequence()). The immutable-after-load and
  * lock-free-read invariants (ADR-001) are preserved exactly — the same snapshot
- * can serve an arbitrary number of concurrent client connections.
+ * can serve concurrent clients up to its configured admission limit.
  *
  * Lifecycle:
  *   TraceonServer server(cache, port);   // port 0 = OS-assigned ephemeral
@@ -30,10 +30,11 @@
  */
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <thread>
 #include <mutex>
-#include <vector>
+#include <list>
 #include <memory>
 #include <atomic>
 #include <set>
@@ -53,11 +54,14 @@ public:
      *                (read it back via port() after start()).
      * @param host    Bind address ("127.0.0.1" for loopback, "0.0.0.0" to accept
      *                connections from other hosts).
-     * @param recv_timeout_ms  Per-read idle timeout for client connections.
+     * @param recv_timeout_ms  Per-frame read/write deadline, including idle clients.
+     * @param max_connections Maximum retained connection workers (must be > 0).
+     *        Excess connections close before HELLO; admitted clients are unaffected.
      */
     explicit TraceonServer(Cache& cache, uint16_t port = 9876,
                            std::string host = "127.0.0.1",
-                           int recv_timeout_ms = proto::kReadTimeoutMs);
+                           int recv_timeout_ms = proto::kReadTimeoutMs,
+                           std::size_t max_connections = 64);
     ~TraceonServer();
 
     TraceonServer(const TraceonServer&) = delete;
@@ -80,24 +84,33 @@ public:
     /** True while the accept loop is running. */
     bool isRunning() const;
 
+    /** Content identity computed before start() publishes readiness. */
+    proto::SnapshotInfo snapshotInfo() const;
+
 private:
     void acceptLoop();
     void handleClient(int fd);
-    void registerClient(int fd);
     void unregisterClient(int fd);
 
     Cache& cache_;
     std::string host_;
     uint16_t port_;
     int recv_timeout_ms_;
+    std::size_t max_connections_;
+    proto::SnapshotInfo snapshot_;
 
     int listen_fd_ = -1;
     int sockfd_control_ = -1; // wake pipe read end used to unblock poll() on the accept loop
     int sockfd_wake_ = -1;    // wake pipe write end
 
+    std::mutex lifecycle_mu_; // Serializes complete start/stop operations, including joins.
     mutable std::mutex mu_;
-    std::thread accept_thread_;
-    std::vector<std::thread> workers_;
+    std::jthread accept_thread_;
+    struct Worker {
+        std::atomic<bool> done{false};
+        std::jthread thread; // Destroy/join before the completion flag.
+    };
+    std::list<Worker> workers_; // Stable addresses until the accept loop reaps them.
     std::set<int> client_fds_;
     bool running_ = false;
     bool stopping_ = false;
