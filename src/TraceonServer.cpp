@@ -181,7 +181,7 @@ void TraceonServer::start() {
         throw std::runtime_error("TraceonServer: cannot make listener nonblocking");
     }
     try {
-        accept_thread_ = std::jthread(&TraceonServer::acceptLoop, this);
+        accept_thread_ = std::thread(&TraceonServer::acceptLoop, this);
     } catch (...) {
         running_ = false;
         closeSocket(&listen_fd_);
@@ -288,7 +288,7 @@ void TraceonServer::acceptLoop() {
             auto& worker = workers_.back();
             try {
                 client_fds_.insert(cfd);
-                worker.thread = std::jthread([this, cfd, &worker] {
+                worker.thread = std::thread([this, cfd, &worker] {
                     handleClient(cfd);
                     worker.done.store(true, std::memory_order_release);
                 });
@@ -458,7 +458,7 @@ void TraceonServer::handleClient(int fd) {
 void TraceonServer::stop() {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mu_);
     std::list<Worker> workers;
-    std::jthread accept_thread;
+    std::thread accept_thread;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (!running_) return;

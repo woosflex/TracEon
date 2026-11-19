@@ -384,7 +384,7 @@ TEST_CASE("C API: serialized build completes before deterministic freeze",
     REQUIRE(kmerindex_reserve(h, 10000) == 1);
     constexpr uint64_t writers_n = 4, per_writer = 2000;
     std::atomic<bool> build_ok{true};
-    std::vector<std::jthread> writers;
+    std::vector<std::thread> writers;
     for (uint64_t t = 0; t < writers_n; ++t) {
         writers.emplace_back([&, t] {
             for (uint64_t i = 0; i < per_writer; ++i) {
@@ -401,7 +401,7 @@ TEST_CASE("C API: serialized build completes before deterministic freeze",
     REQUIRE(kmerindex_get(h, 2, &matched) != nullptr); // deterministic freeze point
     const size_t frozen_size = kmerindex_size(h);
     std::atomic<bool> post_freeze_ok{true};
-    std::vector<std::jthread> readers;
+    std::vector<std::thread> readers;
     for (uint64_t t = 0; t < 4; ++t) {
         readers.emplace_back([&, t] {
             for (uint64_t i = 0; i < 1000; ++i) {
@@ -428,12 +428,12 @@ TEST_CASE("C API: mutation racing first lookup is serialized at freeze",
         int insert_result = -2;
         const uint64_t* found = nullptr;
         uint64_t matched = 0;
-        std::jthread mutator([&] {
+        std::thread mutator([&] {
             ready.fetch_add(1);
             while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
             insert_result = kmerindex_insert(h, 4, 22);
         });
-        std::jthread freezer([&] {
+        std::thread freezer([&] {
             ready.fetch_add(1);
             while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
             found = kmerindex_get(h, 2, &matched);
@@ -446,8 +446,8 @@ TEST_CASE("C API: mutation racing first lookup is serialized at freeze",
         REQUIRE((insert_result == 0 || insert_result == 1));
         const size_t expected = insert_result == 1 ? 2u : 1u;
         std::atomic<bool> sizes_ok{true};
-        std::jthread size_a([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
-        std::jthread size_b([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
+        std::thread size_a([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
+        std::thread size_b([&] { if (kmerindex_size(h) != expected) sizes_ok.store(false); });
         size_a.join(); size_b.join();
         REQUIRE(sizes_ok.load());
         REQUIRE(kmerindex_insert(h, 6, 33) == 0);

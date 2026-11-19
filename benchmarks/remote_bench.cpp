@@ -312,15 +312,16 @@ int runRemote(const Options& o) {
 
     if (sample.empty()) throw std::invalid_argument("no sampled keys");
     std::atomic<size_t> failures{0};
+    std::atomic<bool> stop{false};
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
     std::vector<std::vector<double>> times(o.threads);
     std::vector<Clock::time_point> finished(o.threads);
     std::vector<std::exception_ptr> errors(o.threads);
     std::vector<uint64_t> payload_bytes(o.threads);
-    std::vector<std::jthread> threads;
+    std::vector<std::thread> threads;
     for (int tid = 0; tid < o.threads; ++tid) {
-        threads.emplace_back([&, tid](std::stop_token stop) {
+        threads.emplace_back([&, tid] {
             bool announced = false;
             try {
                 TracEon::TraceonClient client(o.host, o.port, TracEon::proto::kReadTimeoutMs, 5000, o.snapshot);
@@ -357,7 +358,7 @@ int runRemote(const Options& o) {
                 announced = true;
                 ready.fetch_add(1, std::memory_order_release);
                 while (!go.load(std::memory_order_acquire)) {
-                    if (stop.stop_requested()) return;
+                    if (stop.load(std::memory_order_acquire)) return;
                     std::this_thread::yield();
                 }
                 for (uint64_t i = 0; i < count; ++i) {
@@ -374,6 +375,16 @@ int runRemote(const Options& o) {
             }
         });
     }
+    struct ThreadsGuard {
+        std::vector<std::thread>& ths;
+        std::atomic<bool>& s;
+        ~ThreadsGuard() {
+            s.store(true, std::memory_order_release);
+            for (auto& th : ths) {
+                if (th.joinable()) th.join();
+            }
+        }
+    } guard{threads, stop};
     while (ready.load(std::memory_order_acquire) != o.threads) std::this_thread::yield();
     const auto start = Clock::now();
     go.store(true, std::memory_order_release);

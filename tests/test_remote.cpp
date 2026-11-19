@@ -125,11 +125,12 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         configureTestSocket(sv[1]);
         const auto wire = proto::encodeFrame(proto::MsgType::Get,
                                               std::vector<char>(32, 'X'));
-        std::jthread trickle([&](std::stop_token st) {
+        std::atomic<bool> stop_trickle{false};
+        std::thread trickle([&] {
             (void)::send(sv[1], wire.data(), proto::kFrameHeaderSize, MSG_NOSIGNAL);
-            for (size_t i = proto::kFrameHeaderSize; i < wire.size() && !st.stop_requested(); ++i) {
+            for (size_t i = proto::kFrameHeaderSize; i < wire.size() && !stop_trickle.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(15));
-                if (st.stop_requested()) break;
+                if (stop_trickle.load()) break;
                 if (::send(sv[1], wire.data() + i, 1, MSG_NOSIGNAL) != 1) break;
             }
             ::close(sv[1]);
@@ -137,7 +138,7 @@ TEST_CASE("remote protocol — framing and message codecs", "[remote][protocol]"
         const auto start = std::chrono::steady_clock::now();
         REQUIRE_THROWS_AS(proto::readFrame(sv[0], 70), std::runtime_error);
         REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
-        trickle.request_stop();
+        stop_trickle.store(true);
         ::close(sv[0]);
         trickle.join();
     }
@@ -230,7 +231,7 @@ TEST_CASE("remote client closes after transport, protocol, or CRC failure",
         REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len) == 0);
         const uint16_t port = ntohs(addr.sin_port);
 
-        std::jthread peer([listener, response = std::move(response), fastq, handshake_fault, batch] {
+        std::thread peer([listener, response = std::move(response), fastq, handshake_fault, batch] {
             struct pollfd p{listener, POLLIN, 0};
             int pr = ::poll(&p, 1, 5000);
             if (pr <= 0 || !(p.revents & POLLIN)) {
@@ -371,7 +372,7 @@ TEST_CASE("remote v2 identifies content and returns complete FASTQ", "[remote][s
     REQUIRE(client.getBatch(std::vector<std::string>(256, "a"), true).size() == 256);
     std::atomic<bool> batch_ok{true};
     {
-        std::vector<std::jthread> readers;
+        std::vector<std::thread> readers;
         for (int i = 0; i < 2; ++i) readers.emplace_back([&] {
             try {
                 for (int j = 0; j < 20; ++j) {
@@ -380,6 +381,7 @@ TEST_CASE("remote v2 identifies content and returns complete FASTQ", "[remote][s
                 }
             } catch (...) { batch_ok = false; }
         });
+        for (auto& r : readers) r.join();
     }
     REQUIRE(batch_ok.load());
     TraceonClient legacy("127.0.0.1", server.port(), 1000, 1000, {}, 1);
@@ -716,7 +718,7 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         const uint16_t port = ntohs(addr.sin_port);
         std::atomic<bool> request_seen{false};
         std::atomic<bool> peer_ok{true};
-        std::jthread peer([&] {
+        std::thread peer([&] {
             struct pollfd p{listener, POLLIN, 0};
             int pr = ::poll(&p, 1, 5000);
             if (pr <= 0 || !(p.revents & POLLIN)) {
@@ -754,7 +756,7 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         TraceonClient client("127.0.0.1", port, 1000, 1000);
         std::optional<std::string> result;
         std::atomic<bool> reader_ok{true};
-        std::jthread reader([&] {
+        std::thread reader([&] {
             try { result = client.getView("seq1"); }
             catch (...) { reader_ok.store(false); }
         });
@@ -765,7 +767,7 @@ TEST_CASE("remote client-server integration", "[remote][integration]") {
         REQUIRE(request_seen.load(std::memory_order_acquire));
         std::atomic<bool> queued_started{false};
         std::atomic<bool> queued_rejected{false};
-        std::jthread queued([&] {
+        std::thread queued([&] {
             queued_started.store(true, std::memory_order_release);
             try { (void)client.getView("queued"); }
             catch (const std::logic_error&) { queued_rejected.store(true); }
@@ -825,8 +827,8 @@ TEST_CASE("Remote workers drain during connection churn and overlapping lifecycl
         TracEon::TraceonClient client("127.0.0.1", server.port());
         REQUIRE(client.getView("r") == "ACGT");
     }
-    std::jthread first_stop([&] { server.stop(); });
-    std::jthread second_stop([&] { server.stop(); });
+    std::thread first_stop([&] { server.stop(); });
+    std::thread second_stop([&] { server.stop(); });
     first_stop.join();
     second_stop.join();
     REQUIRE_FALSE(server.isRunning());

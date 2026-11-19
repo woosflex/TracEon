@@ -105,10 +105,23 @@ private:
 
     std::mutex lifecycle_mu_; // Serializes complete start/stop operations, including joins.
     mutable std::mutex mu_;
-    std::jthread accept_thread_;
+    std::thread accept_thread_;
     struct Worker {
         std::atomic<bool> done{false};
-        std::jthread thread; // Destroy/join before the completion flag.
+        std::thread thread; // Destroy/join before the completion flag.
+        Worker() = default;
+        ~Worker() {
+            if (thread.joinable()) thread.join();
+        }
+        Worker(Worker&& o) noexcept : done(o.done.load()), thread(std::move(o.thread)) {}
+        Worker& operator=(Worker&& o) noexcept {
+            if (this != &o) {
+                if (thread.joinable()) thread.join();
+                done.store(o.done.load());
+                thread = std::move(o.thread);
+            }
+            return *this;
+        }
     };
     std::list<Worker> workers_; // Stable addresses until the accept loop reaps them.
     std::set<int> client_fds_;

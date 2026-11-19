@@ -152,14 +152,15 @@ std::vector<WorkerStats> runThreads(int nthreads,
                                     uint64_t seed, double& wall) {
     std::atomic<bool> go{false};
     std::atomic<int> ready{0};
+    std::atomic<bool> stop{false};
     std::vector<WorkerStats> stats(nthreads);
     std::vector<std::exception_ptr> errors(nthreads);
     std::vector<Clock::time_point> finished(nthreads);
-    std::vector<std::jthread> pool;
+    std::vector<std::thread> pool;
     pool.reserve(static_cast<size_t>(nthreads));
 
     for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t](std::stop_token stop) {
+        pool.emplace_back([&, t] {
             bool announced = false;
             try {
                 // Private shuffled traversal order: per-thread RNG so threads do
@@ -176,7 +177,7 @@ std::vector<WorkerStats> runThreads(int nthreads,
                 announced = true;
                 ready.fetch_add(1, std::memory_order_release);
                 while (!go.load(std::memory_order_acquire)) {
-                    if (stop.stop_requested()) return;
+                    if (stop.load(std::memory_order_acquire)) return;
                     std::this_thread::yield();
                 }
 
@@ -192,6 +193,16 @@ std::vector<WorkerStats> runThreads(int nthreads,
             }
         });
     }
+    struct PoolGuard {
+        std::vector<std::thread>& p;
+        std::atomic<bool>& s;
+        ~PoolGuard() {
+            s.store(true, std::memory_order_release);
+            for (auto& th : p) {
+                if (th.joinable()) th.join();
+            }
+        }
+    } guard{pool, stop};
     while (ready.load(std::memory_order_acquire) != nthreads) std::this_thread::yield();
     const auto start = Clock::now();
     go.store(true, std::memory_order_release);
