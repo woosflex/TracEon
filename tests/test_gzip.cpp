@@ -350,8 +350,11 @@ TEST_CASE("GZIP — junk between valid members rejected below 1 MiB",
     };
     write_member(first, ">one\nACGT\n");
     write_member(second, ">two\nTGCA\n");
-    std::ifstream in(second, std::ios::binary);
-    const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+    std::vector<char> bytes;
+    {
+        std::ifstream in(second, std::ios::binary);
+        bytes.assign((std::istreambuf_iterator<char>(in)), {});
+    }
     { std::ofstream out(first, std::ios::binary | std::ios::app);
       out.put('X'); out.write(bytes.data(), static_cast<std::streamsize>(bytes.size())); }
     REQUIRE(fs::file_size(first) < 1024u * 1024u);

@@ -288,20 +288,22 @@ TEST_CASE("remote client closes after transport, protocol, or CRC failure",
         exercise(std::nullopt);
     }
     SECTION("FASTQ malformed lengths and CRC") {
+        const char ff = static_cast<char>(0xff);
         for (const auto& payload : std::vector<std::vector<char>>{
                 {}, {1,0,0,0,2,0,0,0,'A','I','I'},
                 {1,0,0,0,1,0,0,0,'A'}, {0,0,0,0,0,0,0,0,'X'},
-                {-1,-1,-1,-1,-1,-1,-1,-1}})
+                {ff,ff,ff,ff,ff,ff,ff,ff}})
             exercise(std::make_pair(proto::MsgType::Ok, proto::encodeOk(proto::kOk, payload)), true);
         auto corrupt = proto::encodeOk(proto::kOk, {1,0,0,0,1,0,0,0,'A','I'});
         corrupt.back() ^= 1;
         exercise(std::make_pair(proto::MsgType::Ok, corrupt), true);
     }
     SECTION("batch malformed results and CRC close the connection") {
+        const char ff = static_cast<char>(0xff);
         for (const auto& payload : std::vector<std::vector<char>>{
                 {}, {0,0,0,0}, {1,0,0,0,0,1,0,0,0,2,0,0,0,'A','I','I'},
                 {1,0,0,0,1,1,0,0,0,0,0,0,0,'A'}, {1,0,0,0,9,0,0,0,0,0,0,0,0},
-                {1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1},
+                {1,0,0,0,0,ff,ff,ff,ff,ff,ff,ff,ff},
                 {1,0,0,0,0,0,0,0,0,0,0,0,0,'X'}})
             exercise(std::make_pair(proto::MsgType::Ok, proto::encodeOk(proto::kOk, payload)), true, false, true);
         auto corrupt = proto::encodeOk(proto::kOk, {1,0,0,0,0,0,0,0,0,0,0,0,0});

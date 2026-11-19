@@ -12,8 +12,16 @@ template <typename Worker>
 void parallelFor(size_t begin, size_t end, Worker worker) {
     std::vector<std::exception_ptr> errors(end - begin);
     {
-        std::vector<std::jthread> threads;
+        std::vector<std::thread> threads;
         threads.reserve(end - begin);
+        struct Joiner {
+            std::vector<std::thread>& ths;
+            ~Joiner() {
+                for (auto& t : ths) {
+                    if (t.joinable()) t.join();
+                }
+            }
+        } joiner{threads};
         for (size_t i = begin; i < end; ++i) {
             threads.emplace_back([&, i] {
                 try { worker(i); }

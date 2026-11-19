@@ -31,6 +31,8 @@ def main():
     build = args.build_dir.resolve()
     if args.thread_shim: args.thread_shim = args.thread_shim.resolve()
     suffix = ".exe" if os.name == "nt" else ""
+    if not (build / ("traceon_driver" + suffix)).exists() and (build / "Release" / ("traceon_driver" + suffix)).exists():
+        build = build / "Release"
     driver = build / ("traceon_driver" + suffix)
     scaling = build / ("read_scaling" + suffix)
     remote = build / ("remote_bench" + suffix)

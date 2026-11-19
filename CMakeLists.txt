@@ -1,6 +1,11 @@
 # Sticking to a modern, stable CMake version.
 cmake_minimum_required(VERSION 3.20)
 
+# Apple Clang deployment target for C++20 standard library features (e.g. std::jthread)
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum OS X version")
+endif()
+
 # This is us! Our project's name is TracEon.
 project(TracEon VERSION 3.0.0 LANGUAGES C CXX)
 include(GNUInstallDirs)

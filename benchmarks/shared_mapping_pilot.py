@@ -120,7 +120,7 @@ def start_server(binary, cache, output, *, supported_cli=False, extra_args=(), c
                                     "records": int(match[2]), "ready_pss_kib": pss_kib(child.pid),
                                     "snapshot": match[3] if supported_cli else None,
                                     "command": child.args, "pid": child.pid,
-                                    "cpu_affinity": sorted(os.sched_getaffinity(child.pid))}
+                                    "cpu_affinity": sorted(os.sched_getaffinity(child.pid)) if hasattr(os, "sched_getaffinity") else []}
     except BaseException:
         child.kill()
         child.wait()
