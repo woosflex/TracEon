@@ -111,7 +111,7 @@ TraceonClient::TraceonClient(std::string host, uint16_t port,
             throw std::runtime_error(msg);
         }
     }
-    setBlocking(fd);
+    setNonBlocking(fd);
     fd_ = fd;
 
     // ── HELLO handshake ───────────────────────────────────────────────────

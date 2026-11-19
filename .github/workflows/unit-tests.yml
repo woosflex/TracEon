@@ -67,7 +67,7 @@ jobs:
         ./test_binary_cache "~[oom]"
         ./test_lifecycle "~[oom]"
         ./test_api_misc "~[oom]"
-        ./test_remote "~[oom]"
+        ./test_remote -s --durations yes "~[oom]"
         ./kmer_c_compile_test
         ./test_save_allocations
         python3 ../tests/test_service_cli.py ./traceon

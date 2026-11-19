@@ -209,15 +209,20 @@ proto::SnapshotInfo TraceonServer::snapshotInfo() const {
 
 void TraceonServer::acceptLoop() {
     for (;;) {
+        std::list<Worker> finished;
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (auto it = workers_.begin(); it != workers_.end();) {
                 // done is published after the worker releases every server lock.
-                if (it->done.load(std::memory_order_acquire)) it = workers_.erase(it);
-                else ++it;
+                if (it->done.load(std::memory_order_acquire)) {
+                    finished.splice(finished.end(), workers_, it++);
+                } else {
+                    ++it;
+                }
             }
             if (stopping_) break;
         }
+        finished.clear();
         struct pollfd pfds[2];
         pfds[0] = {listen_fd_, POLLIN, 0};
         pfds[1] = {sockfd_control_, POLLIN, 0};
@@ -245,6 +250,8 @@ void TraceonServer::acceptLoop() {
             }
             continue; // transient accept error (e.g. EMFILE) — keep serving
         }
+        int cflags = ::fcntl(cfd, F_GETFL, 0);
+        if (cflags >= 0) ::fcntl(cfd, F_SETFL, cflags | O_NONBLOCK);
         int one = 1;
         ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #if defined(SO_NOSIGPIPE)
@@ -265,8 +272,11 @@ void TraceonServer::acceptLoop() {
             if (workers_.size() >= max_connections_) {
                 // Workers may have finished while poll() waited for this client.
                 for (auto it = workers_.begin(); it != workers_.end();) {
-                    if (it->done.load(std::memory_order_acquire)) it = workers_.erase(it);
-                    else ++it;
+                    if (it->done.load(std::memory_order_acquire)) {
+                        finished.splice(finished.end(), workers_, it++);
+                    } else {
+                        ++it;
+                    }
                 }
             }
             if (workers_.size() >= max_connections_) {

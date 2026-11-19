@@ -58,6 +58,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <csignal>
 #endif
 
@@ -358,8 +359,18 @@ inline int remainingMillis(IoDeadline deadline) {
         ? std::numeric_limits<int>::max() : static_cast<int>(remaining);
 }
 
+inline void ensureNonBlocking(int fd) {
+    if (fd >= 0) {
+        int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags >= 0 && !(flags & O_NONBLOCK)) {
+            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+}
+
 /** Read exactly n bytes before one caller-owned absolute deadline. */
 inline bool readFullUntil(int fd, char* buf, size_t n, IoDeadline deadline) {
+    ensureNonBlocking(fd);
     size_t got = 0;
     while (got < n) {
         const int remaining = remainingMillis(deadline);
@@ -394,6 +405,7 @@ inline bool readFull(int fd, char* buf, size_t n, int timeout_ms = kReadTimeoutM
 
 /** Write all bytes before one caller-owned absolute deadline. */
 inline bool writeAllUntil(int fd, const char* buf, size_t n, IoDeadline deadline) {
+    ensureNonBlocking(fd);
 #if defined(SO_NOSIGPIPE)
     int one = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));

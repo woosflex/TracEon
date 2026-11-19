@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <csignal>
 #endif
 
@@ -40,6 +41,8 @@ static int configureTestSocket(int fd) {
         int one = 1;
         (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+        int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) (void)::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
     return fd;
 }
@@ -73,8 +76,12 @@ uint16_t unusedPort() {
 // Raw TCP connect to 127.0.0.1:port for protocol-violation tests. Returns
 // -1 (after closing) on any failure instead of throwing.
 static int connectRaw(uint16_t port) {
-    int fd = configureTestSocket(::socket(AF_INET, SOCK_STREAM, 0));
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
@@ -83,6 +90,7 @@ static int connectRaw(uint16_t port) {
         ::close(fd);
         return -1;
     }
+    configureTestSocket(fd);
     return fd;
 }
 
