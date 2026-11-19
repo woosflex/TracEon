@@ -23,7 +23,7 @@ TEST_CASE("addEntry stores data with stable string_views", "[strategy][addentry]
     REQUIRE(strategy.getQuality("manual_seq") == "IIIIIIII");
 }
 
-#ifndef _WIN32
+#if defined(__linux__)
 
 TEST_CASE("addEntry() throws instead of crashing when the process is memory-constrained",
           "[strategy][addentry][errors][oom]") {
