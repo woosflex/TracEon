@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [3.0.0-dev] — Unreleased
+## [3.0.0-dev] — 2026-11-19
 
-The latest published release remains v2.3.0. This development line contains
-breaking API/protocol and default cache-write changes; no release date is set.
+Pre-release development candidate for v3.0.0. This pre-release introduces the
+portable v5 memory-mapped cache format, atomic POSIX persistence guarantees,
+remote protocol v2 with SHA-256 snapshot pinning and batch retrieval, the unified
+traceon CLI, and relocatable CMake installation packages.
 Historical performance numbers later in this file are retained as release-note
 provenance only and are not current validated comparative evidence.
 

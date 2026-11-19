@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![Release](https://img.shields.io/badge/release-v2.3.0-blueviolet.svg)](RELEASE_v2.3.0.md)
-[![Development](https://img.shields.io/badge/development-3.0.0--dev-orange.svg)](CHANGELOG.md)
+[![Pre-Release](https://img.shields.io/badge/pre--release-v3.0.0--dev-orange.svg)](RELEASE_v3.0.0-dev.md)
 
 TracEon is a C++20 library for repeated whole-record lookup by FASTA/FASTQ
 identifier. **Prepare one immutable cache, open it in independent processes,
@@ -46,8 +46,8 @@ replacement of mapper lookup engines; the
 [native mapper control](docs/shared-minimap-index-pilot.md) did not establish
 such an advantage.
 
-The latest published release is **v2.3.0**. The current uncommitted development
-candidate is **3.0.0-dev** and is not a release. It changes default cache writes
+The latest stable release is **v2.3.0**. The current pre-release development
+candidate is **v3.0.0-dev** ([release notes](RELEASE_v3.0.0-dev.md)). It introduces default cache writes
 to portable v5 and tightens parser, persistence, k-mer, and client-lifecycle
 contracts. See [CHANGELOG.md](CHANGELOG.md) and
 [ADR-007](docs/architecture/ADR-007-traceon-v5-portable-format.md).
